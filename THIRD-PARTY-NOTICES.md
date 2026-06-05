@@ -23,6 +23,10 @@ GPL code was copied. Algorithms ported from MIT sources are attributed below.
 ## Go module dependencies
 
 - **github.com/tetratelabs/wazero** (Apache-2.0): pure-Go WebAssembly runtime.
+- **go.etcd.io/bbolt** (MIT): pure-Go embedded key/value store backing the
+  default disk-persistent token cache and breaker cooldown (its own file
+  locking). <https://github.com/etcd-io/bbolt>
+- **github.com/spf13/cobra** / **spf13/pflag** (Apache-2.0): CLI framework.
 
 ## Ported algorithms (MIT, with attribution)
 

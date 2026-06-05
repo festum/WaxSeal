@@ -41,15 +41,21 @@ func buildLogger(level, format string, w io.Writer) *slog.Logger {
 	return slog.New(slog.NewTextHandler(w, opts))
 }
 
-// buildClient constructs a waxseal.Client that owns transports so egress flags
-// affect the network path. It also uses a persistent wazero compilation cache.
-func buildClient(cfg config.Config, logger *slog.Logger) (*waxseal.Client, error) {
+// buildClient constructs a waxseal.Client that owns transports, so egress flags
+// affect the network path. It always uses the wazero compilation cache.
+// persistDir, when non-empty, also enables the disk store for breaker cooldowns
+// and, when cfg.PersistTokens is set, cached tokens.
+func buildClient(cfg config.Config, logger *slog.Logger, persistDir string) (*waxseal.Client, error) {
 	return waxseal.New(waxseal.Options{
 		EgressTransport:     waxseal.BuildEgressTransport,
 		Logger:              logger,
 		DisableInnertube:    cfg.DisableInnertube,
 		CacheMaxTTL:         cfg.CacheMaxTTL,
 		CompilationCacheDir: compilationCacheDir(cfg.CacheDir),
+		CacheDir:            persistDir,
+		PersistTokens:       cfg.PersistTokens,
+		DiskBackend:         cfg.DiskBackend,
+		EndpointMode:        cfg.EndpointMode,
 	})
 }
 

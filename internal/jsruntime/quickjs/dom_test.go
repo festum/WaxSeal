@@ -244,13 +244,15 @@ func TestCanvasAndWebGL(t *testing.T) {
 }
 
 // The broad platform-interface battery is present and native-looking. Live
-// probes have included IDBVersionChangeEvent, MediaRecorderErrorEvent, and
-// StylePropertyMap. Events are real Event subclasses; the legacy element
-// factories (Image/Audio/Option) stay createElement-coherent.
+// probes have included IDBVersionChangeEvent, MediaRecorderErrorEvent,
+// StylePropertyMap, and CanvasCaptureMediaStreamTrack. Events are real Event
+// subclasses; the legacy element factories (Image/Audio/Option) stay
+// createElement-coherent.
 func TestPlatformBattery(t *testing.T) {
 	rt := newBundledRT(t)
 	present := []string{
-		"IDBVersionChangeEvent", "MediaRecorderErrorEvent", "StylePropertyMap", // the live-named gaps
+		"IDBVersionChangeEvent", "MediaRecorderErrorEvent", "StylePropertyMap", // earlier live-named gaps
+		"CanvasCaptureMediaStreamTrack", "MediaStreamTrack", // CanvasCapture... was the latest live probe
 		"MediaRecorder", "MediaSource", "AudioContext", "AnalyserNode", "OscillatorNode",
 		"IDBDatabase", "IDBKeyRange", "CSSStyleSheet", "WebGLBuffer", "MutationObserver",
 		"ResizeObserver", "IntersectionObserver", "ReadableStream", "XMLHttpRequest",

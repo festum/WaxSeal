@@ -19,6 +19,10 @@ type serverOpts struct {
 	configPath          string
 	verbose             bool
 	allowEgressOverride bool
+	cacheDir            string
+	persistTokens       bool
+	diskBackend         string
+	endpointMode        string
 }
 
 func newServerCmd() *cobra.Command {
@@ -34,6 +38,13 @@ func newServerCmd() *cobra.Command {
 		SilenceErrors: true,
 		RunE:          func(cmd *cobra.Command, _ []string) error { return runServer(cmd, &s) },
 	}
+	bindServerFlags(c, &s)
+	return c
+}
+
+// bindServerFlags registers the server-subcommand flags on cmd. It is separated
+// from newServerCmd so tests can build a command and exercise applyServerFlags.
+func bindServerFlags(c *cobra.Command, s *serverOpts) {
 	f := c.Flags()
 	f.StringVar(&s.host, "host", "", "bind address (default 127.0.0.1; set :: or 0.0.0.0 to expose)")
 	f.IntVar(&s.port, "port", 0, "listen port (default 4416)")
@@ -41,7 +52,39 @@ func newServerCmd() *cobra.Command {
 	f.BoolVarP(&s.verbose, "verbose", "v", false, "verbose (debug) logging")
 	f.BoolVar(&s.allowEgressOverride, "allow-request-egress-override", false,
 		"honor per-request proxy/source_address/disable_tls_verification; off by default")
-	return c
+	f.StringVar(&s.cacheDir, "cache-dir", "", "directory for the wazero AOT cache and persistent store (default per-user cache)")
+	f.BoolVar(&s.persistTokens, "persist-tokens", false, "persist minted tokens to disk across restarts (off by default; tokens are sensitive)")
+	f.StringVar(&s.diskBackend, "disk-backend", "", "persistent store backend: bbolt (default) or json")
+	f.StringVar(&s.endpointMode, "endpoint-mode", "", "WAA attestation host: youtube (default) or googleapis")
+}
+
+// applyServerFlags overlays explicitly-set flags onto cfg (highest precedence,
+// flags > env > file). It honors --flag=false for booleans by gating on
+// Flags().Changed rather than the value, so an explicit disable wins over a true
+// from env/file.
+func applyServerFlags(cmd *cobra.Command, s *serverOpts, cfg *config.Config) {
+	changed := cmd.Flags().Changed
+	if changed("host") {
+		cfg.Host = s.host
+	}
+	if changed("port") {
+		cfg.Port = s.port
+	}
+	if s.verbose {
+		cfg.LogLevel = "debug"
+	}
+	if changed("cache-dir") {
+		cfg.CacheDir = s.cacheDir
+	}
+	if changed("persist-tokens") {
+		cfg.PersistTokens = s.persistTokens
+	}
+	if changed("disk-backend") {
+		cfg.DiskBackend = s.diskBackend
+	}
+	if changed("endpoint-mode") {
+		cfg.EndpointMode = s.endpointMode
+	}
 }
 
 func runServer(cmd *cobra.Command, s *serverOpts) error {
@@ -49,23 +92,16 @@ func runServer(cmd *cobra.Command, s *serverOpts) error {
 	if err != nil {
 		return err
 	}
-	// Overlay explicitly-changed flags (highest precedence).
-	if cmd.Flags().Changed("host") {
-		cfg.Host = s.host
-	}
-	if cmd.Flags().Changed("port") {
-		cfg.Port = s.port
-	}
-	if s.verbose {
-		cfg.LogLevel = "debug"
-	}
+	applyServerFlags(cmd, s, &cfg)
 	if err := cfg.Validate(); err != nil {
 		return err
 	}
 	cfg.CacheMaxTTL = serverCacheTTL(cfg.CacheMaxTTL)
 
 	logger := buildLogger(cfg.LogLevel, cfg.LogFormat, os.Stdout)
-	client, err := buildClient(cfg, logger)
+	// The daemon is long-running and single-process, so it uses the resolved
+	// cache directory for breaker persistence by default.
+	client, err := buildClient(cfg, logger, compilationCacheDir(cfg.CacheDir))
 	if err != nil {
 		return err
 	}

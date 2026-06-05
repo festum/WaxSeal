@@ -51,7 +51,7 @@ func TestGateBVMExecutes(t *testing.T) {
 	rt, _ := eng.NewRuntime(rtctx)
 	defer rt.Close(rtctx)
 
-	ch, err := botguard.FetchCreateChallenge(rtctx, client, "")
+	ch, err := botguard.FetchCreateChallenge(rtctx, client, "", botguard.DefaultEndpoint)
 	if err != nil {
 		t.Fatalf("challenge: %v", err)
 	}
@@ -66,7 +66,7 @@ func TestGateBVMExecutes(t *testing.T) {
 	}
 	t.Logf("BotGuard VM ran in QuickJS-on-wazero: botguardResponse=%d B in %v", len(bgResp), snapDur)
 
-	it, err := botguard.GenerateIT(rtctx, client, "", bgResp)
+	it, err := botguard.GenerateIT(rtctx, client, "", bgResp, botguard.DefaultEndpoint)
 	if err != nil {
 		t.Fatalf("GenerateIT rejected the VM response: %v\nshim log:\n%s", err, stderr.String())
 	}
@@ -84,7 +84,7 @@ func TestGateBVMExecutes(t *testing.T) {
 	t.Logf("GenerateIT accepted the VM response; field-6-valid fallback token returned (%d B), lifetime=%ds",
 		len(it.FallbackToken), it.LifetimeSecs)
 	if probes := stderr.String(); probes != "" {
-		t.Logf("discovery / API-DRIFT log:\n%s", probes)
+		t.Logf("discovery / API drift log:\n%s", probes)
 	}
 }
 
@@ -104,7 +104,7 @@ func TestGateBIntegrityMint(t *testing.T) {
 	defer rt.Close(rtctx)
 
 	const visitorData = "Cgs4bFZSaUotYTYtQSiJnvu8BjIKCgJERRIEEgAgFw=="
-	token, it, err := botguard.MintToken(rtctx, rt, client, "", visitorData)
+	token, it, err := botguard.MintToken(rtctx, rt, client, "", visitorData, botguard.DefaultEndpoint)
 	if err != nil {
 		if se, ok := err.(*botguard.StageError); ok && se.Stage == botguard.StageGenerateIT {
 			t.Skipf("integrity token not issued; GenerateIT returned fallback only. "+
@@ -138,7 +138,7 @@ func TestGateBDebug(t *testing.T) {
 	rt, _ := eng.NewRuntime(rtctx)
 	defer rt.Close(rtctx)
 
-	ch, err := botguard.FetchCreateChallenge(rtctx, client, "")
+	ch, err := botguard.FetchCreateChallenge(rtctx, client, "", botguard.DefaultEndpoint)
 	if err != nil {
 		t.Fatalf("challenge: %v", err)
 	}
@@ -165,6 +165,6 @@ func TestGateBDebug(t *testing.T) {
 	resp.Body.Close()
 	t.Logf("GenerateIT HTTP %d, body: %s", resp.StatusCode, string(raw))
 	if probes := stderr.String(); probes != "" {
-		t.Logf("shim discovery / API-DRIFT log:\n%s", probes)
+		t.Logf("shim discovery / API drift log:\n%s", probes)
 	}
 }

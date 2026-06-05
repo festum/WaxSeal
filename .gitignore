@@ -1,7 +1,3 @@
-# Reference implementations (vendored locally for porting, not committed)
-/bgutil-ytdlp-pot-provider-rs-master_temp/
-/BgUtils-main_temp/
-/rustypipe-botguard-main_temp/
 i-am-looking-to-zany-dragon.md
 
 # Build toolchains (fetched by `make deps`; pinned, not committed)
@@ -11,6 +7,12 @@ build/js/node_modules/
 # Local build scratch
 *.o
 *.tmp
+
+# Cross-compiled release binaries (`make release`)
+/dist/
+
+# Local diff scratch
+*.patch
 
 # NOTE: internal/jsassets/qjs.wasm and bg_bundle.js ARE committed (build outputs
 # treated like vendored deps); do not ignore them.

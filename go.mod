@@ -5,6 +5,7 @@ go 1.26.3
 require (
 	github.com/spf13/cobra v1.10.2
 	github.com/tetratelabs/wazero v1.12.0
+	go.etcd.io/bbolt v1.3.11
 )
 
 require (

@@ -16,6 +16,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"errors"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -42,6 +43,7 @@ type Client interface {
 	PurgeTokens()
 	InvalidateMinters()
 	MinterKeys() []string
+	WriteMetrics(w io.Writer) error
 }
 
 // Options configures a Server.
@@ -98,6 +100,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /invalidate_caches", s.handleInvalidateCaches)
 	mux.HandleFunc("POST /invalidate_it", s.handleInvalidateIT)
 	mux.HandleFunc("GET /minter_cache", s.handleMinterCache)
+	mux.HandleFunc("GET /metrics", s.handleMetrics)
 	return s.logging(s.auth(mux))
 }
 

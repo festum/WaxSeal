@@ -156,6 +156,16 @@ func (s *Server) handleMinterCache(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, keys)
 }
 
+// handleMetrics renders WaxSeal's counters in Prometheus text exposition format.
+// Metrics contain non-sensitive operational counts, but they stay behind the
+// shared secret like every endpoint except /ping.
+func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	if err := s.client.WriteMetrics(w); err != nil {
+		s.logger.Error("write metrics failed", "err", err)
+	}
+}
+
 // deprecatedField reports the first deprecated top-level key present, else "".
 // It uses exact (case-sensitive) key matching, matching bgutil.
 func deprecatedField(body []byte) string {

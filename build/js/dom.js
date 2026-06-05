@@ -949,7 +949,7 @@ const PRESENCE_BATTERY = (
   // IndexedDB
   'IDBFactory IDBDatabase IDBObjectStore IDBIndex IDBCursor IDBCursorWithValue IDBKeyRange IDBRequest IDBOpenDBRequest IDBTransaction ' +
   // Media / WebAudio / MSE / EME
-  'MediaRecorder MediaSource SourceBuffer SourceBufferList MediaStreamTrack MediaDevices MediaDeviceInfo MediaCapabilities ' +
+  'MediaRecorder MediaSource SourceBuffer SourceBufferList MediaStreamTrack CanvasCaptureMediaStreamTrack MediaDevices MediaDeviceInfo MediaCapabilities ' +
   'MediaKeys MediaKeySession MediaKeySystemAccess MediaKeyStatusMap RemotePlayback ' +
   'AudioContext BaseAudioContext OfflineAudioContext AudioNode AudioParam AudioBuffer AudioBufferSourceNode ' +
   'AudioDestinationNode AudioListener AnalyserNode GainNode BiquadFilterNode OscillatorNode DynamicsCompressorNode ' +

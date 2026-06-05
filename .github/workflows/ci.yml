@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # Offline build + vet + race tests. No C/Node toolchain: the qjs.wasm and
+  # bg_bundle.js artifacts are committed.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test -race ./...
+
+  # The WaxTap adapter is a separate nested module; build and vet it separately
+  # so WaxTap-specific changes do not block the core package checks.
+  provider:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - working-directory: provider
+        run: go build ./... && go vet ./...
+
+  # Cross-compile the no-CGo binary for the full GOOS/GOARCH matrix using the
+  # same embedded wasm/JS assets.
+  cross:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        goos: [linux, darwin, windows]
+        goarch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: build ${{ matrix.goos }}/${{ matrix.goarch }} (no CGo)
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: go build ./...
+
+  # Reproducibility gate: rebuild the embedded artifacts from the pinned
+  # toolchains and fail if a single byte differs from what is committed.
+  reproduce-assets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: fetch pinned toolchains (wasi-sdk, quickjs-ng, binaryen, npm)
+        run: make deps
+      - name: rebuild and diff against the committed bytes
+        run: make verify-assets

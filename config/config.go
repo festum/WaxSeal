@@ -27,8 +27,13 @@ type Config struct {
 	Host string // bind address (loopback default; set :: / 0.0.0.0 to expose)
 	Port int
 
-	CacheDir    string        // wazero AOT compilation cache
+	CacheDir    string        // wazero AOT compilation cache + persistent store directory
 	CacheMaxTTL time.Duration // caps cached token validity; 0 = uncapped
+
+	PersistTokens bool   // opt-in: persist minted tokens to disk across restarts
+	DiskBackend   string // persistent store backend: "" (bbolt) or "json"
+
+	EndpointMode string // WAA attestation host: "" (youtube) or "googleapis"
 
 	Proxy            string // default egress proxy (HTTPS_PROXY/HTTP_PROXY)
 	SourceAddress    string // default egress source IP
@@ -74,6 +79,9 @@ type fileSchema struct {
 	Port                       *int    `json:"port"`
 	CacheDir                   *string `json:"cache_dir"`
 	CacheMaxTTL                *string `json:"cache_max_ttl"` // duration ("6h") or seconds
+	PersistTokens              *bool   `json:"persist_tokens"`
+	DiskBackend                *string `json:"disk_backend"`
+	EndpointMode               *string `json:"endpoint_mode"`
 	Proxy                      *string `json:"proxy"`
 	SourceAddress              *string `json:"source_address"`
 	DisableTLSVerify           *bool   `json:"disable_tls_verification"`
@@ -106,6 +114,9 @@ func (c *Config) ApplyFile(path string) error {
 		}
 		c.CacheMaxTTL = d
 	}
+	setBool(&c.PersistTokens, f.PersistTokens)
+	setString(&c.DiskBackend, f.DiskBackend)
+	setString(&c.EndpointMode, f.EndpointMode)
 	setString(&c.Proxy, f.Proxy)
 	setString(&c.SourceAddress, f.SourceAddress)
 	setBool(&c.DisableTLSVerify, f.DisableTLSVerify)
@@ -135,6 +146,17 @@ func (c *Config) ApplyEnv() {
 		if d, err := parseDuration(v); err == nil {
 			c.CacheMaxTTL = d
 		}
+	}
+	if v, ok := os.LookupEnv("PERSIST_TOKENS"); ok {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.PersistTokens = b
+		}
+	}
+	if v, ok := os.LookupEnv("DISK_CACHE_BACKEND"); ok {
+		c.DiskBackend = v
+	}
+	if v, ok := os.LookupEnv("ENDPOINT_MODE"); ok {
+		c.EndpointMode = v
 	}
 	// HTTPS_PROXY takes priority over HTTP_PROXY (bgutil parity).
 	if v, ok := lookupAny("HTTPS_PROXY", "https_proxy"); ok {
@@ -177,6 +199,16 @@ func (c *Config) Validate() error {
 		if _, err := url.Parse(c.Proxy); err != nil {
 			return fmt.Errorf("config: invalid proxy URL %q: %w", c.Proxy, err)
 		}
+	}
+	switch strings.ToLower(c.DiskBackend) {
+	case "", "bbolt", "json":
+	default:
+		return fmt.Errorf("config: invalid disk backend %q (want bbolt or json)", c.DiskBackend)
+	}
+	switch strings.ToLower(strings.TrimSpace(c.EndpointMode)) {
+	case "", "youtube", "googleapis":
+	default:
+		return fmt.Errorf("config: invalid endpoint mode %q (want youtube or googleapis)", c.EndpointMode)
 	}
 	return nil
 }

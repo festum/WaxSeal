@@ -85,7 +85,9 @@ func runGenerate(cmd *cobra.Command, g *genOpts) error {
 		return err
 	}
 
-	client, err := buildClient(cfg, logger)
+	// One-shot CLI calls use disk persistence only when CACHE_DIR is configured;
+	// this avoids competing for a store lock across concurrent invocations.
+	client, err := buildClient(cfg, logger, cfg.CacheDir)
 	if err != nil {
 		fmt.Fprintln(stdout, "{}")
 		logger.Error("init", "err", err)

@@ -22,7 +22,16 @@ import (
 	"github.com/colespringer/waxseal/internal/httpx"
 	"github.com/colespringer/waxseal/internal/innertube"
 	"github.com/colespringer/waxseal/internal/jsruntime"
+	"github.com/colespringer/waxseal/internal/metrics"
 )
+
+// BreakerStore persists per-minter-key circuit-breaker cooldowns so a restart
+// honors an active cooldown instead of starting another Create call immediately.
+// *persist.Store satisfies it.
+type BreakerStore interface {
+	LoadBreakers() (map[string]time.Time, error)
+	SaveBreaker(key string, openUntil time.Time) error
+}
 
 // TokenKind distinguishes a per-identifier integrity-minted token from the
 // single websafe fallback token. They have different lifetime/validity
@@ -36,12 +45,13 @@ const (
 
 // Request is one token request against a warm-minter key.
 type Request struct {
-	Key           string          // full minter key (egress/endpoint/profile hash/client)
-	Identifier    string          // visitor_data / video_id / opaque mint identifier
-	ProfileJSON   json.RawMessage // BrowserProfile JSON for runBotguard
-	AttestationUA string          // UA for Create/GenerateIT
-	Client        *httpx.Client   // egress (shared transport + jar)
-	ForceNew      bool            // 403/bypass: discard the warm entry, re-attest
+	Key           string            // full minter key (egress/endpoint/profile hash/client)
+	Identifier    string            // visitor_data / video_id / opaque mint identifier
+	ProfileJSON   json.RawMessage   // BrowserProfile JSON for runBotguard
+	AttestationUA string            // UA for Create/GenerateIT
+	Client        *httpx.Client     // egress (shared transport + jar)
+	Endpoint      botguard.Endpoint // WAA endpoint (Create/GenerateIT URLs); zero = default
+	ForceNew      bool              // 403/bypass: discard the warm entry, re-attest
 
 	// Challenge inputs (priority: caller -> InnerTube att/get -> Create).
 	// A caller-provided challenge is used only on the synchronous cold path;
@@ -69,6 +79,8 @@ type Options struct {
 	BreakerThreshold    int           // consecutive attestation failures before cool-down (default 5)
 	BreakerCooldown     time.Duration // cool-down duration (default 60s)
 	Logger              *slog.Logger
+	Metrics             *metrics.Metrics // instrumentation; nil installs a private set
+	BreakerStore        BreakerStore     // optional cooldown persistence (default = none)
 	now                 func() time.Time
 }
 
@@ -79,9 +91,10 @@ type Manager struct {
 	sem    chan struct{}
 	sf     flightGroup
 
-	mu       sync.Mutex
-	entries  map[string]*entry
-	breakers map[string]*httpx.Breaker
+	mu        sync.Mutex
+	entries   map[string]*entry
+	breakers  map[string]*httpx.Breaker
+	cooldowns map[string]time.Time // persisted cooldowns awaiting their breaker's first use
 }
 
 type entry struct {
@@ -115,16 +128,31 @@ func New(engine jsruntime.Engine, opts Options) *Manager {
 	if opts.Logger == nil {
 		opts.Logger = slog.New(slog.DiscardHandler)
 	}
+	if opts.Metrics == nil {
+		opts.Metrics = metrics.New()
+	}
 	if opts.now == nil {
 		opts.now = time.Now
 	}
-	return &Manager{
-		engine:   engine,
-		opts:     opts,
-		sem:      make(chan struct{}, opts.SnapshotConcurrency),
-		entries:  make(map[string]*entry),
-		breakers: make(map[string]*httpx.Breaker),
+	m := &Manager{
+		engine:    engine,
+		opts:      opts,
+		sem:       make(chan struct{}, opts.SnapshotConcurrency),
+		entries:   make(map[string]*entry),
+		breakers:  make(map[string]*httpx.Breaker),
+		cooldowns: make(map[string]time.Time),
 	}
+	// Seed persisted cooldowns so a restart honors active backoff before making
+	// another Create call. Cooldowns are applied lazily because breakers are
+	// created per key on demand.
+	if opts.BreakerStore != nil {
+		if cd, err := opts.BreakerStore.LoadBreakers(); err != nil {
+			opts.Logger.Warn("session: load persisted breaker cooldowns failed", "err", err)
+		} else {
+			m.cooldowns = cd
+		}
+	}
+	return m
 }
 
 // Token returns a token for req, building a warm entry if needed and minting (or
@@ -145,7 +173,9 @@ func (m *Manager) Prewarm(req Request) {
 		defer cancel()
 		if _, err := m.ensure(ctx, req); err != nil {
 			m.opts.Logger.Debug("session prewarm failed", "err", err)
+			return
 		}
+		m.opts.Metrics.Prewarms.Inc()
 	}()
 }
 
@@ -186,6 +216,7 @@ func (m *Manager) ensure(ctx context.Context, req Request) (*entry, error) {
 // the QuickJS runtime is single-threaded).
 func (m *Manager) serve(ctx context.Context, e *entry, req Request) (Result, error) {
 	if e.kind == KindFallback {
+		m.opts.Metrics.MintKind(string(KindFallback))
 		return Result{Token: e.result.FallbackToken, ExpiresAt: e.expiresAt, Kind: KindFallback}, nil
 	}
 	// Mint under e.mu (mintFromEntry releases it via defer), then evict if
@@ -201,10 +232,12 @@ func (m *Manager) serve(ctx context.Context, e *entry, req Request) (Result, err
 		}
 		if poisoned {
 			m.breaker(e.key).RecordPoison()
+			m.opts.Metrics.Poisons.Inc()
 			m.evictEntry(e.key, e)
 		}
 		return Result{}, err
 	}
+	m.opts.Metrics.MintKind(string(KindIntegrity))
 	return Result{Token: token, ExpiresAt: e.expiresAt, Kind: KindIntegrity}, nil
 }
 
@@ -244,10 +277,12 @@ func (m *Manager) attest(ctx context.Context, req Request) (*entry, error) {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
+	m.opts.Metrics.Attestations.Inc()
 
 	rt, err := m.engine.NewRuntime(ctx)
 	if err != nil {
 		br.RecordFailure()
+		m.opts.Metrics.AttestFailure("runtime")
 		return nil, fmt.Errorf("session: new runtime: %w", err)
 	}
 	keepRuntime := false
@@ -265,16 +300,20 @@ func (m *Manager) attest(ctx context.Context, req Request) (*entry, error) {
 	ch, err := m.resolveChallenge(ctx, req)
 	if err != nil {
 		br.RecordFailure()
+		m.opts.Metrics.AttestFailure("challenge")
 		return nil, err
 	}
+	m.opts.Metrics.Snapshots.Inc()
 	bgResp, err := botguard.Snapshot(ctx, rt, ch, req.ProfileJSON)
 	if err != nil {
 		m.recordVMFailure(br, rt)
+		m.opts.Metrics.AttestFailure("vm")
 		return nil, err
 	}
-	it, err := botguard.GenerateIT(ctx, req.Client, req.AttestationUA, bgResp)
+	it, err := botguard.GenerateIT(ctx, req.Client, req.AttestationUA, bgResp, req.Endpoint)
 	if err != nil {
 		br.RecordFailure()
+		m.opts.Metrics.AttestFailure("generateit")
 		return nil, err
 	}
 
@@ -283,6 +322,7 @@ func (m *Manager) attest(ctx context.Context, req Request) (*entry, error) {
 	if it.HasIntegrity() {
 		if err := botguard.InstallMinter(ctx, rt, it.IntegrityToken); err != nil {
 			m.recordVMFailure(br, rt)
+			m.opts.Metrics.AttestFailure("minter")
 			return nil, err
 		}
 		e.kind = KindIntegrity
@@ -293,6 +333,7 @@ func (m *Manager) attest(ctx context.Context, req Request) (*entry, error) {
 		// token later, so validate field 6 before serving it.
 		if _, err := botguard.ValidatePOToken(it.FallbackToken); err != nil {
 			br.RecordFailure()
+			m.opts.Metrics.AttestFailure("validate")
 			return nil, fmt.Errorf("session: fallback token failed validation: %w", err)
 		}
 	}
@@ -326,7 +367,7 @@ func (m *Manager) resolveChallenge(ctx context.Context, req Request) (*botguard.
 		}
 		m.opts.Logger.Debug("innertube att/get failed; falling back to Create", "err", err)
 	}
-	return botguard.FetchCreateChallenge(ctx, req.Client, req.AttestationUA)
+	return botguard.FetchCreateChallenge(ctx, req.Client, req.AttestationUA, req.Endpoint)
 }
 
 // recordVMFailure attributes a VM-stage failure to the breaker: a wasm-boundary
@@ -335,6 +376,7 @@ func (m *Manager) resolveChallenge(ctx context.Context, req Request) (*botguard.
 func (m *Manager) recordVMFailure(br *httpx.Breaker, rt jsruntime.Runtime) {
 	if rt.Poisoned() {
 		br.RecordPoison()
+		m.opts.Metrics.Poisons.Inc()
 	} else {
 		br.RecordFailure()
 	}
@@ -362,6 +404,7 @@ func (m *Manager) maybeRefresh(req Request) {
 		defer cancel()
 		fresh, err := m.attest(ctx, req)
 		if err != nil {
+			m.opts.Metrics.RefreshErrors.Inc()
 			m.opts.Logger.Warn("session refresh-ahead failed; serving current until expiry", "err", err)
 			m.mu.Lock()
 			if cur := m.entries[req.Key]; cur != nil {
@@ -371,6 +414,7 @@ func (m *Manager) maybeRefresh(req Request) {
 			return
 		}
 		m.putEntry(req.Key, fresh)
+		m.opts.Metrics.Refreshes.Inc()
 	}()
 }
 
@@ -453,6 +497,15 @@ func (m *Manager) breaker(key string) *httpx.Breaker {
 	b := m.breakers[key]
 	if b == nil {
 		b = httpx.NewBreaker(m.opts.BreakerThreshold, m.opts.BreakerCooldown)
+		b.OnOpen = func() { m.opts.Metrics.BreakerOpens.Inc() }
+		if m.opts.BreakerStore != nil {
+			if until, ok := m.cooldowns[key]; ok {
+				b.Restore(until)
+				delete(m.cooldowns, key) // consumed; later state comes from the live breaker
+			}
+			store := m.opts.BreakerStore
+			b.Persist = func(openUntil time.Time) { _ = store.SaveBreaker(key, openUntil) }
+		}
 		m.breakers[key] = b
 	}
 	return b

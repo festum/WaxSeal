@@ -43,6 +43,56 @@ func TestApplyFilePartialOverlay(t *testing.T) {
 	}
 }
 
+func TestPersistenceConfig(t *testing.T) {
+	// File sets persistence; env overrides the backend.
+	path := writeFile(t, `{"persist_tokens": true, "disk_backend": "json"}`)
+	t.Setenv("DISK_CACHE_BACKEND", "bbolt")
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !c.PersistTokens {
+		t.Error("persist_tokens should be true (from file)")
+	}
+	if c.DiskBackend != "bbolt" {
+		t.Errorf("disk_backend = %q, want bbolt (env over file)", c.DiskBackend)
+	}
+	if err := c.Validate(); err != nil {
+		t.Errorf("Validate: %v", err)
+	}
+}
+
+func TestInvalidDiskBackendRejected(t *testing.T) {
+	c := Default()
+	c.DiskBackend = "lmdb"
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected an invalid disk backend to fail validation")
+	}
+}
+
+func TestEndpointModeConfig(t *testing.T) {
+	path := writeFile(t, `{"endpoint_mode": "youtube"}`)
+	t.Setenv("ENDPOINT_MODE", "googleapis")
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.EndpointMode != "googleapis" {
+		t.Errorf("endpoint_mode = %q, want googleapis (env over file)", c.EndpointMode)
+	}
+	if err := c.Validate(); err != nil {
+		t.Errorf("Validate: %v", err)
+	}
+}
+
+func TestInvalidEndpointModeRejected(t *testing.T) {
+	c := Default()
+	c.EndpointMode = "jnn-pa"
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected an invalid endpoint mode to fail validation")
+	}
+}
+
 func TestApplyFileUnknownFieldRejected(t *testing.T) {
 	c := Default()
 	if err := c.ApplyFile(writeFile(t, `{"bogus": 1}`)); err == nil {

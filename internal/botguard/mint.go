@@ -53,9 +53,10 @@ func Snapshot(ctx context.Context, rt jsruntime.Runtime, ch *Challenge, profileJ
 // done in Go. A response carrying only the fallback token (arr[0] null) is
 // success; the caller decides how to use it. Only a response with neither token
 // is an error.
-func GenerateIT(ctx context.Context, client *httpx.Client, userAgent, botguardResponse string) (*GenerateITResult, error) {
+func GenerateIT(ctx context.Context, client *httpx.Client, userAgent, botguardResponse string, ep Endpoint) (*GenerateITResult, error) {
+	ep = ep.orDefault()
 	body, _ := json.Marshal([]string{RequestKey, botguardResponse})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, GenerateITURL, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ep.GenerateITURL, bytes.NewReader(body))
 	if err != nil {
 		return nil, stageErr(StageGenerateIT, "build request: %w", err)
 	}
@@ -121,8 +122,8 @@ func Mint(ctx context.Context, rt jsruntime.Runtime, identifier string) (string,
 // (profile/cache/session/pool) lives in internal/session and the public
 // waxseal.Client. It requires an integrity token; a fallback-only response
 // returns a StageGenerateIT error so the e2e test can skip.
-func MintToken(ctx context.Context, rt jsruntime.Runtime, client *httpx.Client, userAgent, identifier string) (string, *GenerateITResult, error) {
-	ch, err := FetchCreateChallenge(ctx, client, userAgent)
+func MintToken(ctx context.Context, rt jsruntime.Runtime, client *httpx.Client, userAgent, identifier string, ep Endpoint) (string, *GenerateITResult, error) {
+	ch, err := FetchCreateChallenge(ctx, client, userAgent, ep)
 	if err != nil {
 		return "", nil, err
 	}
@@ -130,7 +131,7 @@ func MintToken(ctx context.Context, rt jsruntime.Runtime, client *httpx.Client, 
 	if err != nil {
 		return "", nil, err
 	}
-	it, err := GenerateIT(ctx, client, userAgent, bgResp)
+	it, err := GenerateIT(ctx, client, userAgent, bgResp, ep)
 	if err != nil {
 		return "", nil, err
 	}

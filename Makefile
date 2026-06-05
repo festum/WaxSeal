@@ -26,6 +26,12 @@ ASSETS        := internal/jsassets
 WASM_OUT      := $(ASSETS)/qjs.wasm
 BUNDLE_OUT    := $(ASSETS)/bg_bundle.js
 
+# Release matrix. The embedded qjs.wasm/bg_bundle.js are arch-neutral and reused
+# unchanged by every target.
+VERSION           ?= dev
+DIST              := dist
+RELEASE_PLATFORMS := linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64
+
 # JS C stack (shadow stack) in linear memory. quickjs needs more than the wasm
 # default; JS-level recursion is separately bounded by JS_SetMaxStackSize.
 WASM_STACK_SIZE ?= 4194304
@@ -48,9 +54,40 @@ LDFLAGS_WASM := \
 	-Wl,--stack-first -Wl,-z,stack-size=$(WASM_STACK_SIZE) \
 	-Wl,--export-table
 
-.PHONY: all wasm jsbundle deps clean provenance
+.PHONY: all wasm jsbundle deps clean provenance test verify-assets release
 
 all: wasm jsbundle
+
+# test runs the offline suite. No C/Node toolchain is needed because the
+# artifacts are committed; this is what CI and `go test ./...` both exercise.
+test:
+	go test ./...
+
+# verify-assets rebuilds the embedded artifacts from the pinned toolchains and
+# fails if they differ from the committed bytes. It depends on `make deps` having
+# fetched the toolchains. The outputs are removed first so make cannot treat the
+# committed files as up to date and skip the rebuild; on a fresh checkout git
+# does not preserve mtimes, so committed artifacts can otherwise look newer than
+# their sources.
+verify-assets:
+	rm -f $(WASM_OUT) $(BUNDLE_OUT)
+	$(MAKE) wasm jsbundle
+	@git diff --exit-code -- $(WASM_OUT) $(BUNDLE_OUT) \
+	  && echo "OK: rebuilt artifacts reproduce the committed bytes" \
+	  || { echo "ERROR: rebuilt artifacts differ from the committed bytes"; exit 1; }
+
+# release cross-compiles the CLI/daemon for the full GOOS/GOARCH matrix into
+# dist/. Each output is a static binary with embedded wasm/JS and no CGo.
+release:
+	@mkdir -p $(DIST)
+	@for p in $(RELEASE_PLATFORMS); do \
+	  os=$${p%/*}; arch=$${p#*/}; ext=""; [ "$$os" = "windows" ] && ext=".exe"; \
+	  out=$(DIST)/waxseal-$$os-$$arch$$ext; \
+	  echo "building $$out"; \
+	  CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch go build -trimpath \
+	    -ldflags "-s -w -X main.version=$(VERSION)" -o $$out ./cmd/waxseal || exit 1; \
+	done
+	@echo "release binaries in $(DIST)/"
 
 # qjs.wasm is the WaxSeal host ABI plus quickjs-ng core, built as an
 # architecture-neutral WASI reactor.
@@ -105,3 +142,4 @@ provenance:
 
 clean:
 	rm -f $(WASM_OUT) $(BUNDLE_OUT)
+	rm -rf $(DIST)

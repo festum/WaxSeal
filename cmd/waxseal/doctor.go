@@ -61,7 +61,7 @@ func runDoctor(cmd *cobra.Command, d *doctorOpts) error {
 	}
 
 	fmt.Fprintln(stdout, "waxseal doctor", version)
-	client, err := buildClient(cfg, logger)
+	client, err := buildClient(cfg, logger, cfg.CacheDir)
 	if err != nil {
 		report(stdout, "init", false, err.Error())
 		return err

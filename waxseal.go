@@ -12,6 +12,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -27,6 +28,8 @@ import (
 	"github.com/colespringer/waxseal/internal/jsassets"
 	"github.com/colespringer/waxseal/internal/jsruntime"
 	"github.com/colespringer/waxseal/internal/jsruntime/quickjs"
+	"github.com/colespringer/waxseal/internal/metrics"
+	"github.com/colespringer/waxseal/internal/persist"
 	"github.com/colespringer/waxseal/internal/session"
 )
 
@@ -40,9 +43,6 @@ const (
 	ScopeContent              // bind video_id (content / player)
 	ScopeOpaque               // mint Identifier as-is (server/CLI)
 )
-
-// endpointModeDefault is youtube.com/api/jnn/v1. It is part of every key.
-const endpointModeDefault = "youtube"
 
 // ErrMissingIdentifier is returned when a request resolves to no mint
 // identifier (e.g. ScopeSession with an empty VisitorData).
@@ -113,6 +113,11 @@ type Options struct {
 
 	Logger *slog.Logger
 
+	// EndpointMode selects the WAA attestation host for Create/GenerateIT:
+	// "" or "youtube" (youtube.com/api/jnn/v1, the default) or "googleapis"
+	// (jnn-pa.googleapis.com). It is validated in New and is part of every key.
+	EndpointMode string
+
 	// Challenge sourcing defaults (per-request Request fields override these).
 	DisableInnertube bool            // skip InnerTube att/get, go straight to Create
 	InnertubeContext json.RawMessage // context sent to att/get; nil uses a default
@@ -123,9 +128,18 @@ type Options struct {
 	CacheContentTokens  bool          // cache ScopeContent tokens (default off; cheap to re-mint)
 	DefaultTTL          time.Duration // used when GenerateIT omits a lifetime (default 1h)
 	SnapshotConcurrency int           // bound concurrent ~910ms snapshots (default GOMAXPROCS/2)
-	Discovery           bool          // keep the shim's API-DRIFT probe trap on (dev/doctor)
+	Discovery           bool          // keep the shim's API drift probe trap on (dev/doctor)
 	CompilationCacheDir string        // wazero AOT cache dir (skip recompile on restart)
 	Watchdog            time.Duration // per VM-call deadline (default 20s)
+
+	// Disk persistence is off when CacheDir is empty, which is the in-process
+	// library default. When CacheDir is set, the non-sensitive breaker cooldown is
+	// persisted by default. The sensitive token cache is persisted only when
+	// PersistTokens is true. A disk that cannot be opened falls back to
+	// memory-only after logging.
+	CacheDir      string // directory for the persistent store (breaker + opt-in tokens)
+	PersistTokens bool   // opt-in: persist minted tokens across restarts (off by default)
+	DiskBackend   string // "bbolt" (default) or "json"
 
 	now    func() time.Time // test hook
 	engine jsruntime.Engine // test hook: inject a fake engine (skips quickjs)
@@ -142,7 +156,12 @@ type Client struct {
 	engine   jsruntime.Engine
 	manager  *session.Manager
 	cache    *cache.Memory[Token]
+	store    persist.Store // disk persistence (Nop when CacheDir unset / disk unavailable)
+	metrics  *metrics.Metrics
 	logger   *slog.Logger
+
+	endpoint     botguard.Endpoint // resolved WAA Create/GenerateIT URLs
+	endpointMode string            // normalized mode string, mixed into keys
 
 	closed bool
 }
@@ -166,6 +185,10 @@ func New(opts Options) (*Client, error) {
 	if opts.now == nil {
 		opts.now = time.Now
 	}
+	endpoint, err := botguard.ResolveEndpoint(opts.EndpointMode)
+	if err != nil {
+		return nil, err
+	}
 
 	eng := opts.engine
 	if eng == nil {
@@ -181,25 +204,93 @@ func New(opts Options) (*Client, error) {
 		eng = qjs
 	}
 
+	mx := metrics.New()
+
+	// Open disk persistence when a directory is configured. Transient open
+	// failures fall back to memory-only; breakerStore stays nil so the session
+	// skips its persistence hooks. Misconfiguration is fatal, since silently
+	// disabling requested persistence would hide the operator's typo.
+	store := persist.Nop()
+	var breakerStore session.BreakerStore
+	if opts.CacheDir != "" {
+		s, err := persist.Open(persist.Options{
+			Dir:         opts.CacheDir,
+			Backend:     opts.DiskBackend,
+			AssetHashes: []string{jsassets.QJSWasmSHA256(), jsassets.BGBundleSHA256()},
+		})
+		switch {
+		case errors.Is(err, persist.ErrInvalidConfig):
+			return nil, err
+		case err != nil:
+			opts.Logger.Warn("waxseal: disk persistence unavailable; using memory-only",
+				"dir", opts.CacheDir, "err", err)
+		default:
+			store, breakerStore = s, s
+		}
+	}
+
 	mgr := session.New(eng, session.Options{
 		SnapshotConcurrency: opts.SnapshotConcurrency,
 		DefaultTTL:          opts.DefaultTTL,
 		MaxTTL:              opts.CacheMaxTTL,
 		Discovery:           opts.Discovery,
 		Logger:              opts.Logger,
+		Metrics:             mx,
+		BreakerStore:        breakerStore,
 	})
 
-	return &Client{
-		opts:     opts,
-		profile:  opts.Profile,
-		profiles: opts.Profiles,
-		http:     httpx.New(opts.HTTPClient),
-		egress:   newEgressCache(defaultEgressCacheSize, opts.HTTPClient.Timeout),
-		engine:   eng,
-		manager:  mgr,
-		cache:    cache.New[Token](opts.CacheMaxEntries),
-		logger:   opts.Logger,
-	}, nil
+	c := &Client{
+		opts:         opts,
+		profile:      opts.Profile,
+		profiles:     opts.Profiles,
+		http:         httpx.New(opts.HTTPClient),
+		egress:       newEgressCache(defaultEgressCacheSize, opts.HTTPClient.Timeout),
+		engine:       eng,
+		manager:      mgr,
+		cache:        cache.New[Token](opts.CacheMaxEntries),
+		store:        store,
+		metrics:      mx,
+		logger:       opts.Logger,
+		endpoint:     endpoint,
+		endpointMode: botguard.NormalizeEndpointMode(opts.EndpointMode),
+	}
+	if opts.PersistTokens {
+		c.loadPersistedTokens()
+	}
+	return c, nil
+}
+
+// loadPersistedTokens warms the in-memory cache from disk so a restart reuses
+// still-valid tokens instead of minting again. Expired records are dropped by
+// the store on load.
+func (c *Client) loadPersistedTokens() {
+	recs, err := c.store.LoadTokens()
+	if err != nil {
+		c.logger.Warn("waxseal: load persisted tokens failed", "err", err)
+		return
+	}
+	now := c.opts.now()
+	for key, rec := range recs {
+		var tok Token
+		if err := json.Unmarshal(rec.Data, &tok); err != nil {
+			continue // skip an unreadable record rather than fail startup
+		}
+		// Re-apply the current TTL cap: a token persisted under a looser (or
+		// unset) CacheMaxTTL must not outlive a now-lower cap. Freshly minted
+		// entries are capped in session.expiryFrom; hydrated ones must match, in
+		// both the cache eviction time and the token's advertised expiry.
+		exp := rec.ExpiresAt
+		if c.opts.CacheMaxTTL > 0 {
+			if capped := now.Add(c.opts.CacheMaxTTL); capped.Before(exp) {
+				exp = capped
+			}
+		}
+		tok.ExpiresAt = exp
+		c.cache.Set(key, tok, exp)
+	}
+	if len(recs) > 0 {
+		c.logger.Debug("waxseal: restored persisted tokens", "count", len(recs))
+	}
 }
 
 // normalizeEgress derives ID from the egress-affecting fields when WaxSeal owns
@@ -252,9 +343,11 @@ func (c *Client) Token(ctx context.Context, req Request) (Token, error) {
 		// because their validity differs.
 		for _, kind := range []session.TokenKind{session.KindIntegrity, session.KindFallback} {
 			if tok, ok := c.cache.Get(c.cacheKey(req, profile, identifier, kind)); ok {
+				c.metrics.CacheHits.Inc()
 				return tok, nil
 			}
 		}
+		c.metrics.CacheMisses.Inc()
 	}
 
 	egressClient, err := c.clientFor(req.Egress)
@@ -272,6 +365,7 @@ func (c *Client) Token(ctx context.Context, req Request) (Token, error) {
 		ProfileJSON:      profile.shimJSON(),
 		AttestationUA:    profile.AttestationUA,
 		Client:           egressClient,
+		Endpoint:         c.endpoint,
 		ForceNew:         req.BypassCache,
 		Challenge:        challenge,
 		InnertubeContext: c.innertubeContext(req),
@@ -283,9 +377,42 @@ func (c *Client) Token(ctx context.Context, req Request) (Token, error) {
 
 	tok := Token{Value: res.Token, ExpiresAt: res.ExpiresAt}
 	if c.shouldCache(req.Scope, res.Kind) {
-		c.cache.Set(c.cacheKey(req, profile, identifier, res.Kind), tok, res.ExpiresAt)
+		key := c.cacheKey(req, profile, identifier, res.Kind)
+		c.cache.Set(key, tok, res.ExpiresAt)
+		if c.persistable(req.Egress) {
+			c.persistToken(key, tok)
+		}
 	}
 	return tok, nil
+}
+
+// persistable reports whether a token for this egress may be written to disk. A
+// non-empty Egress.ID is a stable identity. An empty ID is safe only when WaxSeal
+// owns the transport (EgressTransport set): then the ID is derived from the
+// egress spec, and empty means direct egress with proxy/source/TLS all unset.
+// On the in-process Options.HTTPClient path, an empty ID is an unlabeled
+// *http.Client, so its tokens stay memory-only. Two different jars or proxies
+// must not share a persisted token.
+func (c *Client) persistable(egress EgressSpec) bool {
+	return egress.ID != "" || c.opts.EgressTransport != nil
+}
+
+// persistToken write-throughs a cached token to disk when token persistence is
+// enabled, so a restart can serve it without a re-mint. Best-effort: a disk
+// error is logged, never surfaced (the token was already returned from memory).
+// The caller gates this on persistable(egress).
+func (c *Client) persistToken(key string, tok Token) {
+	if !c.opts.PersistTokens {
+		return
+	}
+	data, err := json.Marshal(tok)
+	if err != nil {
+		c.logger.Debug("waxseal: persist token failed (marshal)", "err", err)
+		return
+	}
+	if err := c.store.SaveToken(key, persist.TokenRecord{Data: data, ExpiresAt: tok.ExpiresAt}); err != nil {
+		c.logger.Debug("waxseal: persist token failed", "err", err)
+	}
 }
 
 // SessionToken is a convenience for a GVS/session token bound to visitorData
@@ -335,15 +462,26 @@ func (c *Client) Prewarm(req Request) {
 		ProfileJSON:      profile.shimJSON(),
 		AttestationUA:    profile.AttestationUA,
 		Client:           egressClient,
+		Endpoint:         c.endpoint,
 		InnertubeContext: c.innertubeContext(req),
 		DisableInnertube: c.disableInnertube(req),
 	})
 }
 
-// PurgeTokens empties the token cache (the server's invalidate_caches). Warm
-// minters keep serving; only previously minted/cached tokens are dropped.
+// PurgeTokens empties the token cache (the server's invalidate_caches), in
+// memory and on disk. Warm minters keep serving; only previously minted/cached
+// tokens are dropped.
 func (c *Client) PurgeTokens() {
 	c.cache.Purge()
+	if err := c.store.PurgeTokens(); err != nil {
+		c.logger.Debug("waxseal: purge persisted tokens failed", "err", err)
+	}
+}
+
+// WriteMetrics renders the client's metric set in Prometheus text exposition
+// format (the server's /metrics endpoint).
+func (c *Client) WriteMetrics(w io.Writer) error {
+	return c.metrics.WritePrometheus(w)
 }
 
 // InvalidateMinters evicts every warm minter session (the server's invalidate_it)
@@ -357,7 +495,7 @@ func (c *Client) MinterKeys() []string {
 	return c.manager.Keys()
 }
 
-// Close releases the warm runtimes and the shared engine.
+// Close releases the warm runtimes, the disk store, and the shared engine.
 func (c *Client) Close() error {
 	if c.closed {
 		return nil
@@ -365,6 +503,9 @@ func (c *Client) Close() error {
 	c.closed = true
 	_ = c.manager.Close()
 	c.egress.closeAll()
+	if err := c.store.Close(); err != nil {
+		c.logger.Debug("waxseal: close persist store failed", "err", err)
+	}
 	return c.engine.Close(context.Background())
 }
 
@@ -425,7 +566,7 @@ func (c *Client) shouldCache(scope Scope, _ session.TokenKind) bool {
 // minterKey is the warm-minter key: the token key minus identifier and kind.
 func (c *Client) minterKey(req Request, p BrowserProfile) string {
 	return strings.Join([]string{
-		req.Egress.ID, endpointModeDefault, p.Hash(), req.ClientName, req.ClientVersion,
+		req.Egress.ID, c.endpointMode, p.Hash(), req.ClientName, req.ClientVersion,
 	}, "|")
 }
 
@@ -433,7 +574,7 @@ func (c *Client) minterKey(req Request, p BrowserProfile) string {
 func (c *Client) cacheKey(req Request, p BrowserProfile, identifier string, kind session.TokenKind) string {
 	return strings.Join([]string{
 		string(kind), scopeString(req.Scope), identifier,
-		req.ClientName, req.ClientVersion, req.Egress.ID, endpointModeDefault, p.Hash(),
+		req.ClientName, req.ClientVersion, req.Egress.ID, c.endpointMode, p.Hash(),
 	}, "|")
 }
 

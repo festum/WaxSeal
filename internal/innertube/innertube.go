@@ -98,9 +98,10 @@ func parseBGChallenge(raw []byte) (*botguard.Challenge, error) {
 		return nil, stageErr(botguard.StageParse, "bgChallenge missing program or globalName")
 	}
 	return &botguard.Challenge{
-		InterpreterURL: url,
-		Program:        bg.Program,
-		GlobalName:     bg.GlobalName,
+		InterpreterURL:  url,
+		InterpreterHash: bg.InterpreterHash,
+		Program:         bg.Program,
+		GlobalName:      bg.GlobalName,
 	}, nil
 }
 

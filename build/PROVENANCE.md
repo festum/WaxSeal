@@ -23,7 +23,7 @@ CI rebuilds them and diffs against these hashes for reproducibility.
 
 ```
 qjs.wasm      2a4c75c0a3ef559055c18e210fe0466766f67fab38a6b1d378f7e04b7317691a   (901,990 B)
-bg_bundle.js  1f51a29ae783d90beff9e2a08b1a745b9943b17c07d121db8633ccb02e4d0d1e   (101,989 B)
+bg_bundle.js  39b51909d76acb841a9ec9537783ef70293764585f0dc4626fe935803b019652   (102,019 B)
 ```
 
 `qjs.wasm` is the `wasm-opt -Os` output (901,990 B, down 28.7% from the

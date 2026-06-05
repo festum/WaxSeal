@@ -15,6 +15,7 @@ require (
 	github.com/go-sourcemap/sourcemap v2.1.4+incompatible // indirect
 	github.com/google/pprof v0.0.0-20230207041349-798e818bf904 // indirect
 	github.com/tetratelabs/wazero v1.12.0 // indirect
+	go.etcd.io/bbolt v1.3.11 // indirect
 	golang.org/x/sys v0.44.0 // indirect
 	golang.org/x/text v0.35.0 // indirect
 )

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -38,6 +39,10 @@ func (f *fakeClient) VisitorData(context.Context, waxseal.EgressSpec) (string, e
 func (f *fakeClient) PurgeTokens()         { f.purged++ }
 func (f *fakeClient) InvalidateMinters()   { f.invalidated++ }
 func (f *fakeClient) MinterKeys() []string { return f.keys }
+func (f *fakeClient) WriteMetrics(w io.Writer) error {
+	_, err := io.WriteString(w, "# waxseal metrics\nwaxseal_snapshots_total 0\n")
+	return err
+}
 
 func do(t *testing.T, h http.Handler, method, path, body string, headers map[string]string) *httptest.ResponseRecorder {
 	t.Helper()
@@ -198,6 +203,20 @@ func TestPing(t *testing.T) {
 	}
 	if resp.Version != "1.2.3" {
 		t.Errorf("version = %q", resp.Version)
+	}
+}
+
+func TestMetricsEndpoint(t *testing.T) {
+	h := New(&fakeClient{}, Options{}).Handler()
+	w := do(t, h, "GET", "/metrics", "", nil)
+	if w.Code != 200 {
+		t.Fatalf("status %d", w.Code)
+	}
+	if ct := w.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/plain") {
+		t.Errorf("Content-Type = %q, want Prometheus text", ct)
+	}
+	if !strings.Contains(w.Body.String(), "waxseal_snapshots_total") {
+		t.Errorf("metrics body missing a known series:\n%s", w.Body.String())
 	}
 }
 

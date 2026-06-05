@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 
 	"github.com/colespringer/waxseal/internal/httpx"
 )
@@ -22,7 +23,7 @@ const (
 	xUserAgent       = "grpc-web-javascript/0.1"
 	DefaultUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.10 Safari/605.1.1"
 
-	// Default endpoint mode: youtube.com/api/jnn/v1 (vs jnn-pa.googleapis.com).
+	// CreateURL/GenerateITURL are the default endpoint mode (youtube.com/api/jnn/v1).
 	CreateURL     = "https://www.youtube.com/api/jnn/v1/Create"
 	GenerateITURL = "https://www.youtube.com/api/jnn/v1/GenerateIT"
 
@@ -30,6 +31,61 @@ const (
 	maxInterpreterBody      = 24 << 20 // the obfuscated interpreter can be large
 	maxInterpreterRedirects = 3
 )
+
+// EndpointMode selects which WAA host serves Create/GenerateIT attestation
+// calls. The default youtube.com/api/jnn/v1 path needs no auth; googleapis
+// targets jnn-pa.googleapis.com for bgutil parity. Only WAA calls vary by mode;
+// InnerTube att/get is always on youtube.com.
+type EndpointMode string
+
+const (
+	EndpointYouTube    EndpointMode = "youtube"    // youtube.com/api/jnn/v1 (default)
+	EndpointGoogleAPIs EndpointMode = "googleapis" // jnn-pa.googleapis.com
+)
+
+// Endpoint carries the resolved Create/GenerateIT URLs for a mode.
+type Endpoint struct {
+	CreateURL     string
+	GenerateITURL string
+}
+
+// DefaultEndpoint is the youtube.com/api/jnn/v1 mode.
+var DefaultEndpoint = Endpoint{CreateURL: CreateURL, GenerateITURL: GenerateITURL}
+
+// ResolveEndpoint maps a mode string (empty = default) to its Endpoint, erroring
+// on an unknown mode so a typo fails loudly at construction.
+func ResolveEndpoint(mode string) (Endpoint, error) {
+	switch EndpointMode(NormalizeEndpointMode(mode)) {
+	case EndpointYouTube:
+		return DefaultEndpoint, nil
+	case EndpointGoogleAPIs:
+		return Endpoint{
+			CreateURL:     "https://jnn-pa.googleapis.com/$rpc/google.internal.waa.v1.Waa/Create",
+			GenerateITURL: "https://jnn-pa.googleapis.com/$rpc/google.internal.waa.v1.Waa/GenerateIT",
+		}, nil
+	default:
+		return Endpoint{}, fmt.Errorf("botguard: unknown endpoint mode %q (want %q or %q)", mode, EndpointYouTube, EndpointGoogleAPIs)
+	}
+}
+
+// NormalizeEndpointMode lowercases/trims a mode and maps empty to the default. It
+// is the canonical string mixed into cache/minter keys.
+func NormalizeEndpointMode(mode string) string {
+	m := strings.ToLower(strings.TrimSpace(mode))
+	if m == "" {
+		return string(EndpointYouTube)
+	}
+	return m
+}
+
+// orDefault substitutes DefaultEndpoint for a zero Endpoint value (defensive for
+// callers/tests that leave it unset).
+func (e Endpoint) orDefault() Endpoint {
+	if e.CreateURL == "" || e.GenerateITURL == "" {
+		return DefaultEndpoint
+	}
+	return e
+}
 
 // Stage tags every error for drift telemetry, so an upstream change reports as
 // "descramble", "parse", "vm", "generateit", or "validate" rather than a
@@ -62,19 +118,21 @@ func stageErr(s Stage, format string, a ...any) error {
 
 // Challenge is the parsed (and interpreter-resolved) BotGuard challenge.
 type Challenge struct {
-	InterpreterJS  string // resolved inline interpreter JS (the only JS we run)
-	Program        string // arr[4]
-	GlobalName     string // arr[5]
-	InterpreterURL string // set when sourced from a URL (for hashing/telemetry)
+	InterpreterJS   string // resolved inline interpreter JS (the only JS we run)
+	Program         string // arr[4]
+	GlobalName      string // arr[5]
+	InterpreterURL  string // set when sourced from a URL (for fetching/telemetry)
+	InterpreterHash string // att/get's interpreterHash, when supplied (cache key)
 }
 
 // FetchCreateChallenge runs the WAA Create source: POST Create, parse or
 // descramble, then resolve the interpreter (inline, or a bounded host-allowlisted
 // fetch). All HTTP is done in Go through the shared httpx layer. userAgent is
 // the profile's attestation UA; WAA requires a WebKit-family UA.
-func FetchCreateChallenge(ctx context.Context, client *httpx.Client, userAgent string) (*Challenge, error) {
+func FetchCreateChallenge(ctx context.Context, client *httpx.Client, userAgent string, ep Endpoint) (*Challenge, error) {
+	ep = ep.orDefault()
 	body, _ := json.Marshal([]string{RequestKey})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, CreateURL, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ep.CreateURL, bytes.NewReader(body))
 	if err != nil {
 		return nil, stageErr(StageTransport, "build Create request: %w", err)
 	}
@@ -260,6 +318,16 @@ func ResolveInterpreter(ctx context.Context, client *httpx.Client, ch *Challenge
 	if ch.InterpreterJS != "" {
 		return nil
 	}
+	// Reuse a previously-fetched interpreter for the same hash/URL: it is the same
+	// Google JS regardless of egress/profile, so this avoids refetching the ~62 KB
+	// blob on minter refreshes and across egresses. Memory-only, never persisted.
+	cacheKey := interpKey(ch)
+	if cacheKey != "" {
+		if js, ok := interpCache.get(cacheKey); ok {
+			ch.InterpreterJS = js
+			return nil
+		}
+	}
 	rawURL := ch.InterpreterURL
 	if strings.HasPrefix(rawURL, "//") {
 		rawURL = "https:" + rawURL
@@ -307,7 +375,61 @@ func ResolveInterpreter(ctx context.Context, client *httpx.Client, ch *Challenge
 		return stageErr(StageInterp, "read interpreter: %w", err)
 	}
 	ch.InterpreterJS = string(data)
+	if cacheKey != "" {
+		interpCache.put(cacheKey, ch.InterpreterJS)
+	}
 	return nil
+}
+
+// interpKey is the interpreter cache key: the att/get-supplied hash when present,
+// else the source URL (stable per interpreter version). Empty means uncacheable.
+func interpKey(ch *Challenge) string {
+	if ch.InterpreterHash != "" {
+		return "h:" + ch.InterpreterHash
+	}
+	if ch.InterpreterURL != "" {
+		return "u:" + ch.InterpreterURL
+	}
+	return ""
+}
+
+// interpreterCache memoizes fetched interpreter JS by interpKey. It is
+// process-wide (the interpreter is the same for every egress/profile),
+// memory-only (live-from-Google is never persisted), and bounded so many
+// interpreter versions cannot grow it without limit.
+type interpreterCache struct {
+	mu  sync.Mutex
+	max int
+	m   map[string]string
+}
+
+var interpCache = &interpreterCache{max: 4, m: make(map[string]string)}
+
+func (c *interpreterCache) get(key string) (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	js, ok := c.m[key]
+	return js, ok
+}
+
+func (c *interpreterCache) put(key, js string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, exists := c.m[key]; !exists && len(c.m) >= c.max {
+		for k := range c.m { // versions change rarely; evicting any is fine
+			delete(c.m, k)
+			break
+		}
+	}
+	c.m[key] = js
+}
+
+// ClearInterpreterCache drops all cached interpreters. It backs forced-refresh
+// paths (and keeps tests isolated from this process-wide cache).
+func ClearInterpreterCache() {
+	interpCache.mu.Lock()
+	defer interpCache.mu.Unlock()
+	clear(interpCache.m)
 }
 
 // hostAllowed permits google.com/youtube.com and their subdomains only, by exact
