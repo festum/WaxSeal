@@ -461,6 +461,12 @@ import {
     def('innerHeight', prof.screen[1] - 120);
     def('outerWidth', prof.screen[0]);
     def('outerHeight', prof.screen[1]);
+    // Window position values are always numbers in browsers. screenLeft and
+    // screenTop are legacy aliases for screenX/screenY; keep all four at 0.
+    def('screenX', 0);
+    def('screenY', 0);
+    def('screenLeft', 0);
+    def('screenTop', 0);
     def('devicePixelRatio', 1);
 
     // location: a real Location instance.

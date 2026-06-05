@@ -87,6 +87,67 @@ func TestParseCreateArrayScrambledAndStructured(t *testing.T) {
 	}
 }
 
+func TestParseProvidedChallengeObject(t *testing.T) {
+	raw := json.RawMessage(`{
+		"interpreterUrl": {"privateDoNotAccessOrElseTrustedResourceUrlWrappedValue": "//www.google.com/js/bg.js"},
+		"interpreterHash": "h",
+		"program": "PROG",
+		"globalName": "gn"
+	}`)
+	ch, err := ParseProvidedChallenge(raw)
+	if err != nil {
+		t.Fatalf("object: %v", err)
+	}
+	if ch.InterpreterURL != "//www.google.com/js/bg.js" || ch.Program != "PROG" || ch.GlobalName != "gn" {
+		t.Fatalf("object parsed = %+v", ch)
+	}
+	if ch.InterpreterJS != "" {
+		t.Fatal("object challenge should be URL-only (unresolved)")
+	}
+}
+
+func TestParseProvidedChallengeArray(t *testing.T) {
+	inner := []any{"v", []any{"INLINE_JS"}, []any{}, 0, "PROG", "gn"}
+	b, _ := json.Marshal(inner)
+	ch, err := ParseProvidedChallenge(b)
+	if err != nil {
+		t.Fatalf("array: %v", err)
+	}
+	if ch.InterpreterJS != "INLINE_JS" || ch.Program != "PROG" {
+		t.Fatalf("array parsed = %+v", ch)
+	}
+}
+
+func TestParseProvidedChallengeStringScrambled(t *testing.T) {
+	inner := []any{"v", []any{"INLINE_JS"}, []any{}, 0, "PROG", "gn"}
+	innerJSON, _ := json.Marshal(inner)
+	s, _ := json.Marshal(scramble(innerJSON)) // JSON string of the scrambled payload
+	ch, err := ParseProvidedChallenge(s)
+	if err != nil {
+		t.Fatalf("scrambled string: %v", err)
+	}
+	if ch.InterpreterJS != "INLINE_JS" || ch.GlobalName != "gn" {
+		t.Fatalf("scrambled string parsed = %+v", ch)
+	}
+}
+
+func TestParseProvidedChallengeBad(t *testing.T) {
+	cases := map[string]string{
+		"empty":             ``,
+		"object no program": `{"interpreterUrl":{"privateDoNotAccessOrElseTrustedResourceUrlWrappedValue":"//www.google.com/x.js"}}`,
+		"object no url":     `{"program":"P","globalName":"g"}`,
+		"garbage string":    `"not a challenge"`,
+		"number":            `42`,
+	}
+	for name, raw := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ParseProvidedChallenge(json.RawMessage(raw)); err == nil {
+				t.Fatalf("expected error for %s", name)
+			}
+		})
+	}
+}
+
 func TestHostAllowlist(t *testing.T) {
 	allowed := []string{"google.com", "www.google.com", "youtube.com", "s.youtube.com", "a.b.google.com"}
 	denied := []string{"evilgoogle.com", "google.com.evil.com", "googlexcom", "example.com", "notyoutube.com", ""}

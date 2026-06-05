@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/colespringer/waxseal/internal/botguard"
 	"github.com/colespringer/waxseal/internal/httpx"
 	"github.com/colespringer/waxseal/internal/jsruntime"
 )
@@ -75,9 +76,12 @@ func (r *fakeRuntime) Close(ctx context.Context) error {
 }
 
 // fakeTransport answers the Create / GenerateIT endpoints with canned bodies.
+// attGetCount tracks InnerTube att/get hits; by default att/get 404s so callers
+// that disable InnerTube (most minter-mechanics tests) stay on the Create path.
 type fakeTransport struct {
-	createCount, genITCount atomic.Int32
-	genITBody               func() (int, string) // status, body
+	createCount, genITCount, attGetCount atomic.Int32
+	genITBody                            func() (int, string) // status, body
+	serveAttGet                          bool                 // answer att/get + interpreter fetch
 }
 
 func (f *fakeTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -90,6 +94,15 @@ func (f *fakeTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		}
 	}
 	switch {
+	case strings.HasSuffix(req.URL.Path, "/att/get"):
+		f.attGetCount.Add(1)
+		if !f.serveAttGet {
+			return mk(404, ""), nil
+		}
+		// bgChallenge points at an allowlisted interpreter URL (fetched below).
+		return mk(200, `{"bgChallenge":{"interpreterUrl":{"privateDoNotAccessOrElseTrustedResourceUrlWrappedValue":"//www.google.com/js/bg.js"},"program":"PROGRAM","globalName":"globalName"}}`), nil
+	case strings.HasSuffix(req.URL.Path, "/js/bg.js"):
+		return mk(200, "VAR_GLOBAL=1;"), nil // the interpreter JS
 	case strings.HasSuffix(req.URL.Path, "/Create"):
 		f.createCount.Add(1)
 		// Structured family: arr[0] is the challenge array with INLINE interpreter.
@@ -128,8 +141,11 @@ func clientWith(tr *fakeTransport) *httpx.Client {
 	return c
 }
 
+// req builds a minter-mechanics request. InnerTube is disabled so the challenge
+// comes deterministically from Create; the challenge-source chain itself is
+// covered by TestChallengeSourcePriority.
 func req(key, id string, hc *httpx.Client) Request {
-	return Request{Key: key, Identifier: id, AttestationUA: "UA", Client: hc}
+	return Request{Key: key, Identifier: id, AttestationUA: "UA", Client: hc, DisableInnertube: true}
 }
 
 // Manager behavior.
@@ -365,6 +381,67 @@ func TestMintFromEntryReleasesLockOnPanic(t *testing.T) {
 		t.Fatal("e.mu still held after a panicking mint; deferred Unlock did not run")
 	}
 	e.mu.Unlock()
+}
+
+// TestChallengeSourcePriority exercises the resolveChallenge chain: a
+// caller-provided challenge wins outright; otherwise InnerTube att/get is used;
+// and an att/get failure falls through to Create.
+func TestChallengeSourcePriority(t *testing.T) {
+	t.Run("caller challenge wins (no challenge HTTP)", func(t *testing.T) {
+		eng := &fakeEngine{}
+		tr := &fakeTransport{genITBody: fallbackBody}
+		m := newTestManager(eng, Options{})
+		hc := clientWith(tr)
+
+		r := req("k", "x", hc)
+		r.DisableInnertube = false // would use att/get, but Challenge preempts it
+		r.Challenge = &botguard.Challenge{InterpreterJS: "VAR=1;", Program: "P", GlobalName: "g"}
+		if _, err := m.Token(context.Background(), r); err != nil {
+			t.Fatalf("token: %v", err)
+		}
+		if got := tr.attGetCount.Load(); got != 0 {
+			t.Errorf("att/get hit %d times despite a caller challenge", got)
+		}
+		if got := tr.createCount.Load(); got != 0 {
+			t.Errorf("Create hit %d times despite a caller challenge", got)
+		}
+	})
+
+	t.Run("att/get used when enabled", func(t *testing.T) {
+		eng := &fakeEngine{}
+		tr := &fakeTransport{genITBody: fallbackBody, serveAttGet: true}
+		m := newTestManager(eng, Options{})
+		hc := clientWith(tr)
+
+		r := Request{Key: "k", Identifier: "x", AttestationUA: "UA", Client: hc}
+		if _, err := m.Token(context.Background(), r); err != nil {
+			t.Fatalf("token: %v", err)
+		}
+		if got := tr.attGetCount.Load(); got != 1 {
+			t.Errorf("att/get hit %d times, want 1", got)
+		}
+		if got := tr.createCount.Load(); got != 0 {
+			t.Errorf("Create hit %d times, want 0 (att/get succeeded)", got)
+		}
+	})
+
+	t.Run("att/get failure falls through to Create", func(t *testing.T) {
+		eng := &fakeEngine{}
+		tr := &fakeTransport{genITBody: fallbackBody, serveAttGet: false} // att/get 404s
+		m := newTestManager(eng, Options{})
+		hc := clientWith(tr)
+
+		r := Request{Key: "k", Identifier: "x", AttestationUA: "UA", Client: hc}
+		if _, err := m.Token(context.Background(), r); err != nil {
+			t.Fatalf("token: %v", err)
+		}
+		if got := tr.attGetCount.Load(); got != 1 {
+			t.Errorf("att/get hit %d times, want 1 (attempted)", got)
+		}
+		if got := tr.createCount.Load(); got != 1 {
+			t.Errorf("Create hit %d times, want 1 (fallback)", got)
+		}
+	})
 }
 
 // validateField6 mirrors the production check so the test asserts served tokens

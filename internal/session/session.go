@@ -20,6 +20,7 @@ import (
 
 	"github.com/colespringer/waxseal/internal/botguard"
 	"github.com/colespringer/waxseal/internal/httpx"
+	"github.com/colespringer/waxseal/internal/innertube"
 	"github.com/colespringer/waxseal/internal/jsruntime"
 )
 
@@ -37,10 +38,17 @@ const (
 type Request struct {
 	Key           string          // full minter key (egress/endpoint/profile hash/client)
 	Identifier    string          // visitor_data / video_id / opaque mint identifier
-	ProfileJSON   json.RawMessage // coherent BrowserProfile for runBotguard
+	ProfileJSON   json.RawMessage // BrowserProfile JSON for runBotguard
 	AttestationUA string          // UA for Create/GenerateIT
 	Client        *httpx.Client   // egress (shared transport + jar)
 	ForceNew      bool            // 403/bypass: discard the warm entry, re-attest
+
+	// Challenge inputs (priority: caller -> InnerTube att/get -> Create).
+	// A caller-provided challenge is used only on the synchronous cold path;
+	// background refreshes fetch their own challenge.
+	Challenge        *botguard.Challenge
+	InnertubeContext json.RawMessage // sent verbatim to att/get; nil uses a default
+	DisableInnertube bool            // skip att/get, go straight to Create
 }
 
 // Result is a minted (or fallback) token with its authoritative expiry.
@@ -254,7 +262,7 @@ func (m *Manager) attest(ctx context.Context, req Request) (*entry, error) {
 		_, _ = rt.Eval(ctx, "globalThis.__wxDiscovery=false;globalThis.__wxAutoStub=false;")
 	}
 
-	ch, err := botguard.FetchCreateChallenge(ctx, req.Client, req.AttestationUA)
+	ch, err := m.resolveChallenge(ctx, req)
 	if err != nil {
 		br.RecordFailure()
 		return nil, err
@@ -294,6 +302,33 @@ func (m *Manager) attest(ctx context.Context, req Request) (*entry, error) {
 	return e, nil
 }
 
+// resolveChallenge chooses the challenge source. A caller-provided challenge
+// wins; otherwise att/get is tried unless disabled. att/get failures fall back
+// to WAA Create.
+func (m *Manager) resolveChallenge(ctx context.Context, req Request) (*botguard.Challenge, error) {
+	if req.Challenge != nil {
+		// A caller-supplied object/URL challenge carries no inline JS; fetch it
+		// through the same bounded, host-allowlisted path as Create.
+		if req.Challenge.InterpreterJS == "" && req.Challenge.InterpreterURL != "" {
+			if err := botguard.ResolveInterpreter(ctx, req.Client, req.Challenge, req.AttestationUA); err != nil {
+				return nil, err
+			}
+		}
+		return req.Challenge, nil
+	}
+	if !req.DisableInnertube {
+		ch, err := innertube.GetChallenge(ctx, req.Client, req.AttestationUA, req.InnertubeContext)
+		if err == nil {
+			return ch, nil
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err() // cancellation should not fall through to Create
+		}
+		m.opts.Logger.Debug("innertube att/get failed; falling back to Create", "err", err)
+	}
+	return botguard.FetchCreateChallenge(ctx, req.Client, req.AttestationUA)
+}
+
 // recordVMFailure attributes a VM-stage failure to the breaker: a wasm-boundary
 // poison counts toward the poison rate, while a plain failure counts toward the
 // consecutive failure streak.
@@ -317,6 +352,10 @@ func (m *Manager) maybeRefresh(req Request) {
 	}
 	e.refreshing = true
 	m.mu.Unlock()
+
+	// Caller-provided challenges are single-use. A later refresh must fetch a
+	// fresh challenge instead of replaying the original one.
+	req.Challenge = nil
 
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), m.opts.RefreshTimeout)
@@ -419,8 +458,22 @@ func (m *Manager) breaker(key string) *httpx.Breaker {
 	return b
 }
 
-// Close releases all warm runtimes. The shared engine is the caller's to close.
-func (m *Manager) Close() error {
+// Keys returns the current warm-minter keys (for the server's minter_cache
+// endpoint). Order is unspecified.
+func (m *Manager) Keys() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	keys := make([]string, 0, len(m.entries))
+	for k := range m.entries {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+// InvalidateAll evicts every warm minter (closing its runtime), forcing the next
+// request to re-attest. It backs the server's invalidate_it endpoint and leaves
+// the manager usable. The shared engine is untouched.
+func (m *Manager) InvalidateAll() {
 	m.mu.Lock()
 	entries := m.entries
 	m.entries = make(map[string]*entry)
@@ -428,5 +481,10 @@ func (m *Manager) Close() error {
 	for _, e := range entries {
 		closeRuntime(e, nil)
 	}
+}
+
+// Close releases all warm runtimes. The shared engine is the caller's to close.
+func (m *Manager) Close() error {
+	m.InvalidateAll()
 	return nil
 }

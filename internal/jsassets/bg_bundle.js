@@ -2872,6 +2872,10 @@
       def("innerHeight", prof.screen[1] - 120);
       def("outerWidth", prof.screen[0]);
       def("outerHeight", prof.screen[1]);
+      def("screenX", 0);
+      def("screenY", 0);
+      def("screenLeft", 0);
+      def("screenTop", 0);
       def("devicePixelRatio", 1);
       const loc = Object.assign(Object.create(G3.Location.prototype), {
         href: "https://www.youtube.com/",

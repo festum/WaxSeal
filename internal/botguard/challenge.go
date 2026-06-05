@@ -26,7 +26,7 @@ const (
 	CreateURL     = "https://www.youtube.com/api/jnn/v1/Create"
 	GenerateITURL = "https://www.youtube.com/api/jnn/v1/GenerateIT"
 
-	maxChallengeBody        = 4 << 20  // bounded response bodies (politeness/safety)
+	maxChallengeBody        = 4 << 20  // bounded response bodies
 	maxInterpreterBody      = 24 << 20 // the obfuscated interpreter can be large
 	maxInterpreterRedirects = 3
 )
@@ -94,7 +94,7 @@ func FetchCreateChallenge(ctx context.Context, client *httpx.Client, userAgent s
 	if err != nil {
 		return nil, err
 	}
-	if err := resolveInterpreter(ctx, client, ch, userAgent); err != nil {
+	if err := ResolveInterpreter(ctx, client, ch, userAgent); err != nil {
 		return nil, err
 	}
 	return ch, nil
@@ -144,6 +144,71 @@ func descramble(scrambled string) ([]byte, error) {
 	return out, nil
 }
 
+// ParseProvidedChallenge parses a caller-supplied challenge from /get_pot or a
+// page into an unresolved Challenge. Accepted shapes are bgutil's structured
+// object, a challenge-data array, and the legacy scrambled string. Interpreter
+// URLs are resolved by the caller with ResolveInterpreter.
+func ParseProvidedChallenge(raw json.RawMessage) (*Challenge, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return nil, stageErr(StageParse, "empty challenge")
+	}
+	switch trimmed[0] {
+	case '{':
+		return parseObjectChallenge(trimmed)
+	case '[':
+		var cdata []json.RawMessage
+		if err := json.Unmarshal(trimmed, &cdata); err != nil {
+			return nil, stageErr(StageParse, "challenge array: %w", err)
+		}
+		return parseChallengeData(cdata)
+	case '"':
+		var s string
+		if err := json.Unmarshal(trimmed, &s); err != nil {
+			return nil, stageErr(StageParse, "challenge string: %w", err)
+		}
+		return parseStringChallenge(s)
+	}
+	return nil, stageErr(StageParse, "unrecognized challenge shape")
+}
+
+// parseObjectChallenge reads bgutil's structured-object shape.
+func parseObjectChallenge(raw []byte) (*Challenge, error) {
+	var obj struct {
+		InterpreterURL struct {
+			Priv string `json:"privateDoNotAccessOrElseTrustedResourceUrlWrappedValue"`
+		} `json:"interpreterUrl"`
+		Program    string `json:"program"`
+		GlobalName string `json:"globalName"`
+	}
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return nil, stageErr(StageParse, "challenge object: %w", err)
+	}
+	if obj.Program == "" || obj.GlobalName == "" {
+		return nil, stageErr(StageParse, "challenge object missing program/globalName")
+	}
+	if obj.InterpreterURL.Priv == "" {
+		return nil, stageErr(StageParse, "challenge object missing interpreterUrl")
+	}
+	return &Challenge{InterpreterURL: obj.InterpreterURL.Priv, Program: obj.Program, GlobalName: obj.GlobalName}, nil
+}
+
+// parseStringChallenge handles the legacy string shape: scrambled base64 or, for
+// compatibility, a plain JSON challenge array encoded as a string.
+func parseStringChallenge(s string) (*Challenge, error) {
+	if descrambled, err := descramble(s); err == nil {
+		var cdata []json.RawMessage
+		if json.Unmarshal(descrambled, &cdata) == nil && len(cdata) >= 6 {
+			return parseChallengeData(cdata)
+		}
+	}
+	var cdata []json.RawMessage
+	if json.Unmarshal([]byte(s), &cdata) == nil && len(cdata) >= 6 {
+		return parseChallengeData(cdata)
+	}
+	return nil, stageErr(StageParse, "unrecognized string challenge")
+}
+
 // parseChallengeData ports parse_challenge_data: interpreter is the first
 // non-empty string in cdata[1] (inline JS) or cdata[2] (URL); program is
 // cdata[4], and globalName is cdata[5].
@@ -186,12 +251,12 @@ func firstNonEmptyString(raw json.RawMessage) string {
 	return ""
 }
 
-// resolveInterpreter fetches a URL-sourced interpreter under a strict host
-// allowlist (exact or suffix match on google.com/youtube.com, not substring),
-// with a bounded body and redirect cap. Inline interpreters pass through. The
-// fetch uses a redirect-guarded clone of the shared transport; the body is
-// capped hard (over-size errors, never silently truncates).
-func resolveInterpreter(ctx context.Context, client *httpx.Client, ch *Challenge, userAgent string) error {
+// ResolveInterpreter fetches a URL-sourced interpreter after validating the host
+// against google.com/youtube.com. Inline interpreters pass through. The fetch
+// uses a redirect-guarded clone of the shared transport and enforces
+// maxInterpreterBody. InnerTube att/get uses this path because it returns a
+// bgChallenge with only an interpreterUrl.
+func ResolveInterpreter(ctx context.Context, client *httpx.Client, ch *Challenge, userAgent string) error {
 	if ch.InterpreterJS != "" {
 		return nil
 	}

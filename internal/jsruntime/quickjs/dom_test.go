@@ -66,6 +66,21 @@ func TestDOMPrototypeChain(t *testing.T) {
 	}
 }
 
+// Window geometry must match browser types. Live BotGuard probes have read
+// window.screenY, and modern browsers expose the legacy screenLeft/screenTop
+// aliases alongside inner/outer dimensions.
+func TestWindowGeometry(t *testing.T) {
+	rt := newBundledRT(t)
+	for _, prop := range []string{
+		"screenX", "screenY", "screenLeft", "screenTop",
+		"innerWidth", "innerHeight", "outerWidth", "outerHeight", "devicePixelRatio",
+	} {
+		evalTrue(t, rt, prop+" is a number", "typeof window."+prop+" === 'number'")
+	}
+	evalTrue(t, rt, "screenLeft mirrors screenX", "window.screenLeft === window.screenX")
+	evalTrue(t, rt, "screenTop mirrors screenY", "window.screenTop === window.screenY")
+}
+
 // createElement maps tags to the correct interface (and the media/SVG sub-chains
 // hold), so the whole instanceof battery agrees with createElement.
 func TestCreateElementTyping(t *testing.T) {
