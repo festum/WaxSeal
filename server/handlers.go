@@ -65,6 +65,9 @@ func (s *Server) handleGetPot(w http.ResponseWriter, r *http.Request) {
 
 	egress := s.egressFor(req)
 	binding := req.ContentBinding
+	// Only a binding sourced here is known to be visitor_data and safe to use as
+	// the att/get session anchor.
+	var sessionVisitorData string
 	if binding == "" {
 		// Caller omitted the binding: fetch guest visitor_data before minting.
 		vd, err := s.client.VisitorData(r.Context(), egress)
@@ -73,11 +76,13 @@ func (s *Server) handleGetPot(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		binding = vd
+		sessionVisitorData = vd
 	}
 
 	tok, err := s.client.Token(r.Context(), waxseal.Request{
 		Scope:            waxseal.ScopeOpaque,
 		Identifier:       binding,
+		VisitorData:      sessionVisitorData,
 		BypassCache:      req.BypassCache,
 		Egress:           egress,
 		Challenge:        req.Challenge,

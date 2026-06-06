@@ -41,16 +41,24 @@ func buildLogger(level, format string, w io.Writer) *slog.Logger {
 	return slog.New(slog.NewTextHandler(w, opts))
 }
 
+// buildClientOpts configures discovery diagnostics for buildClient.
+type buildClientOpts struct {
+	Discovery     bool      // keep the shim's API-drift probe trap on
+	DiscoverySink io.Writer // tee VM stderr (drift probes) here for reporting
+}
+
 // buildClient constructs a waxseal.Client that owns transports, so egress flags
 // affect the network path. It always uses the wazero compilation cache.
 // persistDir, when non-empty, also enables the disk store for breaker cooldowns
 // and, when cfg.PersistTokens is set, cached tokens.
-func buildClient(cfg config.Config, logger *slog.Logger, persistDir string) (*waxseal.Client, error) {
+func buildClient(cfg config.Config, logger *slog.Logger, persistDir string, bco buildClientOpts) (*waxseal.Client, error) {
 	return waxseal.New(waxseal.Options{
 		EgressTransport:     waxseal.BuildEgressTransport,
 		Logger:              logger,
 		DisableInnertube:    cfg.DisableInnertube,
 		CacheMaxTTL:         cfg.CacheMaxTTL,
+		Discovery:           bco.Discovery,
+		DiscoverySink:       bco.DiscoverySink,
 		CompilationCacheDir: compilationCacheDir(cfg.CacheDir),
 		CacheDir:            persistDir,
 		PersistTokens:       cfg.PersistTokens,

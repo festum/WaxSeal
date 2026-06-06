@@ -6,7 +6,7 @@ replace github.com/colespringer/waxseal => ../
 
 require (
 	github.com/colespringer/waxseal v0.0.0-00010101000000-000000000000
-	github.com/colespringer/waxtap v1.1.0
+	github.com/colespringer/waxtap v1.2.0
 )
 
 require (

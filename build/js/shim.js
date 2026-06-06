@@ -32,12 +32,26 @@ import {
 
   const G = globalThis;
 
+  // Capture host bridges before removing their non-browser globals.
+  const __wx_console = G.__wx_console;
+  const __wx_random_fill = G.__wx_random_fill;
+  const __wx_random_double = G.__wx_random_double;
+  delete G.__wx_console;
+  delete G.__wx_random_fill;
+  delete G.__wx_random_double;
+  // host.c creates InternalError instances without using this global binding.
+  try { delete G.InternalError; } catch (_) { /* non-configurable: leave it */ }
+
   // Define a native-looking global function in one step.
   const defFn = (name, fn) => {
     asNative(fn, name);
     Object.defineProperty(G, name, { value: fn, configurable: true, writable: true });
     return fn;
   };
+
+  // Define a host-facing binding without exposing it to ordinary enumeration.
+  const defHidden = (name, value) =>
+    Object.defineProperty(G, name, { value, configurable: true, writable: true, enumerable: false });
 
   // Console.
   const mklog = (level) => asNative(function () {
@@ -192,11 +206,10 @@ import {
   });
   defFn('clearTimeout', function clearTimeout(id) { timers = timers.filter((t) => t.id !== id); });
   defFn('clearInterval', function clearInterval(id) { timers = timers.filter((t) => t.id !== id); });
-  defFn('setImmediate', function setImmediate(fn) { return G.setTimeout(fn, 0); });
-  defFn('clearImmediate', function clearImmediate(id) { return G.clearTimeout(id); });
+  // Chrome does not expose the Node/IE setImmediate APIs.
   G.queueMicrotask = G.queueMicrotask || asNative(function queueMicrotask(fn) { Promise.resolve().then(fn); }, 'queueMicrotask');
-  // Returns true if a timer fired (and advanced the virtual clock).
-  G.__wx_runTimers = function __wx_runTimers() {
+  // host.c calls this by name to advance the virtual timer queue.
+  defHidden('__wx_runTimers', function __wx_runTimers() {
     if (timers.length === 0) return false;
     let idx = 0;
     for (let i = 1; i < timers.length; i++)
@@ -205,14 +218,13 @@ import {
     vnow = t.at;
     try { t.fn.apply(undefined, t.args); } catch (e) { console.error('timer threw: ' + e); }
     return true;
-  };
+  });
 
   // Browser identity rendered from a BrowserProfile.
   const DEFAULT_PROFILE = {
-    // Chrome-on-Windows, close to WaxTap's WEB profile. America/Phoenix stays at
-    // UTC-7 year-round, which matches the shim's static Date offset. Mirrors
-    // waxseal.DefaultProfile() in profile.go.
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    // America/Phoenix matches the shim's fixed UTC-7 Date offset. esbuild injects
+    // the Chrome version from chrome_version.json, which profile.go also embeds.
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/' + __WX_CHROME_MAJOR__ + '.0.0.0 Safari/537.36',
     platform: 'Win32',
     language: 'en-US',
     languages: ['en-US', 'en'],
@@ -222,10 +234,16 @@ import {
     screen: [1920, 1080],
     userAgentData: {
       brands: [
-        { brand: 'Google Chrome', version: '131' },
-        { brand: 'Chromium', version: '131' },
-        { brand: 'Not_A Brand', version: '24' }
+        { brand: 'Google Chrome', version: __WX_CHROME_MAJOR__ },
+        { brand: 'Chromium', version: __WX_CHROME_MAJOR__ },
+        { brand: 'Not)A;Brand', version: '24' }
       ],
+      fullVersionList: [
+        { brand: 'Google Chrome', version: __WX_CHROME_BUILD__ },
+        { brand: 'Chromium', version: __WX_CHROME_BUILD__ },
+        { brand: 'Not)A;Brand', version: '24.0.0.0' }
+      ],
+      uaFullVersion: __WX_CHROME_BUILD__,
       mobile: false,
       platform: 'Windows'
     }
@@ -238,13 +256,25 @@ import {
   //                          to completion and reveals its probe set in one
   //                          pass, instead of stopping at the first miss.
   // Production sets both false: unknown reads return undefined / fail closed.
-  G.__wxDiscovery = true;
-  G.__wxAutoStub = false;
+  // Go and tests update these non-enumerable flags through globalThis.
+  defHidden('__wxDiscovery', true);
+  defHidden('__wxAutoStub', false);
   const seenProbes = new Set();
+  // Tests read probes through these helpers; logProbe also writes them to stderr.
+  defHidden('__wxGetProbes', () => Array.from(seenProbes).sort());
+  defHidden('__wxClearProbes', () => { seenProbes.clear(); });
+  // Hide WaxSeal's host-facing globals from the browser proxies. Direct
+  // globalThis access remains available to the host and tests.
+  const HIDDEN = new Set([
+    'runBotguard', 'newMinter', 'mint', '__wx_runTimers', '__wxApplyProfile',
+    '__wxDiscovery', '__wxAutoStub', '__wxGetProbes', '__wxClearProbes',
+  ]);
   const ALLOW = new Set(['then', 'toJSON', 'constructor', 'valueOf', 'toString',
     Symbol.toPrimitive, Symbol.iterator, Symbol.toStringTag]);
 
   function logProbe(path) {
+    // Empty property names are absent in Chrome and do not identify a missing API.
+    if (path.endsWith('.')) return;
     if (G.__wxDiscovery && !seenProbes.has(path)) {
       seenProbes.add(path);
       console.warn('API-DRIFT probe: ' + path);
@@ -278,14 +308,39 @@ import {
   function discoveryProxy(target, label) {
     return new Proxy(target, {
       get(t, prop, recv) {
+        if (typeof prop === 'string' && HIDDEN.has(prop)) return undefined;
         if (prop in t || typeof prop === 'symbol' || ALLOW.has(prop))
           return Reflect.get(t, prop, recv);
         logProbe(label + '.' + String(prop));
         return G.__wxAutoStub ? universalStub(label + '.' + String(prop)) : undefined;
       },
       has(t, prop) {
+        if (typeof prop === 'string' && HIDDEN.has(prop)) return false;
+        // Record feature detection through the `in` operator.
+        if (typeof prop === 'string' && !ALLOW.has(prop) && !Reflect.has(t, prop))
+          logProbe(label + '.' + String(prop));
         if (G.__wxAutoStub && typeof prop === 'string') return true;
         return Reflect.has(t, prop);
+      },
+      getOwnPropertyDescriptor(t, prop) {
+        if (typeof prop === 'string' && HIDDEN.has(prop)) return undefined;
+        const d = Reflect.getOwnPropertyDescriptor(t, prop);
+        if (d) return d;
+        // Inherited properties are reachable even though they have no own
+        // descriptor, so they are not API drift.
+        if (typeof prop === 'string' && !ALLOW.has(prop) && !Reflect.has(t, prop)) {
+          logProbe(label + '.' + String(prop));
+          if (G.__wxAutoStub)
+            return {
+              value: universalStub(label + '.' + String(prop)),
+              writable: true, enumerable: false, configurable: true,
+            };
+        }
+        return undefined;
+      },
+      // Hidden names are configurable, so omitting them satisfies Proxy invariants.
+      ownKeys(t) {
+        return Reflect.ownKeys(t).filter((k) => !(typeof k === 'string' && HIDDEN.has(k)));
       },
       set(t, prop, val, recv) { return Reflect.set(t, prop, val, recv); }
     });
@@ -395,7 +450,8 @@ import {
   })();
 
   let currentProfile = null;
-  G.__wxApplyProfile = function __wxApplyProfile(p) {
+  // entrypoint.js, Go, and tests call this by name.
+  defHidden('__wxApplyProfile', function __wxApplyProfile(p) {
     const prof = Object.assign({}, DEFAULT_PROFILE, p || {});
     currentProfile = prof;
 
@@ -429,8 +485,9 @@ import {
           const full = {
             brands: this.brands, mobile: this.mobile, platform: this.platform,
             platformVersion: '10.0.0', architecture: 'x86', bitness: '64',
-            model: '', uaFullVersion: prof.userAgentData.brands[0].version + '.0.0.0',
-            fullVersionList: this.brands
+            model: '',
+            uaFullVersion: prof.userAgentData.uaFullVersion || (prof.userAgentData.brands[0].version + '.0.0.0'),
+            fullVersionList: prof.userAgentData.fullVersionList || this.brands
           };
           const out = { brands: this.brands, mobile: this.mobile, platform: this.platform };
           (hints || []).forEach((h) => { if (h in full) out[h] = full[h]; });
@@ -445,7 +502,50 @@ import {
       plugins: Object.create(G.PluginArray.prototype),
       mimeTypes: Object.create(G.MimeTypeArray.prototype),
       sendBeacon: asNative(function sendBeacon() { return true; }, 'sendBeacon'),
-      clearAppBadge: asNative(function clearAppBadge() { return Promise.resolve(); }, 'clearAppBadge')
+      clearAppBadge: asNative(function clearAppBadge() { return Promise.resolve(); }, 'clearAppBadge'),
+      // Protected Audience API surface.
+      joinAdInterestGroup: asNative(function joinAdInterestGroup(group, durationSeconds) { return Promise.resolve(); }, 'joinAdInterestGroup'),
+      leaveAdInterestGroup: asNative(function leaveAdInterestGroup(group) { return Promise.resolve(); }, 'leaveAdInterestGroup'),
+      clearOriginJoinedAdInterestGroups: asNative(function clearOriginJoinedAdInterestGroups(owner, groupsToKeep) { return Promise.resolve(); }, 'clearOriginJoinedAdInterestGroups'),
+      updateAdInterestGroups: asNative(function updateAdInterestGroups() {}, 'updateAdInterestGroups'),
+      runAdAuction: asNative(function runAdAuction(config) { return Promise.resolve(null); }, 'runAdAuction'),
+      createAuctionNonce: asNative(function createAuctionNonce() { return Promise.resolve(G.crypto && G.crypto.randomUUID ? G.crypto.randomUUID() : ''); }, 'createAuctionNonce'),
+      getInterestGroupAdAuctionData: asNative(function getInterestGroupAdAuctionData(config) { return Promise.resolve({ requestId: '', request: new Uint8Array() }); }, 'getInterestGroupAdAuctionData'),
+      deprecatedReplaceInURN: asNative(function deprecatedReplaceInURN(urnOrConfig, replacements) { return Promise.resolve(); }, 'deprecatedReplaceInURN'),
+      deprecatedURNToURL: asNative(function deprecatedURNToURL(urnOrConfig) { return Promise.resolve(null); }, 'deprecatedURNToURL'),
+      canLoadAdAuctionFencedFrame: asNative(function canLoadAdAuctionFencedFrame() { return false; }, 'canLoadAdAuctionFencedFrame'),
+      // Use interface instances so navigator properties pass instanceof checks.
+      mediaDevices: Object.assign(Object.create(G.MediaDevices.prototype), {
+        ondevicechange: null,
+        enumerateDevices: asNative(function enumerateDevices() { return Promise.resolve([]); }, 'enumerateDevices'),
+        getSupportedConstraints: asNative(function getSupportedConstraints() { return { width: true, height: true, aspectRatio: true, frameRate: true, facingMode: true, deviceId: true, groupId: true }; }, 'getSupportedConstraints'),
+        getUserMedia: asNative(function getUserMedia() { return Promise.reject(Object.assign(new Error('Permission denied'), { name: 'NotAllowedError' })); }, 'getUserMedia'),
+        getDisplayMedia: asNative(function getDisplayMedia() { return Promise.reject(Object.assign(new Error('Permission denied'), { name: 'NotAllowedError' })); }, 'getDisplayMedia')
+      }),
+      connection: Object.assign(Object.create(G.NetworkInformation.prototype), {
+        effectiveType: '4g', rtt: 50, downlink: 10, saveData: false, onchange: null
+      }),
+      keyboard: Object.assign(Object.create(G.Keyboard.prototype), {
+        getLayoutMap: asNative(function getLayoutMap() { return Promise.resolve(new Map()); }, 'getLayoutMap'),
+        lock: asNative(function lock() { return Promise.resolve(); }, 'lock'),
+        unlock: asNative(function unlock() {}, 'unlock')
+      }),
+      userActivation: Object.assign(Object.create(G.UserActivation.prototype), {
+        hasBeenActive: false, isActive: false
+      }),
+      windowControlsOverlay: Object.assign(Object.create(G.WindowControlsOverlay.prototype), {
+        visible: false, ongeometrychange: null,
+        getTitlebarAreaRect: asNative(function getTitlebarAreaRect() { return new G.DOMRect(0, 0, 0, 0); }, 'getTitlebarAreaRect')
+      }),
+      // Use Ink and InkPresenter instances to preserve instanceof behavior.
+      ink: Object.assign(Object.create(G.Ink.prototype), {
+        requestPresenter: asNative(function requestPresenter(param) {
+          return Promise.resolve(Object.assign(Object.create(G.InkPresenter.prototype), {
+            presentationArea: null,
+            updateInkTrailStartPoint: asNative(function updateInkTrailStartPoint(event, style) {}, 'updateInkTrailStartPoint')
+          }));
+        }, 'requestPresenter')
+      })
     });
     def('navigator', discoveryProxy(navBase, 'navigator'));
 
@@ -527,7 +627,7 @@ import {
     defFn('close', function close() {});
     defFn('alert', function alert() {});
     return currentProfile;
-  };
+  });
 
   // Apply the default profile at load; Go overrides via __wxApplyProfile.
   G.__wxApplyProfile(null);

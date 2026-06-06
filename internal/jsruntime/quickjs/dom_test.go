@@ -315,6 +315,33 @@ func TestPhase0ProbedInterfaces(t *testing.T) {
 		"window.length":                "window.length === 0",
 		"HTMLVideoElement videoTracks": "document.createElement('video').videoTracks instanceof VideoTrackList",
 		"media canPlayType":            "document.createElement('video').canPlayType('video/mp4') === 'probably'",
+		// Keys match discovery paths so constructor and property probes use the
+		// same names.
+		"window.PictureInPictureWindow": "typeof window.PictureInPictureWindow === 'function'",
+		// Protected Audience APIs.
+		"navigator.leaveAdInterestGroup": "typeof navigator.leaveAdInterestGroup === 'function'",
+		"navigator.joinAdInterestGroup":  "typeof navigator.joinAdInterestGroup === 'function'",
+		"navigator.runAdAuction":         "typeof navigator.runAdAuction === 'function'",
+		// Navigator properties backed by their corresponding interfaces.
+		"navigator.mediaDevices":                          "navigator.mediaDevices instanceof MediaDevices",
+		"navigator.connection":                            "navigator.connection instanceof NetworkInformation",
+		"navigator.keyboard":                              "navigator.keyboard instanceof Keyboard",
+		"navigator.userActivation":                        "navigator.userActivation instanceof UserActivation",
+		"window.Observable":                               "typeof window.Observable === 'function'",
+		"window.PressureRecord":                           "typeof window.PressureRecord === 'function'",
+		"window.XRInputSource":                            "typeof window.XRInputSource === 'function'",
+		"window.IdentityCredentialError":                  "typeof window.IdentityCredentialError === 'function'",
+		"window.SpeechSynthesisEvent":                     "typeof window.SpeechSynthesisEvent === 'function'",
+		"window.WindowControlsOverlayGeometryChangeEvent": "typeof window.WindowControlsOverlayGeometryChangeEvent === 'function'",
+		// XRVisibilityMaskChangeEvent extends Event and is constructable.
+		"window.XRVisibilityMaskChangeEvent": "typeof window.XRVisibilityMaskChangeEvent === 'function' && new window.XRVisibilityMaskChangeEvent('x') instanceof Event",
+		"window.CrashReportContext":          "typeof window.CrashReportContext === 'function'",
+		"navigator.windowControlsOverlay":    "navigator.windowControlsOverlay instanceof WindowControlsOverlay",
+		// Delegated Ink API.
+		"window.Ink":                     "typeof window.Ink === 'function'",
+		"window.InkPresenter":            "typeof window.InkPresenter === 'function'",
+		"navigator.ink":                  "navigator.ink instanceof Ink",
+		"navigator.ink.requestPresenter": "typeof navigator.ink.requestPresenter === 'function'",
 	}
 	for name, expr := range cases {
 		evalTrue(t, rt, name, expr)

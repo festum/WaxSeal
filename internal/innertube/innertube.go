@@ -23,9 +23,10 @@ import (
 
 const (
 	// clientVersion is a recent WEB InnerTube version; clientName WEB is required
-	// for these guest endpoints. Matches the bgutil reference's context.
+	// for these guest endpoints. Callers may override it with the current YouTube
+	// web client version from ytcfg.INNERTUBE_CLIENT_VERSION.
 	clientName    = "WEB"
-	clientVersion = "2.20240822.03.00"
+	clientVersion = "2.20260603.05.00"
 
 	maxBody = 4 << 20 // response body cap
 )
@@ -135,12 +136,16 @@ func GenerateVisitorData(ctx context.Context, client *httpx.Client, userAgent st
 	return resp.ResponseContext.VisitorData, nil
 }
 
-// defaultContext builds a guest WEB InnerTube context, embedding visitorData when
-// known so att/get sees the same client identity.
-func defaultContext(visitorData string) json.RawMessage {
+// GuestContext builds a guest WEB InnerTube context, adding visitorData when set.
+// An empty clientVer uses the package default.
+func GuestContext(visitorData, clientVer string) json.RawMessage {
+	cv := clientVer
+	if cv == "" {
+		cv = clientVersion
+	}
 	clientObj := map[string]any{
 		"clientName":    clientName,
-		"clientVersion": clientVersion,
+		"clientVersion": cv,
 		"hl":            "en",
 		"gl":            "US",
 	}
@@ -149,6 +154,11 @@ func defaultContext(visitorData string) json.RawMessage {
 	}
 	b, _ := json.Marshal(map[string]any{"client": clientObj})
 	return b
+}
+
+// defaultContext builds a guest WEB context with the package client version.
+func defaultContext(visitorData string) json.RawMessage {
+	return GuestContext(visitorData, "")
 }
 
 // postJSON posts a JSON body to an InnerTube endpoint through httpx and returns

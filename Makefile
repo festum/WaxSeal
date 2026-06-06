@@ -102,10 +102,11 @@ $(WASM_OUT): build/wasm/host.c $(QJS_SOURCES) | $(ASSETS)
 	@echo "wasm-opt $(WASM_OPT_FLAGS) -> $@ ($$(wc -c < $@) bytes)"
 
 # bg_bundle.js is bgutils-js, the browser shim, and the BotGuard entrypoint
-# bundled as an ES2020 IIFE.
+# bundled as an ES2020 IIFE. build.mjs reads chrome_version.json, so changing the
+# emulated Chrome version must rebuild the bundle.
 jsbundle: $(BUNDLE_OUT)
 
-$(BUNDLE_OUT): build/js/build.mjs build/js/shim.js build/js/dom.js build/js/entrypoint.js build/js/package.json | $(ASSETS)
+$(BUNDLE_OUT): build/js/build.mjs build/js/shim.js build/js/dom.js build/js/entrypoint.js build/js/package.json chrome_version.json | $(ASSETS)
 	cd build/js && npm install --no-audit --no-fund --silent && node build.mjs
 	@echo "built $@ ($$(wc -c < $@) bytes)"
 

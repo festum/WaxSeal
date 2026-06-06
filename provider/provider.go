@@ -65,12 +65,10 @@ func (p *Provider) ProvidePOToken(ctx context.Context, req potoken.Request) (pot
 		wreq.Scope = waxseal.ScopeSession
 		wreq.VisitorData = req.VisitorData
 	case potoken.ScopePlayer:
-		// The /player request POT binds to the content (video_id). The exact
-		// player binding should be rechecked against the integrity minter; the
-		// fallback token is binding-agnostic, so current tests do not depend on
-		// this choice.
+		// Bind the token to video_id and attest under WaxTap's visitor_data.
 		wreq.Scope = waxseal.ScopeContent
 		wreq.VideoID = req.VideoID
+		wreq.VisitorData = req.VisitorData
 	default: // ScopeSubtitles or unknown
 		return potoken.Response{}, fmt.Errorf("%w: %s", ErrUnsupportedScope, req.Scope)
 	}

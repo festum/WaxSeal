@@ -56,9 +56,11 @@ type Request struct {
 	// Challenge inputs (priority: caller -> InnerTube att/get -> Create).
 	// A caller-provided challenge is used only on the synchronous cold path;
 	// background refreshes fetch their own challenge.
-	Challenge        *botguard.Challenge
-	InnertubeContext json.RawMessage // sent verbatim to att/get; nil uses a default
-	DisableInnertube bool            // skip att/get, go straight to Create
+	Challenge *botguard.Challenge
+	// InnertubeContext is evaluated only on the cold att/get path. A nil function
+	// or nil result uses the default context.
+	InnertubeContext func() json.RawMessage
+	DisableInnertube bool // skip att/get and use Create
 }
 
 // Result is a minted (or fallback) token with its authoritative expiry.
@@ -358,7 +360,11 @@ func (m *Manager) resolveChallenge(ctx context.Context, req Request) (*botguard.
 		return req.Challenge, nil
 	}
 	if !req.DisableInnertube {
-		ch, err := innertube.GetChallenge(ctx, req.Client, req.AttestationUA, req.InnertubeContext)
+		var ictx json.RawMessage
+		if req.InnertubeContext != nil {
+			ictx = req.InnertubeContext()
+		}
+		ch, err := innertube.GetChallenge(ctx, req.Client, req.AttestationUA, ictx)
 		if err == nil {
 			return ch, nil
 		}

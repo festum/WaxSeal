@@ -15,11 +15,14 @@ import (
 	"io"
 	"net/http"
 	"net/http/cookiejar"
+	"strings"
 	"testing"
 	"time"
 
+	waxseal "github.com/colespringer/waxseal"
 	"github.com/colespringer/waxseal/internal/botguard"
 	"github.com/colespringer/waxseal/internal/httpx"
+	"github.com/colespringer/waxseal/internal/innertube"
 	"github.com/colespringer/waxseal/internal/jsassets"
 	"github.com/colespringer/waxseal/internal/jsruntime/quickjs"
 )
@@ -89,13 +92,8 @@ func TestGateBVMExecutes(t *testing.T) {
 }
 
 // TestGateBIntegrityMint exercises the full minter path (newMinter -> mint ->
-// validate). It requires GenerateIT to issue an integrity token (arr[0]).
-//
-// With the build/js/dom.js fidelity layer (real prototype chains, native-looking
-// Function.toString, canvas/WebGL/SVG/media, platform interfaces, and Date/Intl
-// coherence), this should mint and warm re-mint end-to-end. A fallback-only
-// response usually means YouTube drift or IP risk-scoring after too many Create
-// calls in a short window.
+// validate) using the production challenge order: InnerTube att/get, then WAA
+// Create. The test skips when GenerateIT returns only a fallback token.
 func TestGateBIntegrityMint(t *testing.T) {
 	ctx, eng, client, stderr := liveSetup(t)
 	rtctx, cancel := context.WithTimeout(ctx, 60*time.Second)
@@ -104,17 +102,43 @@ func TestGateBIntegrityMint(t *testing.T) {
 	defer rt.Close(rtctx)
 
 	const visitorData = "Cgs4bFZSaUotYTYtQSiJnvu8BjIKCgJERRIEEgAgFw=="
-	token, it, err := botguard.MintToken(rtctx, rt, client, "", visitorData, botguard.DefaultEndpoint)
+	// Use the same Chrome version as the browser shim.
+	chromeUA := waxseal.DefaultProfile().UserAgent
+
+	// Anchor att/get to the same visitor_data used for minting.
+	ch, err := innertube.GetChallenge(rtctx, client, chromeUA, innertube.GuestContext(visitorData, ""))
 	if err != nil {
-		if se, ok := err.(*botguard.StageError); ok && se.Stage == botguard.StageGenerateIT {
-			t.Skipf("integrity token not issued; GenerateIT returned fallback only. "+
-				"GenerateIT stage: %v\nshim discovery log:\n%s", se.Err, stderr.String())
+		t.Logf("att/get failed (%v); falling back to WAA Create", err)
+		if ch, err = botguard.FetchCreateChallenge(rtctx, client, chromeUA, botguard.DefaultEndpoint); err != nil {
+			t.Fatalf("challenge: %v", err)
 		}
-		t.Fatalf("MintToken failed at unexpected stage: %v", err)
 	}
 
-	if _, verr := botguard.ValidatePOToken(token); verr != nil {
-		t.Fatalf("minted token failed validate: %v", verr)
+	bgResp, err := botguard.Snapshot(rtctx, rt, ch, nil)
+	if err != nil {
+		t.Fatalf("snapshot: %v\nshim discovery log:\n%s", err, stderr.String())
+	}
+	it, err := botguard.GenerateIT(rtctx, client, chromeUA, bgResp, botguard.DefaultEndpoint)
+	if err != nil {
+		t.Fatalf("GenerateIT: %v\nshim discovery log:\n%s", err, stderr.String())
+	}
+
+	// Fallback-only responses can result from session or IP reputation limits.
+	if it.HasFallback() && !it.HasIntegrity() {
+		log := stderr.String()
+		diag := "no missing browser APIs detected; likely a session or IP reputation issue; retry sparingly"
+		if probes := botguard.DriftProbes(log); len(probes) > 0 {
+			diag = "missing browser APIs: " + strings.Join(probes, ", ")
+		}
+		t.Skipf("fallback only, no integrity token. %s\nshim discovery log:\n%s", diag, log)
+	}
+
+	if err := botguard.InstallMinter(rtctx, rt, it.IntegrityToken); err != nil {
+		t.Fatalf("InstallMinter: %v\nshim discovery log:\n%s", err, stderr.String())
+	}
+	token, err := botguard.Mint(rtctx, rt, visitorData) // validates field 6 internally
+	if err != nil {
+		t.Fatalf("mint: %v\nshim discovery log:\n%s", err, stderr.String())
 	}
 	t.Logf("minted and validated token (%d B), integrity lifetime=%ds", len(token), it.LifetimeSecs)
 

@@ -87,7 +87,7 @@ func runGenerate(cmd *cobra.Command, g *genOpts) error {
 
 	// One-shot CLI calls use disk persistence only when CACHE_DIR is configured;
 	// this avoids competing for a store lock across concurrent invocations.
-	client, err := buildClient(cfg, logger, cfg.CacheDir)
+	client, err := buildClient(cfg, logger, cfg.CacheDir, buildClientOpts{})
 	if err != nil {
 		fmt.Fprintln(stdout, "{}")
 		logger.Error("init", "err", err)
@@ -108,6 +108,9 @@ func runGenerate(cmd *cobra.Command, g *genOpts) error {
 	}
 
 	binding := g.contentBinding
+	// Only a binding sourced here is known to be visitor_data and safe to use as
+	// the att/get session anchor.
+	var sessionVisitorData string
 	if binding == "" {
 		vd, err := client.VisitorData(ctx, egress)
 		if err != nil {
@@ -116,11 +119,13 @@ func runGenerate(cmd *cobra.Command, g *genOpts) error {
 			return err
 		}
 		binding = vd
+		sessionVisitorData = vd
 	}
 
 	tok, err := client.Token(ctx, waxseal.Request{
 		Scope:            waxseal.ScopeOpaque,
 		Identifier:       binding,
+		VisitorData:      sessionVisitorData,
 		Egress:           egress,
 		BypassCache:      g.bypassCache,
 		DisableInnertube: boolPtr(g.disableInnertube || cfg.DisableInnertube),

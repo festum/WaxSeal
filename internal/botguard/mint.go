@@ -116,34 +116,3 @@ func Mint(ctx context.Context, rt jsruntime.Runtime, identifier string) (string,
 	}
 	return token, nil
 }
-
-// MintToken is an end-to-end helper kept for the live BotGuard tests: challenge
-// -> VM -> GenerateIT -> minter -> mint -> validate. Production orchestration
-// (profile/cache/session/pool) lives in internal/session and the public
-// waxseal.Client. It requires an integrity token; a fallback-only response
-// returns a StageGenerateIT error so the e2e test can skip.
-func MintToken(ctx context.Context, rt jsruntime.Runtime, client *httpx.Client, userAgent, identifier string, ep Endpoint) (string, *GenerateITResult, error) {
-	ch, err := FetchCreateChallenge(ctx, client, userAgent, ep)
-	if err != nil {
-		return "", nil, err
-	}
-	bgResp, err := Snapshot(ctx, rt, ch, nil)
-	if err != nil {
-		return "", nil, err
-	}
-	it, err := GenerateIT(ctx, client, userAgent, bgResp, ep)
-	if err != nil {
-		return "", nil, err
-	}
-	if !it.HasIntegrity() {
-		return "", it, stageErr(StageGenerateIT, "no integrity token (fallback only)")
-	}
-	if err := InstallMinter(ctx, rt, it.IntegrityToken); err != nil {
-		return "", it, err
-	}
-	token, err := Mint(ctx, rt, identifier)
-	if err != nil {
-		return "", it, err
-	}
-	return token, it, nil
-}

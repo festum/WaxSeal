@@ -7,7 +7,7 @@
 // TestForcedWEBDownload forces a WEB-only client whose /player response and GVS
 // stream URLs require PO tokens, so the token path is actually exercised. The
 // default chain (ANDROID_VR -> iOS -> WEB_EMBEDDED -> WEB) would otherwise
-// succeed through a no-POT client first. WaxTap v1.1.0 injects the player-scope
+// succeed through a no-POT client first. WaxTap injects the player-scope
 // POT into the /player body (serviceIntegrityDimensions.poToken) and the GVS POT
 // onto the stream URL, so this exercises both paths end-to-end with WaxSeal
 // tokens. It classifies the outcome using WaxTap's exported error sentinels:
@@ -54,7 +54,7 @@ const defaultTestURL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 const defaultWebVersion = "2.20260603.05.00"
 
 // webOnlyOverride forces a single WEB profile that requires both a player and a
-// GVS PO token (WaxTap v1.1.0 schema: requiresPoTokens is a list). WEB uses
+// GVS PO token (WaxTap schema: requiresPoTokens is a list). WEB uses
 // keyless InnerTube POSTs (no apiKey needed).
 func webOnlyOverride(version string) string {
 	return `{
@@ -64,7 +64,7 @@ func webOnlyOverride(version string) string {
       "innerTubeName": "WEB",
       "innerTubeId": 1,
       "version": "` + version + `",
-      "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      "userAgent": "` + waxseal.DefaultProfile().UserAgent + `",
       "requiresPoTokens": ["player", "gvs"],
       "supportsCookies": true,
       "supportsPlaylists": true
@@ -159,7 +159,7 @@ func TestForcedWEBDownload(t *testing.T) {
 
 	case errors.Is(err, waxtap.ErrExtractionFailed):
 		t.Skipf("player-scope token rejected: WaxTap injected our player POT into the /player body "+
-			"(WaxTap v1.1.0), but the response is still URL-less; the generic fallback token "+
+			"but the response is still URL-less; the generic fallback token "+
 			"is not accepted as a player POT. scopes=%v err=%v", rec.scopes(), err)
 
 	case errors.Is(err, waxtap.ErrNeedsPOToken):

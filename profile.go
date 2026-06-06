@@ -2,12 +2,33 @@ package waxseal
 
 import (
 	"crypto/sha256"
+	_ "embed"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"regexp"
+	"strconv"
 	"strings"
 )
+
+// chrome_version.json supplies the emulated Chrome version to both this package
+// and the JavaScript bundle. Run `make jsbundle` after changing it.
+//
+//go:embed chrome_version.json
+var chromeVersionJSON []byte
+
+var chromeVer = func() (v struct {
+	Major       string `json:"major"`       // e.g. "149"
+	FullVersion string `json:"fullVersion"` // e.g. "149.0.7827.3"
+}) {
+	if err := json.Unmarshal(chromeVersionJSON, &v); err != nil {
+		panic("waxseal: invalid chrome_version.json: " + err.Error())
+	}
+	if v.Major == "" || v.FullVersion == "" {
+		panic("waxseal: chrome_version.json missing major/fullVersion")
+	}
+	return v
+}()
 
 // ErrUnsupportedClient is returned when a Request.UserAgent has no coherent
 // BrowserProfile, for example a non-WebKit-family UA. WAA needs a WebKit-family
@@ -52,7 +73,7 @@ type BrowserProfile struct {
 // that matches the date they want to emulate.
 func DefaultProfile() BrowserProfile {
 	return BrowserProfile{
-		UserAgent:        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+		UserAgent:        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/" + chromeVer.Major + ".0.0.0 Safari/537.36",
 		Platform:         "Win32",
 		Language:         "en-US",
 		AcceptLanguage:   "en-US,en;q=0.9",
@@ -111,6 +132,17 @@ func (p BrowserProfile) languages() []string {
 
 var chromeVersionRE = regexp.MustCompile(`Chrome/(\d+)`)
 
+// ChromeMajor returns the Chrome major version in ua, or 0 when ua does not
+// contain one.
+func ChromeMajor(ua string) int {
+	m := chromeVersionRE.FindStringSubmatch(ua)
+	if m == nil {
+		return 0
+	}
+	n, _ := strconv.Atoi(m[1]) // The regexp guarantees digits; overflow returns 0.
+	return n
+}
+
 // userAgentData derives navigator.userAgentData (sec-ch-ua) for Chrome UAs, so
 // the high-entropy client-hint probes BotGuard reads stay coherent with the UA.
 // Non-Chrome UAs return nil (the shim leaves userAgentData undefined).
@@ -129,15 +161,31 @@ func (p BrowserProfile) userAgentData() map[string]any {
 	case strings.Contains(p.NavigatorUA, "Android"):
 		platform = "Android"
 	}
+	full := chromeFullVersion(major)
 	return map[string]any{
 		"brands": []map[string]any{
 			{"brand": "Google Chrome", "version": major},
 			{"brand": "Chromium", "version": major},
-			{"brand": "Not_A Brand", "version": "24"},
+			{"brand": "Not)A;Brand", "version": "24"},
 		},
-		"mobile":   platform == "Android",
-		"platform": platform,
+		"fullVersionList": []map[string]any{
+			{"brand": "Google Chrome", "version": full},
+			{"brand": "Chromium", "version": full},
+			{"brand": "Not)A;Brand", "version": "24.0.0.0"},
+		},
+		"uaFullVersion": full,
+		"mobile":        platform == "Android",
+		"platform":      platform,
 	}
+}
+
+// chromeFullVersion returns the configured full version for the default Chrome
+// major. Other majors use Chrome's reduced version form.
+func chromeFullVersion(major string) string {
+	if major == chromeVer.Major {
+		return chromeVer.FullVersion
+	}
+	return major + ".0.0.0"
 }
 
 // shimProfile renders the object the shim's __wxApplyProfile consumes. Keys must

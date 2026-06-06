@@ -12,6 +12,9 @@ const pkgVersion = (name) =>
 const bgutilsVersion = pkgVersion('bgutils-js');
 const esbuildVersion = pkgVersion('esbuild');
 
+// profile.go embeds the same file to keep the Go and JavaScript profiles aligned.
+const chrome = JSON.parse(readFileSync('../../chrome_version.json', 'utf8'));
+
 const OUT = '../../internal/jsassets/bg_bundle.js';
 
 const result = await build({
@@ -22,6 +25,10 @@ const result = await build({
   platform: 'neutral',
   legalComments: 'none',
   minify: false, // keep the committed bundle readable while the shim is evolving
+  define: {
+    __WX_CHROME_MAJOR__: JSON.stringify(chrome.major),
+    __WX_CHROME_BUILD__: JSON.stringify(chrome.fullVersion),
+  },
   banner: {
     js: `// GENERATED - do not edit. Source: build/js/{shim,entrypoint}.js + bgutils-js@${bgutilsVersion}.\n`
       + `// Rebuild: make jsbundle (esbuild@${esbuildVersion}, target es2020 IIFE).`

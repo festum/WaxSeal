@@ -81,6 +81,10 @@ func TestGetPotSuccess(t *testing.T) {
 	if fc.lastReq.Scope != waxseal.ScopeOpaque || fc.lastReq.Identifier != "vid123" {
 		t.Fatalf("request mapped wrong: %+v", fc.lastReq)
 	}
+	// A caller-supplied binding may be a video_id, so it cannot anchor att/get.
+	if fc.lastReq.VisitorData != "" {
+		t.Fatalf("VisitorData = %q, want empty for a caller-supplied binding", fc.lastReq.VisitorData)
+	}
 }
 
 func TestGetPotDeprecatedFields(t *testing.T) {
@@ -119,6 +123,10 @@ func TestGetPotEmptyBindingSourcesVisitorData(t *testing.T) {
 	}
 	if fc.lastReq.Identifier != "GENERATED_VD" {
 		t.Fatalf("identifier = %q", fc.lastReq.Identifier)
+	}
+	// A sourced binding is known to be visitor_data.
+	if fc.lastReq.VisitorData != "GENERATED_VD" {
+		t.Fatalf("VisitorData = %q, want the sourced visitor_data forwarded", fc.lastReq.VisitorData)
 	}
 }
 

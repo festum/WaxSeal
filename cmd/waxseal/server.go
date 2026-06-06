@@ -101,7 +101,7 @@ func runServer(cmd *cobra.Command, s *serverOpts) error {
 	logger := buildLogger(cfg.LogLevel, cfg.LogFormat, os.Stdout)
 	// The daemon is long-running and single-process, so it uses the resolved
 	// cache directory for breaker persistence by default.
-	client, err := buildClient(cfg, logger, compilationCacheDir(cfg.CacheDir))
+	client, err := buildClient(cfg, logger, compilationCacheDir(cfg.CacheDir), buildClientOpts{})
 	if err != nil {
 		return err
 	}

@@ -1,6 +1,7 @@
 package waxseal
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -333,6 +334,54 @@ func TestClientManagementSurface(t *testing.T) {
 	}
 	if got := tr.createCount.Load(); got != 2 {
 		t.Fatalf("Create called %d times, want 2 (re-attest after invalidate+purge)", got)
+	}
+}
+
+// TestMinterSharedAcrossSessions verifies that visitor_data does not partition
+// warm minters.
+func TestMinterSharedAcrossSessions(t *testing.T) {
+	tr := &fakeTransport{genIT: integrityGenIT}
+	c, _ := newTestClient(t, tr)
+	ctx := context.Background()
+
+	for _, vd := range []string{"VD_A", "VD_B"} {
+		if _, err := c.Token(ctx, Request{Scope: ScopeSession, VisitorData: vd}); err != nil {
+			t.Fatalf("Token(%s): %v", vd, err)
+		}
+	}
+	if got := len(c.MinterKeys()); got != 1 {
+		t.Fatalf("minter keys = %d, want 1 (sessions share one warm minter; no per-session attestation)", got)
+	}
+	if got := tr.createCount.Load(); got != 1 {
+		t.Fatalf("Create called %d times, want 1 (one attestation serves both sessions)", got)
+	}
+}
+
+// TestSyncWriterSerializesConcurrentWrites verifies that concurrent writes remain
+// intact.
+func TestSyncWriterSerializesConcurrentWrites(t *testing.T) {
+	var buf bytes.Buffer
+	w := &syncWriter{w: &buf}
+	const (
+		writers = 50
+		each    = 20
+		line    = "API-DRIFT probe: window.X\n"
+	)
+	var wg sync.WaitGroup
+	wg.Add(writers)
+	for i := 0; i < writers; i++ {
+		go func() {
+			defer wg.Done()
+			for j := 0; j < each; j++ {
+				if _, err := w.Write([]byte(line)); err != nil {
+					t.Errorf("write: %v", err)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	if got, want := strings.Count(buf.String(), line), writers*each; got != want {
+		t.Fatalf("intact lines = %d, want %d (torn or lost writes)", got, want)
 	}
 }
 

@@ -1655,6 +1655,19 @@
   };
   var Performance = class extends EventTarget {
   };
+  var PictureInPictureWindow = class extends EventTarget {
+    get width() {
+      return 0;
+    }
+    get height() {
+      return 0;
+    }
+    get onresize() {
+      return null;
+    }
+    set onresize(_v) {
+    }
+  };
   var Storage = class {
     get length() {
       return 0;
@@ -2189,6 +2202,7 @@
     Location,
     History,
     Performance,
+    PictureInPictureWindow,
     Storage,
     Plugin,
     PluginArray,
@@ -2275,10 +2289,10 @@
       return shifted(this).getUTCMilliseconds();
     });
   }
-  var EVENT_BATTERY = "AnimationEvent AnimationPlaybackEvent BeforeInstallPromptEvent BeforeUnloadEvent BlobEvent ClipboardEvent CloseEvent CompositionEvent ContentVisibilityAutoStateChangeEvent DeviceMotionEvent DeviceOrientationEvent DragEvent FontFaceSetLoadEvent FormDataEvent GamepadEvent HashChangeEvent IDBVersionChangeEvent InputEvent MediaEncryptedEvent MediaQueryListEvent MediaRecorderErrorEvent MediaStreamTrackEvent MutationEvent OfflineAudioCompletionEvent PageTransitionEvent PaymentRequestUpdateEvent PopStateEvent ProgressEvent PromiseRejectionEvent RTCDataChannelEvent RTCPeerConnectionIceEvent SecurityPolicyViolationEvent StorageEvent SubmitEvent ToggleEvent TouchEvent TrackEvent TransitionEvent WebGLContextEvent".split(" ");
+  var EVENT_BATTERY = "AnimationEvent AnimationPlaybackEvent BeforeInstallPromptEvent BeforeUnloadEvent BlobEvent ClipboardEvent CloseEvent CompositionEvent ContentVisibilityAutoStateChangeEvent DeviceMotionEvent DeviceOrientationEvent DragEvent FontFaceSetLoadEvent FormDataEvent GamepadEvent HashChangeEvent IDBVersionChangeEvent InputEvent MediaEncryptedEvent MediaQueryListEvent MediaRecorderErrorEvent MediaStreamTrackEvent MutationEvent OfflineAudioCompletionEvent PageTransitionEvent PaymentRequestUpdateEvent PopStateEvent ProgressEvent PromiseRejectionEvent RTCDataChannelEvent RTCPeerConnectionIceEvent SecurityPolicyViolationEvent StorageEvent SubmitEvent ToggleEvent TouchEvent TrackEvent TransitionEvent WebGLContextEvent SpeechSynthesisEvent WindowControlsOverlayGeometryChangeEvent XRVisibilityMaskChangeEvent".split(" ");
   var PRESENCE_BATTERY = (
     // IndexedDB
-    "IDBFactory IDBDatabase IDBObjectStore IDBIndex IDBCursor IDBCursorWithValue IDBKeyRange IDBRequest IDBOpenDBRequest IDBTransaction MediaRecorder MediaSource SourceBuffer SourceBufferList MediaStreamTrack CanvasCaptureMediaStreamTrack MediaDevices MediaDeviceInfo MediaCapabilities MediaKeys MediaKeySession MediaKeySystemAccess MediaKeyStatusMap RemotePlayback AudioContext BaseAudioContext OfflineAudioContext AudioNode AudioParam AudioBuffer AudioBufferSourceNode AudioDestinationNode AudioListener AnalyserNode GainNode BiquadFilterNode OscillatorNode DynamicsCompressorNode ConvolverNode DelayNode PannerNode StereoPannerNode WaveShaperNode ChannelMergerNode ChannelSplitterNode ConstantSourceNode IIRFilterNode PeriodicWave AudioWorklet AudioWorkletNode ScriptProcessorNode CSSStyleSheet StyleSheet StyleSheetList MediaList CSSRule CSSRuleList CSSStyleRule CSSMediaRule CSSImportRule CSSKeyframeRule CSSKeyframesRule CSSFontFaceRule CSSSupportsRule CSSNamespaceRule CSSPageRule StylePropertyMap StylePropertyMapReadOnly CSSStyleValue CSSUnitValue CSSKeywordValue CSSMathValue CSSNumericValue CSSTransformValue CSSTransformComponent CSSPerspective CSSImageValue CSSUnparsedValue FontFace FontFaceSet WebGLBuffer WebGLProgram WebGLShader WebGLTexture WebGLFramebuffer WebGLRenderbuffer WebGLUniformLocation WebGLActiveInfo WebGLShaderPrecisionFormat WebGLVertexArrayObject WebGLQuery WebGLSampler WebGLSync WebGLTransformFeedback Worker SharedWorker ServiceWorker ServiceWorkerContainer ServiceWorkerRegistration MessageChannel MessagePort BroadcastChannel Worklet WorkletGlobalScope MutationObserver MutationRecord ResizeObserver ResizeObserverEntry ResizeObserverSize IntersectionObserver IntersectionObserverEntry PerformanceObserver PerformanceObserverEntryList ReportingObserver ReadableStream WritableStream TransformStream ReadableStreamDefaultReader ReadableStreamBYOBReader ReadableStreamDefaultController WritableStreamDefaultWriter ByteLengthQueuingStrategy CountQueuingStrategy SubtleCrypto CryptoKey Crypto FileReader FileList FormData WebSocket EventSource XMLHttpRequest XMLHttpRequestUpload XMLHttpRequestEventTarget TextEncoderStream TextDecoderStream CompressionStream DecompressionStream DOMException DOMImplementation DOMParser XMLSerializer DOMStringList DOMStringMap DOMTokenList Attr CharacterData CDATASection ProcessingInstruction DocumentType Range StaticRange Selection NodeIterator TreeWalker ShadowRoot CustomElementRegistry XPathEvaluator XPathExpression XPathResult AbortPaymentEvent Performance PerformanceEntry PerformanceMark PerformanceMeasure PerformanceNavigationTiming PerformanceResourceTiming PerformancePaintTiming PerformanceServerTiming PerformanceEventTiming PerformanceLongTaskTiming PerformanceTiming PerformanceNavigation Animation AnimationEffect KeyframeEffect AnimationTimeline DocumentTimeline Notification Permissions PermissionStatus Clipboard ClipboardItem Geolocation GeolocationPosition GeolocationCoordinates GeolocationPositionError Gamepad GamepadButton BatteryManager NetworkInformation VisualViewport BarProp External Touch TouchList ImageBitmap ImageBitmapRenderingContext Path2D OffscreenCanvas OffscreenCanvasRenderingContext2D IdleDeadline Image Audio Option RTCPeerConnection RTCDataChannel RTCSessionDescription RTCIceCandidate RTCRtpSender RTCRtpReceiver RTCRtpTransceiver SVGAngle SVGLength SVGLengthList SVGNumber SVGNumberList SVGPoint SVGPointList SVGRect SVGMatrix SVGTransform SVGTransformList SVGPreserveAspectRatio SVGStringList SVGUnitTypes SVGZoomAndPan SVGAnimatedAngle SVGAnimatedBoolean SVGAnimatedEnumeration SVGAnimatedInteger SVGAnimatedLength SVGAnimatedLengthList SVGAnimatedNumber SVGAnimatedNumberList SVGAnimatedPreserveAspectRatio SVGAnimatedRect SVGAnimatedString SVGAnimatedTransformList SVGComponentTransferFunctionElement SVGFEBlendElement SVGFEColorMatrixElement SVGFEComponentTransferElement SVGFECompositeElement SVGFEConvolveMatrixElement SVGFEDiffuseLightingElement SVGFEDisplacementMapElement SVGFEDistantLightElement SVGFEDropShadowElement SVGFEFloodElement SVGFEFuncAElement SVGFEFuncBElement SVGFEFuncGElement SVGFEFuncRElement SVGFEGaussianBlurElement SVGFEImageElement SVGFEMergeElement SVGFEMergeNodeElement SVGFEMorphologyElement SVGFEOffsetElement SVGFEPointLightElement SVGFESpecularLightingElement SVGFESpotLightElement SVGFETileElement SVGFETurbulenceElement FileSystem FileSystemDirectoryEntry FileSystemDirectoryReader FileSystemEntry FileSystemFileEntry FileSystemHandle FileSystemFileHandle FileSystemDirectoryHandle FileSystemWritableFileStream ManagedMediaSource ManagedSourceBuffer DataTransfer DataTransferItem DataTransferItemList PointerEvent ScreenOrientation MediaQueryList NamedFlow Highlight HighlightRegistry".split(" ")
+    "IDBFactory IDBDatabase IDBObjectStore IDBIndex IDBCursor IDBCursorWithValue IDBKeyRange IDBRequest IDBOpenDBRequest IDBTransaction MediaRecorder MediaSource SourceBuffer SourceBufferList MediaStreamTrack CanvasCaptureMediaStreamTrack MediaDevices MediaDeviceInfo MediaCapabilities MediaKeys MediaKeySession MediaKeySystemAccess MediaKeyStatusMap RemotePlayback AudioContext BaseAudioContext OfflineAudioContext AudioNode AudioParam AudioBuffer AudioBufferSourceNode AudioDestinationNode AudioListener AnalyserNode GainNode BiquadFilterNode OscillatorNode DynamicsCompressorNode ConvolverNode DelayNode PannerNode StereoPannerNode WaveShaperNode ChannelMergerNode ChannelSplitterNode ConstantSourceNode IIRFilterNode PeriodicWave AudioWorklet AudioWorkletNode ScriptProcessorNode CSSStyleSheet StyleSheet StyleSheetList MediaList CSSRule CSSRuleList CSSStyleRule CSSMediaRule CSSImportRule CSSKeyframeRule CSSKeyframesRule CSSFontFaceRule CSSSupportsRule CSSNamespaceRule CSSPageRule StylePropertyMap StylePropertyMapReadOnly CSSStyleValue CSSUnitValue CSSKeywordValue CSSMathValue CSSNumericValue CSSTransformValue CSSTransformComponent CSSPerspective CSSImageValue CSSUnparsedValue FontFace FontFaceSet WebGLBuffer WebGLProgram WebGLShader WebGLTexture WebGLFramebuffer WebGLRenderbuffer WebGLUniformLocation WebGLActiveInfo WebGLShaderPrecisionFormat WebGLVertexArrayObject WebGLQuery WebGLSampler WebGLSync WebGLTransformFeedback Worker SharedWorker ServiceWorker ServiceWorkerContainer ServiceWorkerRegistration MessageChannel MessagePort BroadcastChannel Worklet WorkletGlobalScope MutationObserver MutationRecord ResizeObserver ResizeObserverEntry ResizeObserverSize IntersectionObserver IntersectionObserverEntry PerformanceObserver PerformanceObserverEntryList ReportingObserver ReadableStream WritableStream TransformStream ReadableStreamDefaultReader ReadableStreamBYOBReader ReadableStreamDefaultController WritableStreamDefaultWriter ByteLengthQueuingStrategy CountQueuingStrategy SubtleCrypto CryptoKey Crypto FileReader FileList FormData WebSocket EventSource XMLHttpRequest XMLHttpRequestUpload XMLHttpRequestEventTarget TextEncoderStream TextDecoderStream CompressionStream DecompressionStream DOMException DOMImplementation DOMParser XMLSerializer DOMStringList DOMStringMap DOMTokenList Attr CharacterData CDATASection ProcessingInstruction DocumentType Range StaticRange Selection NodeIterator TreeWalker ShadowRoot CustomElementRegistry XPathEvaluator XPathExpression XPathResult AbortPaymentEvent Performance PerformanceEntry PerformanceMark PerformanceMeasure PerformanceNavigationTiming PerformanceResourceTiming PerformancePaintTiming PerformanceServerTiming PerformanceEventTiming PerformanceLongTaskTiming PerformanceTiming PerformanceNavigation Animation AnimationEffect KeyframeEffect AnimationTimeline DocumentTimeline Notification Permissions PermissionStatus Clipboard ClipboardItem Geolocation GeolocationPosition GeolocationCoordinates GeolocationPositionError Gamepad GamepadButton BatteryManager NetworkInformation VisualViewport BarProp External Touch TouchList ImageBitmap ImageBitmapRenderingContext Path2D OffscreenCanvas OffscreenCanvasRenderingContext2D IdleDeadline Image Audio Option Observable PressureRecord XRInputSource IdentityCredentialError Keyboard UserActivation Ink InkPresenter CrashReportContext WindowControlsOverlay RTCPeerConnection RTCDataChannel RTCSessionDescription RTCIceCandidate RTCRtpSender RTCRtpReceiver RTCRtpTransceiver SVGAngle SVGLength SVGLengthList SVGNumber SVGNumberList SVGPoint SVGPointList SVGRect SVGMatrix SVGTransform SVGTransformList SVGPreserveAspectRatio SVGStringList SVGUnitTypes SVGZoomAndPan SVGAnimatedAngle SVGAnimatedBoolean SVGAnimatedEnumeration SVGAnimatedInteger SVGAnimatedLength SVGAnimatedLengthList SVGAnimatedNumber SVGAnimatedNumberList SVGAnimatedPreserveAspectRatio SVGAnimatedRect SVGAnimatedString SVGAnimatedTransformList SVGComponentTransferFunctionElement SVGFEBlendElement SVGFEColorMatrixElement SVGFEComponentTransferElement SVGFECompositeElement SVGFEConvolveMatrixElement SVGFEDiffuseLightingElement SVGFEDisplacementMapElement SVGFEDistantLightElement SVGFEDropShadowElement SVGFEFloodElement SVGFEFuncAElement SVGFEFuncBElement SVGFEFuncGElement SVGFEFuncRElement SVGFEGaussianBlurElement SVGFEImageElement SVGFEMergeElement SVGFEMergeNodeElement SVGFEMorphologyElement SVGFEOffsetElement SVGFEPointLightElement SVGFESpecularLightingElement SVGFESpotLightElement SVGFETileElement SVGFETurbulenceElement FileSystem FileSystemDirectoryEntry FileSystemDirectoryReader FileSystemEntry FileSystemFileEntry FileSystemHandle FileSystemFileHandle FileSystemDirectoryHandle FileSystemWritableFileStream ManagedMediaSource ManagedSourceBuffer DataTransfer DataTransferItem DataTransferItemList PointerEvent ScreenOrientation MediaQueryList NamedFlow Highlight HighlightRegistry".split(" ")
   );
   function rename(fn, name) {
     try {
@@ -2340,11 +2354,22 @@
   (function() {
     "use strict";
     const G3 = globalThis;
+    const __wx_console = G3.__wx_console;
+    const __wx_random_fill = G3.__wx_random_fill;
+    const __wx_random_double = G3.__wx_random_double;
+    delete G3.__wx_console;
+    delete G3.__wx_random_fill;
+    delete G3.__wx_random_double;
+    try {
+      delete G3.InternalError;
+    } catch (_) {
+    }
     const defFn = (name, fn) => {
       asNative(fn, name);
       Object.defineProperty(G3, name, { value: fn, configurable: true, writable: true });
       return fn;
     };
+    const defHidden2 = (name, value) => Object.defineProperty(G3, name, { value, configurable: true, writable: true, enumerable: false });
     const mklog = (level) => asNative(function() {
       let s = "";
       for (let i = 0; i < arguments.length; i++) {
@@ -2509,16 +2534,10 @@
     defFn("clearInterval", function clearInterval(id) {
       timers = timers.filter((t) => t.id !== id);
     });
-    defFn("setImmediate", function setImmediate(fn) {
-      return G3.setTimeout(fn, 0);
-    });
-    defFn("clearImmediate", function clearImmediate(id) {
-      return G3.clearTimeout(id);
-    });
     G3.queueMicrotask = G3.queueMicrotask || asNative(function queueMicrotask(fn) {
       Promise.resolve().then(fn);
     }, "queueMicrotask");
-    G3.__wx_runTimers = function __wx_runTimers() {
+    defHidden2("__wx_runTimers", function __wx_runTimers() {
       if (timers.length === 0) return false;
       let idx = 0;
       for (let i = 1; i < timers.length; i++)
@@ -2531,12 +2550,11 @@
         console.error("timer threw: " + e);
       }
       return true;
-    };
+    });
     const DEFAULT_PROFILE = {
-      // Chrome-on-Windows, close to WaxTap's WEB profile. America/Phoenix stays at
-      // UTC-7 year-round, which matches the shim's static Date offset. Mirrors
-      // waxseal.DefaultProfile() in profile.go.
-      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+      // America/Phoenix matches the shim's fixed UTC-7 Date offset. esbuild injects
+      // the Chrome version from chrome_version.json, which profile.go also embeds.
+      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
       platform: "Win32",
       language: "en-US",
       languages: ["en-US", "en"],
@@ -2546,17 +2564,38 @@
       screen: [1920, 1080],
       userAgentData: {
         brands: [
-          { brand: "Google Chrome", version: "131" },
-          { brand: "Chromium", version: "131" },
-          { brand: "Not_A Brand", version: "24" }
+          { brand: "Google Chrome", version: "149" },
+          { brand: "Chromium", version: "149" },
+          { brand: "Not)A;Brand", version: "24" }
         ],
+        fullVersionList: [
+          { brand: "Google Chrome", version: "149.0.7827.3" },
+          { brand: "Chromium", version: "149.0.7827.3" },
+          { brand: "Not)A;Brand", version: "24.0.0.0" }
+        ],
+        uaFullVersion: "149.0.7827.3",
         mobile: false,
         platform: "Windows"
       }
     };
-    G3.__wxDiscovery = true;
-    G3.__wxAutoStub = false;
+    defHidden2("__wxDiscovery", true);
+    defHidden2("__wxAutoStub", false);
     const seenProbes = /* @__PURE__ */ new Set();
+    defHidden2("__wxGetProbes", () => Array.from(seenProbes).sort());
+    defHidden2("__wxClearProbes", () => {
+      seenProbes.clear();
+    });
+    const HIDDEN = /* @__PURE__ */ new Set([
+      "runBotguard",
+      "newMinter",
+      "mint",
+      "__wx_runTimers",
+      "__wxApplyProfile",
+      "__wxDiscovery",
+      "__wxAutoStub",
+      "__wxGetProbes",
+      "__wxClearProbes"
+    ]);
     const ALLOW = /* @__PURE__ */ new Set([
       "then",
       "toJSON",
@@ -2568,6 +2607,7 @@
       Symbol.toStringTag
     ]);
     function logProbe(path) {
+      if (path.endsWith(".")) return;
       if (G3.__wxDiscovery && !seenProbes.has(path)) {
         seenProbes.add(path);
         console.warn("API-DRIFT probe: " + path);
@@ -2603,14 +2643,38 @@
     function discoveryProxy(target, label) {
       return new Proxy(target, {
         get(t, prop, recv) {
+          if (typeof prop === "string" && HIDDEN.has(prop)) return void 0;
           if (prop in t || typeof prop === "symbol" || ALLOW.has(prop))
             return Reflect.get(t, prop, recv);
           logProbe(label + "." + String(prop));
           return G3.__wxAutoStub ? universalStub(label + "." + String(prop)) : void 0;
         },
         has(t, prop) {
+          if (typeof prop === "string" && HIDDEN.has(prop)) return false;
+          if (typeof prop === "string" && !ALLOW.has(prop) && !Reflect.has(t, prop))
+            logProbe(label + "." + String(prop));
           if (G3.__wxAutoStub && typeof prop === "string") return true;
           return Reflect.has(t, prop);
+        },
+        getOwnPropertyDescriptor(t, prop) {
+          if (typeof prop === "string" && HIDDEN.has(prop)) return void 0;
+          const d = Reflect.getOwnPropertyDescriptor(t, prop);
+          if (d) return d;
+          if (typeof prop === "string" && !ALLOW.has(prop) && !Reflect.has(t, prop)) {
+            logProbe(label + "." + String(prop));
+            if (G3.__wxAutoStub)
+              return {
+                value: universalStub(label + "." + String(prop)),
+                writable: true,
+                enumerable: false,
+                configurable: true
+              };
+          }
+          return void 0;
+        },
+        // Hidden names are configurable, so omitting them satisfies Proxy invariants.
+        ownKeys(t) {
+          return Reflect.ownKeys(t).filter((k) => !(typeof k === "string" && HIDDEN.has(k)));
         },
         set(t, prop, val, recv) {
           return Reflect.set(t, prop, val, recv);
@@ -2790,7 +2854,7 @@
       def("performance", perf);
     })();
     let currentProfile = null;
-    G3.__wxApplyProfile = function __wxApplyProfile(p) {
+    defHidden2("__wxApplyProfile", function __wxApplyProfile(p) {
       const prof = Object.assign({}, DEFAULT_PROFILE, p || {});
       currentProfile = prof;
       const navBase = Object.create(G3.Navigator.prototype);
@@ -2827,8 +2891,8 @@
               architecture: "x86",
               bitness: "64",
               model: "",
-              uaFullVersion: prof.userAgentData.brands[0].version + ".0.0.0",
-              fullVersionList: this.brands
+              uaFullVersion: prof.userAgentData.uaFullVersion || prof.userAgentData.brands[0].version + ".0.0.0",
+              fullVersionList: prof.userAgentData.fullVersionList || this.brands
             };
             const out = { brands: this.brands, mobile: this.mobile, platform: this.platform };
             (hints || []).forEach((h) => {
@@ -2853,7 +2917,91 @@
         }, "sendBeacon"),
         clearAppBadge: asNative(function clearAppBadge() {
           return Promise.resolve();
-        }, "clearAppBadge")
+        }, "clearAppBadge"),
+        // Protected Audience API surface.
+        joinAdInterestGroup: asNative(function joinAdInterestGroup(group, durationSeconds) {
+          return Promise.resolve();
+        }, "joinAdInterestGroup"),
+        leaveAdInterestGroup: asNative(function leaveAdInterestGroup(group) {
+          return Promise.resolve();
+        }, "leaveAdInterestGroup"),
+        clearOriginJoinedAdInterestGroups: asNative(function clearOriginJoinedAdInterestGroups(owner, groupsToKeep) {
+          return Promise.resolve();
+        }, "clearOriginJoinedAdInterestGroups"),
+        updateAdInterestGroups: asNative(function updateAdInterestGroups() {
+        }, "updateAdInterestGroups"),
+        runAdAuction: asNative(function runAdAuction(config) {
+          return Promise.resolve(null);
+        }, "runAdAuction"),
+        createAuctionNonce: asNative(function createAuctionNonce() {
+          return Promise.resolve(G3.crypto && G3.crypto.randomUUID ? G3.crypto.randomUUID() : "");
+        }, "createAuctionNonce"),
+        getInterestGroupAdAuctionData: asNative(function getInterestGroupAdAuctionData(config) {
+          return Promise.resolve({ requestId: "", request: new Uint8Array() });
+        }, "getInterestGroupAdAuctionData"),
+        deprecatedReplaceInURN: asNative(function deprecatedReplaceInURN(urnOrConfig, replacements) {
+          return Promise.resolve();
+        }, "deprecatedReplaceInURN"),
+        deprecatedURNToURL: asNative(function deprecatedURNToURL(urnOrConfig) {
+          return Promise.resolve(null);
+        }, "deprecatedURNToURL"),
+        canLoadAdAuctionFencedFrame: asNative(function canLoadAdAuctionFencedFrame() {
+          return false;
+        }, "canLoadAdAuctionFencedFrame"),
+        // Use interface instances so navigator properties pass instanceof checks.
+        mediaDevices: Object.assign(Object.create(G3.MediaDevices.prototype), {
+          ondevicechange: null,
+          enumerateDevices: asNative(function enumerateDevices() {
+            return Promise.resolve([]);
+          }, "enumerateDevices"),
+          getSupportedConstraints: asNative(function getSupportedConstraints() {
+            return { width: true, height: true, aspectRatio: true, frameRate: true, facingMode: true, deviceId: true, groupId: true };
+          }, "getSupportedConstraints"),
+          getUserMedia: asNative(function getUserMedia() {
+            return Promise.reject(Object.assign(new Error("Permission denied"), { name: "NotAllowedError" }));
+          }, "getUserMedia"),
+          getDisplayMedia: asNative(function getDisplayMedia() {
+            return Promise.reject(Object.assign(new Error("Permission denied"), { name: "NotAllowedError" }));
+          }, "getDisplayMedia")
+        }),
+        connection: Object.assign(Object.create(G3.NetworkInformation.prototype), {
+          effectiveType: "4g",
+          rtt: 50,
+          downlink: 10,
+          saveData: false,
+          onchange: null
+        }),
+        keyboard: Object.assign(Object.create(G3.Keyboard.prototype), {
+          getLayoutMap: asNative(function getLayoutMap() {
+            return Promise.resolve(/* @__PURE__ */ new Map());
+          }, "getLayoutMap"),
+          lock: asNative(function lock() {
+            return Promise.resolve();
+          }, "lock"),
+          unlock: asNative(function unlock() {
+          }, "unlock")
+        }),
+        userActivation: Object.assign(Object.create(G3.UserActivation.prototype), {
+          hasBeenActive: false,
+          isActive: false
+        }),
+        windowControlsOverlay: Object.assign(Object.create(G3.WindowControlsOverlay.prototype), {
+          visible: false,
+          ongeometrychange: null,
+          getTitlebarAreaRect: asNative(function getTitlebarAreaRect() {
+            return new G3.DOMRect(0, 0, 0, 0);
+          }, "getTitlebarAreaRect")
+        }),
+        // Use Ink and InkPresenter instances to preserve instanceof behavior.
+        ink: Object.assign(Object.create(G3.Ink.prototype), {
+          requestPresenter: asNative(function requestPresenter(param) {
+            return Promise.resolve(Object.assign(Object.create(G3.InkPresenter.prototype), {
+              presentationArea: null,
+              updateInkTrailStartPoint: asNative(function updateInkTrailStartPoint(event, style) {
+              }, "updateInkTrailStartPoint")
+            }));
+          }, "requestPresenter")
+        })
       });
       def("navigator", discoveryProxy(navBase, "navigator"));
       const screenBase = Object.assign(Object.create(G3.Screen.prototype), {
@@ -2973,7 +3121,7 @@
       defFn("alert", function alert() {
       });
       return currentProfile;
-    };
+    });
     G3.__wxApplyProfile(null);
   })();
 
@@ -3256,8 +3404,8 @@
     constructor(mintCallback) {
       this.mintCallback = mintCallback;
     }
-    static async create(integrityTokenResponse, webPoSignalOutput) {
-      const getMinter = webPoSignalOutput[0];
+    static async create(integrityTokenResponse, webPoSignalOutput2) {
+      const getMinter = webPoSignalOutput2[0];
       if (!getMinter)
         throw new BGError("VM_ERROR", "PMD:Undefined");
       if (!integrityTokenResponse.integrityToken)
@@ -3286,8 +3434,8 @@
     const { program, bgConfig, globalName } = args;
     const { identifier } = bgConfig;
     const botguard = await BotGuardClient.create({ program, globalName, globalObj: bgConfig.globalObj });
-    const webPoSignalOutput = [];
-    const botguardResponse = await botguard.snapshot({ webPoSignalOutput });
+    const webPoSignalOutput2 = [];
+    const botguardResponse = await botguard.snapshot({ webPoSignalOutput: webPoSignalOutput2 });
     const payload = [bgConfig.requestKey, botguardResponse];
     const integrityTokenResponse = await bgConfig.fetch(buildURL("GenerateIT", bgConfig.useYouTubeAPI), {
       method: "POST",
@@ -3302,7 +3450,7 @@
       mintRefreshThreshold,
       websafeFallbackToken
     };
-    const webPoMinter = await WebPoMinter.create(integrityTokenData, webPoSignalOutput);
+    const webPoMinter = await WebPoMinter.create(integrityTokenData, webPoSignalOutput2);
     const poToken = await webPoMinter.mintAsWebsafeString(identifier);
     return { poToken, integrityTokenData };
   }
@@ -3365,7 +3513,10 @@
 
   // entrypoint.js
   var G2 = globalThis;
-  G2.runBotguard = async (interpreterJavascript, program, globalName, profile) => {
+  var defHidden = (name, value) => Object.defineProperty(G2, name, { value, configurable: true, writable: true, enumerable: false });
+  var webPoSignalOutput;
+  var minter;
+  defHidden("runBotguard", async (interpreterJavascript, program, globalName, profile) => {
     if (profile) G2.__wxApplyProfile(profile);
     new Function(interpreterJavascript)();
     const botguard = await core_exports.BotGuardClient.create({
@@ -3373,18 +3524,15 @@
       globalName,
       globalObj: G2
     });
-    G2.webPoSignalOutput = [];
-    const botguardResponse = await botguard.snapshot({
-      webPoSignalOutput: G2.webPoSignalOutput
-    });
+    webPoSignalOutput = [];
+    const botguardResponse = await botguard.snapshot({ webPoSignalOutput });
     return botguardResponse;
-  };
-  G2.newMinter = async (integrityToken) => {
-    G2.minter = await core_exports.WebPoMinter.create({ integrityToken }, G2.webPoSignalOutput);
+  });
+  defHidden("newMinter", async (integrityToken) => {
+    minter = await core_exports.WebPoMinter.create({ integrityToken }, webPoSignalOutput);
     return true;
-  };
-  G2.mint = async (identifier) => {
-    return await G2.minter.mintAsWebsafeString(identifier);
-  };
-  G2.__wxBundleReady = true;
+  });
+  defHidden("mint", async (identifier) => {
+    return await minter.mintAsWebsafeString(identifier);
+  });
 })();

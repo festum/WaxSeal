@@ -3,8 +3,11 @@ package waxseal
 import (
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/colespringer/waxseal/internal/jsassets"
 )
 
 // The default profile's timezone must be DST-free, and its static
@@ -139,5 +142,35 @@ func TestShimProfileNonChromeOmitsUAData(t *testing.T) {
 	_ = json.Unmarshal(p.shimJSON(), &m)
 	if _, ok := m["userAgentData"]; ok {
 		t.Fatal("Safari profile should omit userAgentData")
+	}
+}
+
+func TestChromeMajor(t *testing.T) {
+	cases := map[string]int{
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36": 149,
+		"Chrome/131.0.0.0": 131,
+		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Version/17.0 Safari/605.1.15": 0, // Safari: not Chrome
+		"":           0,
+		"Chrome/":    0, // no digits after the marker
+		"Chrome/abc": 0,
+	}
+	for ua, want := range cases {
+		if got := ChromeMajor(ua); got != want {
+			t.Errorf("ChromeMajor(%q) = %d, want %d", ua, got, want)
+		}
+	}
+}
+
+// TestBundleChromeVersionMatchesProfile catches a stale committed bundle after
+// chrome_version.json changes.
+func TestBundleChromeVersionMatchesProfile(t *testing.T) {
+	bundle := string(jsassets.BGBundle)
+	// navigator.userAgent uses Chrome's reduced major.0.0.0 form.
+	if ua := "Chrome/" + chromeVer.Major + ".0.0.0"; !strings.Contains(bundle, ua) {
+		t.Errorf("committed bg_bundle.js does not contain %q; run `make jsbundle` after bumping chrome_version.json", ua)
+	}
+	// UA-CH high-entropy hints contain the full build.
+	if !strings.Contains(bundle, chromeVer.FullVersion) {
+		t.Errorf("committed bg_bundle.js does not contain full version %q; run `make jsbundle` after bumping chrome_version.json", chromeVer.FullVersion)
 	}
 }

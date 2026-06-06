@@ -2,6 +2,8 @@ github.com/Masterminds/semver/v3 v3.2.1 h1:RN9w6+7QoMeJVGyfmbcgs28Br8cvmnucEXnY0
 github.com/Masterminds/semver/v3 v3.2.1/go.mod h1:qvl/7zhW3nngYb5+80sSMF+FG2BjYrf8m9wsX0PNOMQ=
 github.com/colespringer/waxtap v1.1.0 h1:F40A8mf+SnO958dHFdHu9W4AtKY8/1gQm+0oYZI7ttw=
 github.com/colespringer/waxtap v1.1.0/go.mod h1:5BEoCb4FzKVGzMsd+CahAwTgOtfHo9Br29zKrYhjw3g=
+github.com/colespringer/waxtap v1.2.0 h1:AG/TBup+AQ5ZSx5buJ+2hbffW3n/1krpmbYuI4iOdv8=
+github.com/colespringer/waxtap v1.2.0/go.mod h1:5BEoCb4FzKVGzMsd+CahAwTgOtfHo9Br29zKrYhjw3g=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/dlclark/regexp2 v1.11.5 h1:Q/sSnsKerHeCkc/jSTNq1oCm7KiVgUMZRDUoRu0JQZQ=

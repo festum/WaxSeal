@@ -646,6 +646,11 @@ class Screen {}
 class Location {}
 class History { get length() { return 1; } get state() { return null; } back() {} forward() {} go() {} pushState() {} replaceState() {} }
 class Performance extends EventTarget {}
+// Chrome exposes PictureInPictureWindow as a global EventTarget constructor.
+class PictureInPictureWindow extends EventTarget {
+  get width() { return 0; } get height() { return 0; }
+  get onresize() { return null; } set onresize(_v) {}
+}
 class Storage { get length() { return 0; } getItem() { return null; } setItem() {} removeItem() {} clear() {} key() { return null; } }
 // Crypto is a real class so the `crypto` singleton can be `instanceof Crypto`
 // (shim.js builds it via Object.create(Crypto.prototype)), not a bare presence
@@ -834,7 +839,7 @@ const INTERFACES = {
   Document, HTMLDocument, DocumentFragment, CharacterData, Text, Comment,
   DOMTokenList, NamedNodeMap, NodeList, HTMLCollection,
   Window, Navigator, WorkerNavigator, NavigatorUAData, Screen, Location, History,
-  Performance, Storage, Plugin, PluginArray, MimeType, MimeTypeArray, CSSStyleDeclaration
+  Performance, PictureInPictureWindow, Storage, Plugin, PluginArray, MimeType, MimeTypeArray, CSSStyleDeclaration
 };
 
 /** Publish all interfaces on `target` (globalThis) and mark them native. */
@@ -941,7 +946,9 @@ const EVENT_BATTERY = ('AnimationEvent AnimationPlaybackEvent BeforeInstallPromp
   'MediaRecorderErrorEvent MediaStreamTrackEvent MutationEvent OfflineAudioCompletionEvent PageTransitionEvent ' +
   'PaymentRequestUpdateEvent PopStateEvent ProgressEvent PromiseRejectionEvent RTCDataChannelEvent ' +
   'RTCPeerConnectionIceEvent SecurityPolicyViolationEvent StorageEvent SubmitEvent ToggleEvent ' +
-  'TouchEvent TrackEvent TransitionEvent WebGLContextEvent').split(' ');
+  'TouchEvent TrackEvent TransitionEvent WebGLContextEvent ' +
+  // Chrome 144 added XRVisibilityMaskChangeEvent to the WebXR surface.
+  'SpeechSynthesisEvent WindowControlsOverlayGeometryChangeEvent XRVisibilityMaskChangeEvent').split(' ');
 
 // Other standard window interfaces: present native constructors (most platform
 // interfaces throw "Illegal constructor" on direct new, which is what we render).
@@ -990,6 +997,9 @@ const PRESENCE_BATTERY = (
   'GeolocationPositionError Gamepad GamepadButton BatteryManager NetworkInformation VisualViewport BarProp External ' +
   'Touch TouchList ImageBitmap ImageBitmapRenderingContext Path2D OffscreenCanvas OffscreenCanvasRenderingContext2D ' +
   'IdleDeadline Image Audio Option ' +
+  // Additional browser interfaces modeled by the shim.
+  'Observable PressureRecord XRInputSource IdentityCredentialError Keyboard UserActivation Ink InkPresenter ' +
+  'CrashReportContext WindowControlsOverlay ' +
   // RTC
   'RTCPeerConnection RTCDataChannel RTCSessionDescription RTCIceCandidate RTCRtpSender RTCRtpReceiver RTCRtpTransceiver ' +
   // SVG value types (not elements; presence is correct) plus the animated

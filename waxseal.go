@@ -17,6 +17,7 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"log/slog"
@@ -91,6 +92,8 @@ type Token struct {
 	Headers   http.Header
 	Query     url.Values
 	ExpiresAt time.Time
+	// Kind is "integrity" or "fallback".
+	Kind string `json:",omitempty"`
 }
 
 // Options configure a Client.
@@ -129,6 +132,7 @@ type Options struct {
 	DefaultTTL          time.Duration // used when GenerateIT omits a lifetime (default 1h)
 	SnapshotConcurrency int           // bound concurrent ~910ms snapshots (default GOMAXPROCS/2)
 	Discovery           bool          // keep the shim's API drift probe trap on (dev/doctor)
+	DiscoverySink       io.Writer     // optional copy of VM stderr for discovery diagnostics
 	CompilationCacheDir string        // wazero AOT cache dir (skip recompile on restart)
 	Watchdog            time.Duration // per VM-call deadline (default 20s)
 
@@ -192,10 +196,16 @@ func New(opts Options) (*Client, error) {
 
 	eng := opts.engine
 	if eng == nil {
+		// Keep VM stderr in the logger and optionally copy it to a diagnostic sink.
+		var stderr io.Writer = slogWriter{opts.Logger}
+		if opts.DiscoverySink != nil {
+			// Runtimes share this writer and may write concurrently.
+			stderr = io.MultiWriter(&syncWriter{w: opts.DiscoverySink}, stderr)
+		}
 		qjs, err := quickjs.NewEngine(context.Background(), jsassets.QJSWasm, quickjs.Options{
 			PreloadBundle:       jsassets.BGBundle,
 			Watchdog:            opts.Watchdog,
-			Stderr:              slogWriter{opts.Logger},
+			Stderr:              stderr,
 			CompilationCacheDir: opts.CompilationCacheDir,
 		})
 		if err != nil {
@@ -368,14 +378,14 @@ func (c *Client) Token(ctx context.Context, req Request) (Token, error) {
 		Endpoint:         c.endpoint,
 		ForceNew:         req.BypassCache,
 		Challenge:        challenge,
-		InnertubeContext: c.innertubeContext(req),
+		InnertubeContext: func() json.RawMessage { return c.innertubeContext(req) },
 		DisableInnertube: c.disableInnertube(req),
 	})
 	if err != nil {
 		return Token{}, err
 	}
 
-	tok := Token{Value: res.Token, ExpiresAt: res.ExpiresAt}
+	tok := Token{Value: res.Token, ExpiresAt: res.ExpiresAt, Kind: string(res.Kind)}
 	if c.shouldCache(req.Scope, res.Kind) {
 		key := c.cacheKey(req, profile, identifier, res.Kind)
 		c.cache.Set(key, tok, res.ExpiresAt)
@@ -463,7 +473,7 @@ func (c *Client) Prewarm(req Request) {
 		AttestationUA:    profile.AttestationUA,
 		Client:           egressClient,
 		Endpoint:         c.endpoint,
-		InnertubeContext: c.innertubeContext(req),
+		InnertubeContext: func() json.RawMessage { return c.innertubeContext(req) },
 		DisableInnertube: c.disableInnertube(req),
 	})
 }
@@ -520,12 +530,23 @@ func (c *Client) parseChallenge(raw json.RawMessage) (*botguard.Challenge, error
 	return botguard.ParseProvidedChallenge(raw)
 }
 
-// innertubeContext returns the per-request att/get context or the client default.
+// innertubeContext returns the configured att/get context or builds one from the
+// request's visitor_data and WEB client version.
 func (c *Client) innertubeContext(req Request) json.RawMessage {
 	if len(req.InnertubeContext) > 0 {
 		return req.InnertubeContext
 	}
-	return c.opts.InnertubeContext
+	if len(c.opts.InnertubeContext) > 0 {
+		return c.opts.InnertubeContext
+	}
+	if req.VisitorData != "" {
+		clientVersion := ""
+		if strings.EqualFold(req.ClientName, "WEB") {
+			clientVersion = req.ClientVersion
+		}
+		return innertube.GuestContext(req.VisitorData, clientVersion)
+	}
+	return nil
 }
 
 // disableInnertube resolves the per-request InnerTube toggle over the default.
@@ -564,6 +585,10 @@ func (c *Client) shouldCache(scope Scope, _ session.TokenKind) bool {
 }
 
 // minterKey is the warm-minter key: the token key minus identifier and kind.
+//
+// It intentionally omits visitor_data. One attested minter can serve multiple
+// identifiers and scopes, while keying by session would force the player and GVS
+// paths to perform separate cold attestations.
 func (c *Client) minterKey(req Request, p BrowserProfile) string {
 	return strings.Join([]string{
 		req.Egress.ID, c.endpointMode, p.Hash(), req.ClientName, req.ClientVersion,
@@ -597,4 +622,16 @@ type slogWriter struct{ l *slog.Logger }
 func (w slogWriter) Write(p []byte) (int, error) {
 	w.l.Debug("vm", "line", strings.TrimRight(string(p), "\n"))
 	return len(p), nil
+}
+
+// syncWriter serializes writes to an underlying writer.
+type syncWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (s *syncWriter) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.w.Write(p)
 }
