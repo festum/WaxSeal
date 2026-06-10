@@ -30,6 +30,12 @@ RUN apt-get update \
 RUN useradd --create-home --uid 10001 waxseal
 COPY --from=build /out/waxseal /usr/local/bin/waxseal
 
+# org.opencontainers.image.source links the GHCR package to the repo (so it shows
+# under the repo's Packages and inherits its context).
+LABEL org.opencontainers.image.source="https://github.com/ColeSpringer/WaxSeal" \
+      org.opencontainers.image.description="YouTube PO-token service running BotGuard in a real headless Chromium" \
+      org.opencontainers.image.licenses="MIT"
+
 ENV WAXSEAL_CHROME_BIN=/usr/bin/chromium \
     HOME=/home/waxseal
 USER waxseal

@@ -12,7 +12,12 @@ RELEASE_PLATFORMS := linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/a
 
 BROWSER_BUNDLE_OUT := internal/browser/bg_browser_bundle.js
 
-.PHONY: all test jsbundle-browser verify-assets release deps clean
+REGISTRY    ?= ghcr.io
+IMAGE_OWNER ?= colespringer
+IMAGE       := $(REGISTRY)/$(IMAGE_OWNER)/waxseal
+
+.PHONY: all test jsbundle-browser verify-assets release deps clean \
+        docker-build docker-login docker-push
 
 all: jsbundle-browser
 
@@ -51,6 +56,29 @@ release:
 	    -ldflags "-s -w -X main.version=$(VERSION)" -o $$out ./cmd/waxseal || exit 1; \
 	done
 	@echo "release binaries in $(DIST)/ (each requires a system Chromium at runtime)"
+
+# Publish the runtime image to GitHub Container Registry. Auth reuses your gh
+# login: the token is piped to docker on stdin, so it never lands in args, env,
+# or shell history. Publish 1.0.0 with:  make docker-push VERSION=1.0.0
+
+# docker-build builds the runtime image, tagged VERSION and latest.
+docker-build:
+	docker build --build-arg VERSION=$(VERSION) -t $(IMAGE):$(VERSION) -t $(IMAGE):latest .
+
+# docker-login signs in to GHCR with the gh token (never printed). It needs the
+# write:packages scope; the check prints the one-time fix if the scope is absent.
+docker-login:
+	@gh api -i user 2>/dev/null | grep -qi '^X-Oauth-Scopes:.*write:packages' || { \
+	  echo "gh token is missing the 'write:packages' scope. Run once, then retry:"; \
+	  echo "    gh auth refresh -h github.com -s write:packages"; \
+	  exit 1; }
+	@gh auth token | docker login $(REGISTRY) -u $(IMAGE_OWNER) --password-stdin
+
+# docker-push builds, logs in, and pushes VERSION + latest to GHCR.
+docker-push: docker-build docker-login
+	docker push $(IMAGE):$(VERSION)
+	docker push $(IMAGE):latest
+	@echo "pushed $(IMAGE):$(VERSION) and $(IMAGE):latest"
 
 # deps installs the Node toolchain used to rebuild the browser bundle
 # (deterministically, from the committed lockfile).
