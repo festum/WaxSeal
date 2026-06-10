@@ -2,126 +2,112 @@ package main
 
 import (
 	"context"
+	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
+	"time"
 
-	waxseal "github.com/colespringer/waxseal"
-	"github.com/colespringer/waxseal/config"
+	"github.com/colespringer/waxseal/internal/browser"
 	"github.com/colespringer/waxseal/server"
 	"github.com/spf13/cobra"
 )
 
 // serverOpts holds server-subcommand flags.
 type serverOpts struct {
-	host                string
-	port                int
-	configPath          string
-	verbose             bool
-	allowEgressOverride bool
-	cacheDir            string
-	persistTokens       bool
-	diskBackend         string
-	endpointMode        string
+	host       string
+	port       int
+	video      string
+	headful    bool
+	tenantKeys string
+	verbose    bool
 }
 
 func newServerCmd() *cobra.Command {
-	var s serverOpts
+	var o serverOpts
 	c := &cobra.Command{
 		Use:   "server",
-		Short: "Run the bgutil-compatible HTTP daemon",
-		Long: "Run the HTTP daemon. It defaults to loopback (127.0.0.1:4416); set --host :: or\n" +
-			"0.0.0.0 (or POT_SERVER_HOST) to expose it on a private network. Use a shared\n" +
-			"secret (POT_SERVER_SECRET) when exposing it. It drains in-flight requests on SIGTERM/SIGINT.",
+		Short: "Run the bgutil-compatible HTTP daemon (warm browser, fast mints)",
+		Long: "Run the HTTP daemon over a real headless Chromium. It defaults to loopback\n" +
+			"(127.0.0.1:4416); set --host 0.0.0.0 to expose it. With --tenant-keys it is\n" +
+			"multi-tenant (one isolated browser context per key); without, it is keyless.\n" +
+			"It drains in-flight requests on SIGTERM/SIGINT.",
 		Args:          cobra.NoArgs,
 		SilenceUsage:  true,
 		SilenceErrors: true,
-		RunE:          func(cmd *cobra.Command, _ []string) error { return runServer(cmd, &s) },
+		RunE:          func(cmd *cobra.Command, _ []string) error { return runServer(cmd, &o) },
 	}
-	bindServerFlags(c, &s)
+	f := c.Flags()
+	f.StringVar(&o.host, "host", "127.0.0.1", "bind address (set 0.0.0.0 to expose)")
+	f.IntVar(&o.port, "port", 4416, "listen port")
+	f.StringVar(&o.video, "video", browser.DefaultVideo, "landing video for each tenant session")
+	f.BoolVar(&o.headful, "headful", false, "run headful (needs a display/Xvfb)")
+	f.StringVar(&o.tenantKeys, "tenant-keys", "", `multi-tenant API keys: "label1=key1,label2=key2" (empty = keyless)`)
+	f.BoolVarP(&o.verbose, "verbose", "v", false, "verbose (debug) logging")
 	return c
 }
 
-// bindServerFlags registers the server-subcommand flags on cmd. It is separated
-// from newServerCmd so tests can build a command and exercise applyServerFlags.
-func bindServerFlags(c *cobra.Command, s *serverOpts) {
-	f := c.Flags()
-	f.StringVar(&s.host, "host", "", "bind address (default 127.0.0.1; set :: or 0.0.0.0 to expose)")
-	f.IntVar(&s.port, "port", 0, "listen port (default 4416)")
-	f.StringVar(&s.configPath, "config", "", "path to a JSON config file")
-	f.BoolVarP(&s.verbose, "verbose", "v", false, "verbose (debug) logging")
-	f.BoolVar(&s.allowEgressOverride, "allow-request-egress-override", false,
-		"honor per-request proxy/source_address/disable_tls_verification; off by default")
-	f.StringVar(&s.cacheDir, "cache-dir", "", "directory for the wazero AOT cache and persistent store (default per-user cache)")
-	f.BoolVar(&s.persistTokens, "persist-tokens", false, "persist minted tokens to disk across restarts (off by default; tokens are sensitive)")
-	f.StringVar(&s.diskBackend, "disk-backend", "", "persistent store backend: bbolt (default) or json")
-	f.StringVar(&s.endpointMode, "endpoint-mode", "", "WAA attestation host: youtube (default) or googleapis")
-}
+func runServer(cmd *cobra.Command, o *serverOpts) error {
+	level := "info"
+	if o.verbose {
+		level = "debug"
+	}
+	logger := buildLogger(level, os.Stdout) // daemon logs to stdout
+	keys := server.ParseTenantKeys(o.tenantKeys)
 
-// applyServerFlags overlays explicitly-set flags onto cfg (highest precedence,
-// flags > env > file). It honors --flag=false for booleans by gating on
-// Flags().Changed rather than the value, so an explicit disable wins over a true
-// from env/file.
-func applyServerFlags(cmd *cobra.Command, s *serverOpts, cfg *config.Config) {
-	changed := cmd.Flags().Changed
-	if changed("host") {
-		cfg.Host = s.host
-	}
-	if changed("port") {
-		cfg.Port = s.port
-	}
-	if s.verbose {
-		cfg.LogLevel = "debug"
-	}
-	if changed("cache-dir") {
-		cfg.CacheDir = s.cacheDir
-	}
-	if changed("persist-tokens") {
-		cfg.PersistTokens = s.persistTokens
-	}
-	if changed("disk-backend") {
-		cfg.DiskBackend = s.diskBackend
-	}
-	if changed("endpoint-mode") {
-		cfg.EndpointMode = s.endpointMode
-	}
-}
-
-func runServer(cmd *cobra.Command, s *serverOpts) error {
-	cfg, err := config.Load(s.configPath)
-	if err != nil {
-		return err
-	}
-	applyServerFlags(cmd, s, &cfg)
-	if err := cfg.Validate(); err != nil {
-		return err
-	}
-	cfg.CacheMaxTTL = serverCacheTTL(cfg.CacheMaxTTL)
-
-	logger := buildLogger(cfg.LogLevel, cfg.LogFormat, os.Stdout)
-	// The daemon is long-running and single-process, so it uses the resolved
-	// cache directory for breaker persistence by default.
-	client, err := buildClient(cfg, logger, compilationCacheDir(cfg.CacheDir), buildClientOpts{})
-	if err != nil {
-		return err
-	}
-	defer func() { _ = client.Close() }()
-
-	egress := defaultEgress(cfg)
-	// Pre-warm the default egress so the first request skips the cold snapshot.
-	client.Prewarm(waxseal.Request{Scope: waxseal.ScopeOpaque, Egress: egress})
-
-	srv := server.New(client, server.Options{
-		Host:                       cfg.Host,
-		Port:                       cfg.Port,
-		SharedSecret:               cfg.SharedSecret,
-		AllowRequestEgressOverride: cfg.AllowRequestEgressOverride || s.allowEgressOverride,
-		DefaultEgress:              egress,
-		Version:                    version,
-		Logger:                     logger,
+	srv, err := server.New(server.Config{
+		Addr:       net.JoinHostPort(o.host, strconv.Itoa(o.port)),
+		Video:      o.video,
+		Headful:    o.headful,
+		TenantKeys: keys,
+		Logger:     logger,
 	})
+	if err != nil {
+		logger.Error("startup: launch browser failed", "err", err)
+		return err
+	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	// Warm one tenant so the first request is fast and startup fails loudly if the
+	// browser/IP can't attest. The rest (if multi-tenant) attest lazily.
+	warmKey := ""
+	for k := range keys {
+		warmKey = k
+		break
+	}
+	warmCtx, cancel := context.WithTimeout(cmd.Context(), 90*time.Second)
+	err = srv.Warm(warmCtx, warmKey)
+	cancel()
+	if err != nil {
+		logger.Error("startup attestation failed", "err", err)
+		_ = srv.Shutdown(context.Background())
+		return err
+	}
+	if len(keys) == 0 {
+		logger.Info("mode: keyless single-tenant")
+	} else {
+		logger.Info("mode: multi-tenant", "tenants", len(keys))
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		logger.Info("waxseal server listening (bgutil /get_pot)", "addr", srv.Addr())
+		errCh <- srv.ListenAndServe()
+	}()
+
+	ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	return srv.ListenAndServe(ctx)
+	select {
+	case <-ctx.Done():
+	case err := <-errCh:
+		if err != nil {
+			logger.Error("listen failed", "err", err)
+			_ = srv.Shutdown(context.Background())
+			return err
+		}
+	}
+	logger.Info("shutting down")
+	shutCtx, c := context.WithTimeout(context.Background(), 5*time.Second)
+	defer c()
+	return srv.Shutdown(shutCtx)
 }

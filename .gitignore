@@ -1,18 +1,12 @@
-i-am-looking-to-zany-dragon.md
-
-# Build toolchains (fetched by `make deps`; pinned, not committed)
-/.toolchains/
+# Node deps for rebuilding the browser bundle (`make deps`)
 build/js/node_modules/
-
-# Local build scratch
-*.o
-*.tmp
 
 # Cross-compiled release binaries (`make release`)
 /dist/
 
-# Local diff scratch
+# Local scratch
+*.tmp
 *.patch
 
-# NOTE: internal/jsassets/qjs.wasm and bg_bundle.js ARE committed (build outputs
-# treated like vendored deps); do not ignore them.
+# NOTE: internal/browser/bg_browser_bundle.js IS committed (a build output treated
+# like a vendored dep); do not ignore it.

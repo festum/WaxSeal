@@ -9,8 +9,9 @@ permissions:
   contents: read
 
 jobs:
-  # Offline build + vet + race tests. No C/Node toolchain: the qjs.wasm and
-  # bg_bundle.js artifacts are committed.
+  # Offline build + vet + race tests. No Node toolchain: the browser bundle is
+  # committed (go:embed). Live YouTube/BotGuard tests are run manually, not in CI
+  # (they need a real Chromium + network and are inherently flaky).
   test:
     runs-on: ubuntu-latest
     steps:
@@ -36,8 +37,8 @@ jobs:
       - working-directory: provider
         run: go build ./... && go vet ./...
 
-  # Cross-compile the no-CGo binary for the full GOOS/GOARCH matrix using the
-  # same embedded wasm/JS assets.
+  # Cross-compile the CLI/daemon for the full GOOS/GOARCH matrix. The binary is
+  # pure Go and cross-compiles cleanly; it drives an external Chromium at runtime.
   cross:
     runs-on: ubuntu-latest
     strategy:
@@ -56,21 +57,24 @@ jobs:
           CGO_ENABLED: "0"
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
-        run: go build ./...
+        run: go build ./cmd/waxseal
 
-  # Reproducibility gate: rebuild the embedded artifacts from the pinned
-  # toolchains and fail if a single byte differs from what is committed.
-  reproduce-assets:
+  # Reproducibility gate: rebuild the committed browser bundle from source and
+  # fail if a single byte differs from what is committed.
+  reproduce-bundle:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - name: fetch pinned toolchains (wasi-sdk, quickjs-ng, binaryen, npm)
-        run: make deps
-      - name: rebuild and diff against the committed bytes
+      - name: rebuild and diff against the committed bundle
         run: make verify-assets
+
+  # The container build gate: builds the hardened image. It is not run here
+  # (running needs a real Chromium + network).
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose -f compose.yaml build

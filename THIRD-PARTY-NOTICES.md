@@ -1,39 +1,35 @@
 # Third-party notices
 
-WaxSeal is **MIT**-licensed. It is implemented independently. The **GPL-3.0**
+WaxSeal is **MIT**-licensed, implemented independently. The **GPL-3.0**
 `bgutil-ytdlp-pot-provider` project was used only as a behavioral and wire
-reference for interoperable details such as endpoints and JSON field names; no
-GPL code was copied. Algorithms ported from MIT sources are attributed below.
+reference for interoperable details (endpoints, JSON field names); no GPL code
+was copied. Algorithms ported from MIT sources are attributed below.
 
 ## Bundled / embedded at runtime
 
-- **quickjs-ng** (MIT): © 2017-present Fabrice Bellard, Charlie Gordon, and
-  quickjs-ng contributors. Compiled to `internal/jsassets/qjs.wasm`.
-  <https://github.com/quickjs-ng/quickjs>
-- **bgutils-js** (MIT): bundled into `internal/jsassets/bg_bundle.js`.
-  <https://github.com/LuanRT/BgUtils>
+- **bgutils-js** (MIT): the BotGuard client / WebPoMinter, bundled into the
+  shim-free browser bundle `internal/browser/bg_browser_bundle.js` and eval'd in
+  the real Chromium. <https://github.com/LuanRT/BgUtils>
 
 ## Build-time only (not shipped)
 
-- **wasi-sdk** (Apache-2.0 with LLVM exceptions): compiles `host.c` + quickjs-ng.
-- **esbuild** (MIT): bundles `bg_bundle.js`.
-- **Binaryen / `wasm-opt`** (Apache-2.0, `version_119`): required for the
-  pinned artifact size and AOT profile (`-Os`).
+- **esbuild** (MIT): bundles `bg_browser_bundle.js` from `build/js`.
+  <https://github.com/evanw/esbuild>
 
 ## Go module dependencies
 
-- **github.com/tetratelabs/wazero** (Apache-2.0): pure-Go WebAssembly runtime.
-- **go.etcd.io/bbolt** (MIT): pure-Go embedded key/value store backing the
-  default disk-persistent token cache and breaker cooldown (its own file
-  locking). <https://github.com/etcd-io/bbolt>
+- **github.com/go-rod/rod** (MIT): the Chrome DevTools Protocol driver used to run
+  BotGuard in a real headless Chromium (pulls `ysmood/{gson,goob,fetchup,leakless}`
+  and `google.golang.org/protobuf`). <https://github.com/go-rod/rod>
 - **github.com/spf13/cobra** / **spf13/pflag** (Apache-2.0): CLI framework.
+
+The product drives an external system **Chromium** at run time; Chromium is not
+bundled and carries its own (BSD-style) license.
 
 ## Ported algorithms (MIT, with attribution)
 
 - **rustypipe-botguard** (MIT): `descramble` (`+97`/byte), `parse_challenge_data`,
-  `validate_potoken` (protobuf field-6 scan), and the `bg_entrypoint.js` shape
-  were ported to Go / the WaxSeal entrypoint.
-  <https://codeberg.org/ThetaDev/rustypipe-botguard>
-- **BgUtils** (MIT): the BotGuard client / WebPoMinter protocol (`botGuardClient.ts`,
-  `webPoMinter.ts`, `webPoClient.ts`, `helpers.ts`) informed the entrypoint and
-  validator. <https://github.com/LuanRT/BgUtils>
+  and `validate_potoken` (protobuf field-6 scan) were ported to Go in
+  `internal/botguard`. <https://codeberg.org/ThetaDev/rustypipe-botguard>
+- **BgUtils** (MIT): the BotGuard client / WebPoMinter protocol informed the
+  browser entrypoint and the validator. <https://github.com/LuanRT/BgUtils>

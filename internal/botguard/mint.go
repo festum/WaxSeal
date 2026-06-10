@@ -7,7 +7,6 @@ import (
 	"net/http"
 
 	"github.com/colespringer/waxseal/internal/httpx"
-	"github.com/colespringer/waxseal/internal/jsruntime"
 )
 
 // GenerateITResult preserves the integrity and fallback tokens independently.
@@ -28,26 +27,6 @@ func (r *GenerateITResult) HasIntegrity() bool { return r != nil && r.IntegrityT
 
 // HasFallback reports whether a directly-usable fallback token was issued.
 func (r *GenerateITResult) HasFallback() bool { return r != nil && r.FallbackToken != "" }
-
-// Snapshot runs the BotGuard VM on the runtime (the only JS we run) and returns
-// the botguardResponse. The runtime must have the bg_bundle preloaded.
-// profileJSON, when non-empty, is the coherent BrowserProfile the shim renders
-// (navigator/screen/timezone/UA-CH); empty leaves the shim's loaded default.
-func Snapshot(ctx context.Context, rt jsruntime.Runtime, ch *Challenge, profileJSON json.RawMessage) (string, error) {
-	args := []any{ch.InterpreterJS, ch.Program, ch.GlobalName}
-	if len(profileJSON) > 0 {
-		args = append(args, profileJSON)
-	}
-	out, err := rt.Call(ctx, "runBotguard", args...)
-	if err != nil {
-		return "", stageErr(StageVM, "runBotguard: %w", err)
-	}
-	var resp string
-	if err := json.Unmarshal(out, &resp); err != nil || resp == "" {
-		return "", stageErr(StageVM, "empty botguardResponse")
-	}
-	return resp, nil
-}
 
 // GenerateIT posts the botguardResponse and parses the result tuple. All HTTP is
 // done in Go. A response carrying only the fallback token (arr[0] null) is
@@ -89,30 +68,4 @@ func parseGenerateIT(raw []byte) (*GenerateITResult, error) {
 		return nil, stageErr(StageGenerateIT, "no integrity or fallback token")
 	}
 	return it, nil
-}
-
-// InstallMinter creates the WebPoMinter on the runtime from the integrity token.
-// It must run on the same runtime as Snapshot (webPoSignalOutput[0] is a live JS
-// closure on that runtime).
-func InstallMinter(ctx context.Context, rt jsruntime.Runtime, integrityToken string) error {
-	if _, err := rt.Call(ctx, "newMinter", integrityToken); err != nil {
-		return stageErr(StageMint, "newMinter: %w", err)
-	}
-	return nil
-}
-
-// Mint mints a websafe-base64 token bound to identifier and validates field 6.
-func Mint(ctx context.Context, rt jsruntime.Runtime, identifier string) (string, error) {
-	out, err := rt.Call(ctx, "mint", identifier)
-	if err != nil {
-		return "", stageErr(StageMint, "mint: %w", err)
-	}
-	var token string
-	if err := json.Unmarshal(out, &token); err != nil || token == "" {
-		return "", stageErr(StageMint, "empty token")
-	}
-	if _, err := ValidatePOToken(token); err != nil {
-		return "", stageErr(StageValidate, "%w", err)
-	}
-	return token, nil
 }

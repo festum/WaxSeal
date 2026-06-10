@@ -2,14 +2,13 @@
   "name": "waxseal-bgbundle",
   "version": "0.0.0",
   "private": true,
-  "description": "WaxSeal BotGuard JS bundle build (esbuild: bgutils-js + shim + entrypoint)",
+  "description": "WaxSeal BotGuard JS bundle build (esbuild: bgutils-js + browser entrypoint)",
   "type": "module",
   "scripts": {
-    "build": "node build.mjs"
+    "build": "node build-browser.mjs"
   },
   "devDependencies": {
-    "esbuild": "^0.25.0",
-    "playwright-core": "^1.60.0"
+    "esbuild": "^0.25.0"
   },
   "dependencies": {
     "bgutils-js": "^3.2.0"

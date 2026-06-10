@@ -1,148 +1,104 @@
 # WaxSeal
 
-A native-Go YouTube **PO Token (POT)** provider. WaxSeal handles networking,
-descrambling, protobuf, caching, and orchestration in **pure Go**, and runs only
-Google's **BotGuard VM** inside **QuickJS compiled to WASM**, executed by
-[`wazero`](https://github.com/tetratelabs/wazero) (pure Go, no CGo).
+A YouTube **PO Token (POT)** provider that mints tokens from a **real headless
+Chromium**: Google's **BotGuard** runs in the actual browser (via
+[go-rod](https://github.com/go-rod/rod)), while WaxSeal handles attestation,
+token binding, caching, multi-tenancy, and the HTTP/CLI surface in Go.
 
-The result is a single static binary: no CGo, no Node/V8, and no per-arch native
-artifacts. The embedded `qjs.wasm` and `bg_bundle.js` are architecture-neutral,
-so normal `GOOS`/`GOARCH` cross-builds work. WaxSeal can plug into
-[WaxTap](https://github.com/colespringer/waxtap) as a `potoken.Provider`, run as
-a bgutil-wire-compatible HTTP daemon, or run as a CLI.
+Running BotGuard in a genuine browser rather than an emulated JS environment lets
+the attestation fingerprint a real navigator, which reliably earns the
+**integrity** token grade. WaxSeal runs as a bgutil-wire HTTP daemon or a CLI, and
+its HTTP API is consumed by applications that embed the
+[WaxTap](https://github.com/colespringer/waxtap) library.
 
-> **Status.** The QuickJS-on-wazero core is in place, and the live integrity path
-> mints bound tokens that pass field-6 validation. The public Client, WaxTap
-> adapter, InnerTube challenge/visitor_data source, per-egress transports,
-> bgutil-compatible HTTP daemon, and CLI commands (`generate`, `server`,
-> `doctor`, `ping`) are implemented. The current tree also includes optional
-> disk-backed token caching, persisted breaker cooldowns, Prometheus metrics, and
-> a cross-platform release matrix. Offline tests cover the runtime ABI, the
-> challenge/mint/validate pipeline, the warm-minter session, persistence, metrics,
-> server handlers, and config precedence; live BotGuard tests run under
-> `-tags e2e`. Artifact pins and hashes live in
-> [build/PROVENANCE.md](build/PROVENANCE.md).
+> **Requires a system Chromium at runtime** (auto-detected, or set
+> `WAXSEAL_CHROME_BIN`). The Go binary cross-compiles normally, but it drives an
+> external browser, so it is not a self-contained static binary.
+
+> **Status.** It mints integrity tokens reliably (headless, no Xvfb). The daemon
+> exposes `/get_pot`, `/session` (the coherent
+> visitor_data + cookies handoff), `/ping`, and `/metrics`, is **multi-tenant**
+> (per-tenant API keys → isolated browser contexts), and wraps a reliability
+> layer (single-flight attestation, a generation-keyed token cache, a mint
+> escalation ladder, crash recovery). End-to-end verified with WaxTap v1.5.0
+> streaming WEB Opus audio.
 
 ## Layout
 
 ```
-waxseal.go / profile.go / egress.go  public Client: orchestration, profiles, per-egress transports
-provider/                  WaxTap potoken.Provider adapter (separate, WaxTap-only module)
-server/                    bgutil-wire-compatible net/http daemon
-cmd/waxseal/               CLI: generate (default) / server / doctor
-config/                    layered config (flags > env > file > defaults)
-build/wasm/host.c          WaxSeal QuickJS host ABI (the only C we ship; WASI reactor)
-build/js/{shim,entrypoint,dom}.js  browser shim + DOM model + BotGuard entrypoint
-internal/jsassets/         go:embed qjs.wasm + bg_bundle.js (committed build outputs)
-internal/jsruntime/        Runtime/Engine interface + quickjs (wazero) backend
-internal/botguard/         challenge fetch/descramble/parse, GenerateIT, mint, field-6 validation
-internal/innertube/        InnerTube att/get challenge source + guest visitor_data
-internal/session/          warm-minter pool (refresh-ahead, snapshot semaphore, breaker)
-internal/cache/ httpx/     token cache; shared Google-facing HTTP (retry/backoff/breaker)
-internal/persist/          disk store: bbolt (default) / JSON, versioned; memory fallback
-internal/metrics/          dependency-free counters + Prometheus exposition
-Makefile                   make deps / wasm / jsbundle / provenance / verify-assets / release
+client/              Go client for the WaxSeal HTTP API (POToken + Session); WaxTap-free, reusable by any app
+cmd/waxseal/         CLI: generate (default) / server / doctor / ping
+server/              bgutil-wire HTTP daemon over the minter (get_pot/session/ping/metrics)
+internal/browser/    go-rod + Chromium substrate: Session, Pool (incognito contexts), bundle
+internal/minter/     reliability + multi-tenancy: Minter (single-flight/cache/escalation), Tenants
+internal/botguard/   challenge fetch/descramble/parse, GenerateIT, field-6 validation
+internal/innertube/  InnerTube att/get challenge source + guest visitor_data
+internal/httpx/      shared Google-facing HTTP (retry/backoff)
+build/js/            bgutils + BotGuard entrypoint -> internal/browser bundle (esbuild)
+provider/            thin WaxTap potoken.Provider adapter over client/ (separate, WaxTap-only module)
 ```
+
+Any Go application can talk to a WaxSeal daemon via the WaxTap-free `client`
+package: `client.New(url).POToken(ctx, contentBinding, scope)` and `.Session(ctx)`.
+The `provider/` module is a thin scope-mapping adapter that satisfies WaxTap's
+`potoken.Provider`; a non-WaxTap consumer uses `client` directly or writes its own
+adapter.
 
 ## Build & test
 
 ```
-go build ./...      # needs no C/Node toolchain; artifacts are committed
-go test ./...       # offline unit tests
-make deps           # fetch pinned wasi-sdk + quickjs-ng, npm install (only to rebuild artifacts)
-make wasm jsbundle  # regenerate qjs.wasm / bg_bundle.js
-go test -tags e2e ./internal/botguard/ -run TestGateB -v   # live BotGuard check
+go build ./...      # needs no Node toolchain; the browser bundle is committed
+go test ./...       # offline unit tests (race-clean)
+make deps           # npm install (only to rebuild the browser bundle)
+make jsbundle-browser   # regenerate internal/browser/bg_browser_bundle.js
 ```
 
 ## Run
 
 ```
-# CLI generate mode, compatible with bgutil's script provider.
-go run ./cmd/waxseal -c <content_binding>
-
-# HTTP daemon (defaults to loopback 127.0.0.1:4416).
+# HTTP daemon (defaults to loopback 127.0.0.1:4416). Warms a browser at startup.
 go run ./cmd/waxseal server
 curl -s localhost:4416/get_pot -d '{"content_binding":"<videoID>"}'   # -> {"poToken",...}
-curl -s localhost:4416/ping                                          # health check; never mints
-curl -s localhost:4416/metrics                                       # Prometheus counters
+curl -s localhost:4416/session                                        # visitor_data + cookies (coherence handoff)
+curl -s localhost:4416/ping                                           # health check; never mints
+curl -s localhost:4416/metrics                                        # per-tenant counters
 
-# Redacted diagnostics by stage.
+# One-shot CLI generate (bgutil script-provider compatible). Launches a fresh
+# browser each call, so for yt-dlp prefer the warm `server`.
+go run ./cmd/waxseal -c <content_binding>
+
+# Diagnostics: launch a browser, attest, report identity + token grade.
 go run ./cmd/waxseal doctor
 
 # Health-check a running daemon (exit 0/1) for scripts/systemd/monitoring.
 go run ./cmd/waxseal ping
 ```
 
-The daemon treats `content_binding` as an opaque mint identifier. It rejects the
-deprecated `visitor_data`/`data_sync_id` fields with HTTP 400, and ignores
-per-request `proxy`/`source_address`/`disable_tls_verification` unless started
-with `--allow-request-egress-override`. Set `POT_SERVER_SECRET` to require an
-`X-WaxSeal-Secret` header on every endpoint except `/ping`.
+`content_binding` is the mint identifier: a **video_id** for a player token, or a
+**visitor_data** for a GVS token. The token is bound to the minting host's egress
+IP, so the consumer must egress the **same IP** for the SABR media stage.
 
-Config precedence is flags > env (`POT_SERVER_HOST`/`POT_SERVER_PORT`,
-`CACHE_DIR`, `CACHE_MAX_TTL`, `PERSIST_TOKENS`, `DISK_CACHE_BACKEND`,
-`ENDPOINT_MODE`, `HTTP(S)_PROXY`, `DISABLE_INNERTUBE`, `POT_SERVER_SECRET`,
-`LOG_LEVEL`/`LOG_FORMAT`) > file > defaults. `ENDPOINT_MODE` selects the WAA
-attestation host: `youtube` (default, `youtube.com/api/jnn/v1`) or `googleapis`
-(`jnn-pa.googleapis.com`).
+## Multi-tenant
 
-## Persistence
-
-Warm minters run `Create`/`GenerateIT` roughly once per egress per token
-lifetime, usually 6 to 12 hours. A configured disk store keeps usable state
-across restarts, which reduces repeated `Create` calls after daemon restarts.
-When `CACHE_DIR` is set:
-
-- the **circuit-breaker cooldown is persisted by default** (non-sensitive): an
-  active cooldown survives a restart and prevents immediate attestation calls;
-- the **token cache is opt-in** (`--persist-tokens` / `PERSIST_TOKENS=true`)
-  because tokens are bearer capabilities; store files are `0600`.
-
-The default backend is **bbolt**, which provides its own file locking.
-`--disk-backend json` selects a JSON file for single-process use. The store
-fingerprint includes the `qjs.wasm` and `bg_bundle.js` hashes; when it changes,
-WaxSeal resets the stored state. If a configured store is locked or too slow to
-open (for example, on a network mount), WaxSeal logs the failure and uses
-memory-only storage. The in-process library also defaults to memory-only when
-`CacheDir` is empty.
-
-## Metrics
-
-The daemon exposes Prometheus metrics at `GET /metrics` (behind the shared
-secret, like every endpoint but `/ping`):
+One Chromium hosts N isolated incognito **browser contexts**, one guest identity
+(visitor_data + cookies) per tenant, selected by per-tenant API keys:
 
 ```
-curl -s localhost:4416/metrics
-# waxseal_snapshots_total, waxseal_attestations_total,
-# waxseal_mints_total{kind="integrity|fallback"}, waxseal_runtime_poisons_total,
-# waxseal_breaker_opens_total, waxseal_cache_hits_total/_misses_total,
-# waxseal_attest_failures_total{stage="challenge|vm|generateit|..."}, ...
+go run ./cmd/waxseal server --tenant-keys "alice=KEYA,bob=KEYB"
+curl -s localhost:4416/get_pot -H "X-API-Key: KEYA" -d '{"content_binding":"<id>"}'
 ```
 
-The counters help distinguish API drift, shown as a spike in
-`attest_failures_total` by stage, from IP risk scoring, where integrity mints
-downgrade to fallback tokens.
+With no `--tenant-keys` the daemon is **keyless single-tenant** (the bgutil wire
+stays unauthenticated for generic yt-dlp). The key may be sent as `X-API-Key`,
+`Authorization: Bearer <key>`, or `?key=<key>`. Per-tenant egress is a future
+seam; residential self-hosting uses the one host IP.
 
-## Cross-platform
+## Coherence handoff (`/session`)
 
-The pure-Go, no-CGo design builds as a static binary with the wasm/JS embedded;
-no Node, V8, or Python runtime is required. The embedded `qjs.wasm` and
-`bg_bundle.js` assets are **architecture-neutral**, so `make release` uses normal
-`CGO_ENABLED=0` cross-builds for:
-
-| OS \ Arch | amd64 | arm64 |
-|-----------|:-----:|:-----:|
-| Linux     |  yes  |  yes  |
-| macOS     |  yes  |  yes  |
-| Windows   |  yes  |  yes  |
-
-```
-make release            # cross-compiles all six into dist/
-make verify-assets      # rebuild qjs.wasm/bg_bundle.js and diff the committed bytes
-```
-
-CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs race tests, the
-cross-compile matrix, and the artifact-reproducibility diff on every push.
+GVS reaches `STREAM_PROTECTION` status 1 only with the **coherent**
+{visitor_data, cookies} pair. `GET /session` exports the tenant context's
+identity so a consumer embedding WaxTap can adopt the browser-as-origin; pair it with a
+`/get_pot` token bound to that same visitor_data, egressing the same IP.
 
 ## License
 

@@ -1,0 +1,33 @@
+# WaxSeal + a consumer sharing one egress IP.  `docker compose -f compose.full.yaml up`
+#
+# WaxSeal is the PO-token daemon (this repo). WaxTap is a *library*, not a
+# container; it is embedded in a consumer application. The intended consumer is
+# WaxBin (a music organizer that embeds WaxTap); WaxBin is not built yet, so the
+# `waxbin` service below is a template: drop in your own image and command.
+#
+# The PO token is bound to the minting host's egress IP, so the consumer must
+# egress the same IP as WaxSeal. Sharing WaxSeal's network namespace
+# (network_mode: service:waxseal) gives that for free and lets the consumer reach
+# the daemon at 127.0.0.1:4416.
+services:
+  waxseal:
+    extends:
+      file: compose.yaml
+      service: waxseal
+    container_name: waxseal
+    ports: [] # not published; the consumer reaches it over the shared network namespace
+
+  # WaxBin (or any app embedding the WaxTap library): not built yet; template only.
+  waxbin:
+    image: ${WAXBIN_IMAGE:-waxbin:latest}
+    network_mode: "service:waxseal" # same netns -> same egress IP + WaxSeal at localhost:4416
+    depends_on:
+      waxseal:
+        condition: service_healthy
+    restart: "no"
+    # Point the embedded WaxTap at the daemon: /get_pot for tokens, /session for the
+    # coherent visitor_data + cookies handoff. e.g.:
+    #   environment:
+    #     - WAXSEAL_POTOKEN_URL=http://127.0.0.1:4416
+    #     - WAXSEAL_SESSION_URL=http://127.0.0.1:4416/session
+    # command: ["..."]

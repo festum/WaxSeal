@@ -1,185 +1,261 @@
-// Package server is WaxSeal's standalone HTTP daemon. Its wire format is
-// compatible with the bgutil POT provider (so existing yt-dlp POT plugins work
-// unchanged) but it is implemented independently over the standard library's
-// net/http and log/slog; the GPL bgutil project is a behavioral reference only.
-//
-// It defaults to loopback exposure, treats content_binding as an opaque mint
-// identifier, rejects the deprecated visitor_data/data_sync_id fields, and
-// requires explicit opt-ins for network-changing per-request egress overrides
-// (proxy/source_address/disable_tls_verification) and caller-supplied inline
-// interpreter challenges.
+// Package server is the WaxSeal HTTP PO-token service: a bgutil-wire /get_pot
+// daemon backed by the real-browser minter (internal/browser + internal/minter).
+// One Chromium hosts N isolated browser contexts (one guest identity per tenant),
+// selected by per-tenant API keys; with no keys it is keyless single-tenant.
 package server
 
 import (
 	"context"
-	"crypto/sha256"
-	"crypto/subtle"
-	"encoding/hex"
-	"errors"
-	"io"
+	"encoding/json"
 	"log/slog"
-	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
-	waxseal "github.com/colespringer/waxseal"
+	"github.com/colespringer/waxseal/internal/browser"
+	"github.com/colespringer/waxseal/internal/minter"
 )
 
-// SecretHeader carries the optional shared secret. Requests must present it
-// (constant-time compared) when Options.SharedSecret is set; /ping is exempt so
-// container health checks need no credential.
-const SecretHeader = "X-WaxSeal-Secret"
-
-// maxRequestBody bounds an inbound /get_pot body. Challenges reference small
-// interpreter URLs; inline interpreter bodies are rejected anyway.
-const maxRequestBody = 2 << 20
-
-// Client is the subset of *waxseal.Client the server needs, named so handlers are
-// testable without standing up the real BotGuard VM.
-type Client interface {
-	Token(ctx context.Context, req waxseal.Request) (waxseal.Token, error)
-	VisitorData(ctx context.Context, egress waxseal.EgressSpec) (string, error)
-	PurgeTokens()
-	InvalidateMinters()
-	MinterKeys() []string
-	WriteMetrics(w io.Writer) error
+// Config configures a Server. The zero value is usable: keyless, loopback, a
+// stable landing video, headless.
+type Config struct {
+	Addr       string            // listen address (default 127.0.0.1:4416)
+	Video      string            // landing video for each tenant session (default a stable id)
+	Headful    bool              // run headful (needs a display/Xvfb)
+	TenantKeys map[string]string // api key -> tenant label; nil = keyless single tenant
+	Logger     *slog.Logger      // nil discards
 }
 
-// Options configures a Server.
-type Options struct {
-	Host                       string             // bind address (loopback default)
-	Port                       int                // default 4416
-	SharedSecret               string             // optional; when set, required on every endpoint but /ping
-	AllowRequestEgressOverride bool               // honor per-request proxy/source_address/disable_tls_verification
-	DefaultEgress              waxseal.EgressSpec // baseline egress (server's configured proxy/source)
-	Version                    string             // reported by /ping
-	Logger                     *slog.Logger
-	now                        func() time.Time // test hook
-}
-
-// Server serves the bgutil-compatible API over a waxseal.Client.
+// Server is the running HTTP service over a real-browser minter.
 type Server struct {
-	client    Client
-	opts      Options
-	logger    *slog.Logger
-	startTime time.Time
-	now       func() time.Time
+	tenants *minter.Tenants
+	log     *slog.Logger
+	srv     *http.Server
 }
 
-// New builds a Server. host/port default to loopback:4416 when unset.
-func New(client Client, opts Options) *Server {
-	if opts.Host == "" {
-		opts.Host = "127.0.0.1"
+// New launches the shared Chromium and builds the service. It does not attest
+// until Warm or the first request. Shutdown tears the browser down.
+func New(cfg Config) (*Server, error) {
+	log := cfg.Logger
+	if log == nil {
+		log = slog.New(slog.DiscardHandler)
 	}
-	if opts.Port == 0 {
-		opts.Port = 4416
+	if cfg.Addr == "" {
+		cfg.Addr = "127.0.0.1:4416"
 	}
-	if opts.Version == "" {
-		opts.Version = "dev"
+	if cfg.Video == "" {
+		cfg.Video = browser.DefaultVideo
 	}
-	if opts.Logger == nil {
-		opts.Logger = slog.New(slog.DiscardHandler)
+	opts := browser.Options{
+		Headful:     cfg.Headful,
+		NormalizeUA: !cfg.Headful, // headless: rewrite HeadlessChrome -> Chrome
+		Logger:      log,
 	}
-	if opts.now == nil {
-		opts.now = time.Now
+	pool, err := browser.LaunchPool(opts)
+	if err != nil {
+		return nil, err
 	}
-	return &Server{client: client, opts: opts, logger: opts.Logger, startTime: opts.now(), now: opts.now}
-}
-
-// Addr is the host:port the server binds.
-func (s *Server) Addr() string {
-	return net.JoinHostPort(s.opts.Host, strconv.Itoa(s.opts.Port))
-}
-
-// Handler builds the routed, middleware-wrapped handler (exported for tests).
-func (s *Server) Handler() http.Handler {
+	s := &Server{
+		tenants: minter.NewTenants(pool, cfg.Video, cfg.TenantKeys, opts),
+		log:     log,
+	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /get_pot", s.handleGetPot)
-	mux.HandleFunc("GET /ping", s.handlePing)
-	mux.HandleFunc("POST /invalidate_caches", s.handleInvalidateCaches)
-	mux.HandleFunc("POST /invalidate_it", s.handleInvalidateIT)
-	mux.HandleFunc("GET /minter_cache", s.handleMinterCache)
-	mux.HandleFunc("GET /metrics", s.handleMetrics)
-	return s.logging(s.auth(mux))
+	mux.HandleFunc("/get_pot", s.handleGetPot)
+	mux.HandleFunc("/ping", s.handlePing)
+	mux.HandleFunc("/session", s.handleSession)
+	mux.HandleFunc("/metrics", s.handleMetrics)
+	s.srv = &http.Server{Addr: cfg.Addr, Handler: mux}
+	return s, nil
 }
 
-// ListenAndServe binds and serves until ctx is cancelled, then drains in-flight
-// requests within a bounded grace period (graceful shutdown).
-func (s *Server) ListenAndServe(ctx context.Context) error {
-	hs := &http.Server{
-		Addr:              s.Addr(),
-		Handler:           s.Handler(),
-		ReadHeaderTimeout: 10 * time.Second,
-	}
-	errc := make(chan error, 1)
-	go func() { errc <- hs.ListenAndServe() }()
-	s.logger.Info("waxseal server listening",
-		"addr", s.Addr(), "auth", s.opts.SharedSecret != "", "egress_override", s.opts.AllowRequestEgressOverride)
-
-	select {
-	case <-ctx.Done():
-		shutCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		s.logger.Info("waxseal server shutting down")
-		return hs.Shutdown(shutCtx)
-	case err := <-errc:
-		if errors.Is(err, http.ErrServerClosed) {
-			return nil
-		}
-		return err
-	}
+// Warm attests the tenant the API key selects (pass "" for keyless), so startup
+// fails loudly if the browser/IP can't attest.
+func (s *Server) Warm(ctx context.Context, apiKey string) error {
+	return s.tenants.WarmOne(ctx, apiKey)
 }
 
-// auth enforces the shared secret on all endpoints except /ping. With no secret
-// configured it is a pass-through (the server is loopback by default).
-func (s *Server) auth(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.opts.SharedSecret != "" && r.URL.Path != "/ping" {
-			got := r.Header.Get(SecretHeader)
-			if subtle.ConstantTimeCompare([]byte(got), []byte(s.opts.SharedSecret)) != 1 {
-				writeError(w, http.StatusUnauthorized, "missing or invalid "+SecretHeader)
-				return
-			}
-		}
-		next.ServeHTTP(w, r)
+// Addr is the configured listen address.
+func (s *Server) Addr() string { return s.srv.Addr }
+
+// ListenAndServe runs the HTTP server until Shutdown.
+func (s *Server) ListenAndServe() error { return s.srv.ListenAndServe() }
+
+// Shutdown drains in-flight requests, then tears down the browser.
+func (s *Server) Shutdown(ctx context.Context) error {
+	err := s.srv.Shutdown(ctx)
+	s.tenants.Close()
+	return err
+}
+
+// apiKey extracts the tenant key from the header (preferred) or a query param.
+func apiKey(r *http.Request) string {
+	if k := r.Header.Get("X-API-Key"); k != "" {
+		return k
+	}
+	if a := r.Header.Get("Authorization"); strings.HasPrefix(a, "Bearer ") {
+		return strings.TrimSpace(strings.TrimPrefix(a, "Bearer "))
+	}
+	return r.URL.Query().Get("key")
+}
+
+// tenant resolves the request's Minter, writing 401 and returning ok=false on an
+// unknown key.
+func (s *Server) tenant(w http.ResponseWriter, r *http.Request) (*minter.Minter, string, bool) {
+	m, label, err := s.tenants.Minter(apiKey(r))
+	if err != nil {
+		writeErr(w, http.StatusUnauthorized, "invalid or missing API key")
+		return nil, "", false
+	}
+	return m, label, true
+}
+
+func (s *Server) handleGetPot(w http.ResponseWriter, r *http.Request) {
+	m, label, ok := s.tenant(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		ContentBinding string `json:"content_binding"`
+		Scope          string `json:"scope"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		writeErr(w, http.StatusUnprocessableEntity, "invalid JSON: "+err.Error())
+		return
+	}
+	if req.ContentBinding == "" {
+		writeErr(w, http.StatusBadRequest, "content_binding is required (the video_id for player, or the visitor_data for gvs)")
+		return
+	}
+	scope := req.Scope
+	if scope == "" {
+		scope = "pot" // the binding distinguishes player (video_id) vs gvs (visitor_data)
+	}
+	res, cached, err := m.Mint(r.Context(), scope, req.ContentBinding)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, "mint failed: "+err.Error())
+		return
+	}
+	// Use the token's real expiry (fixed at attest time, preserved through the
+	// cache) rather than now+lifetime; otherwise a cache hit overstates expiry by
+	// the token's age.
+	expires := res.ExpiresAt
+	if expires.IsZero() {
+		expires = time.Now().Add(6 * time.Hour)
+	}
+	if cached {
+		w.Header().Set("X-POT-Cache", "hit")
+	} else {
+		w.Header().Set("X-POT-Cache", "miss")
+	}
+	s.log.Info("minted", "tenant", label, "binding_len", len(req.ContentBinding), "scope", scope, "kind", res.Kind, "token_len", res.TokenLen, "cached", cached)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"poToken":        res.Token,
+		"contentBinding": req.ContentBinding,
+		"expiresAt":      expires.UTC().Format(time.RFC3339),
 	})
 }
 
-// logging records each request with a redacted summary (no tokens; binding and
-// proxy are hashed). It captures the status via a small ResponseWriter wrapper.
-func (s *Server) logging(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := s.now()
-		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
-		next.ServeHTTP(sw, r)
-		s.logger.Info("request",
-			"method", r.Method, "path", r.URL.Path,
-			"status", sw.status, "duration_ms", s.now().Sub(start).Milliseconds())
+func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
+	m, label, ok := s.tenant(w, r)
+	if !ok {
+		return
+	}
+	id, err := m.Identity(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "tenant": label, "error": err.Error()})
+		return
+	}
+	kind, _ := m.AttestKind(r.Context())
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "tenant": label, "attest": kind, "identity": id})
+}
+
+// sessionCookie is one youtube.com cookie in a shape a consumer can rebuild an
+// http.Cookie / cookie jar from.
+type sessionCookie struct {
+	Name     string `json:"name"`
+	Value    string `json:"value"`
+	Domain   string `json:"domain"`
+	Path     string `json:"path"`
+	Secure   bool   `json:"secure"`
+	HTTPOnly bool   `json:"http_only"`
+}
+
+// handleSession hands out the tenant context's coherent {visitor_data, cookies}
+// pair so a consumer can adopt the browser-as-origin (the only way GVS reaches
+// STREAM_PROTECTION status 1). The session is anonymous (no Google login).
+func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
+	m, label, ok := s.tenant(w, r)
+	if !ok {
+		return
+	}
+	id, err := m.Identity(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusServiceUnavailable, "no session: "+err.Error())
+		return
+	}
+	raw, err := m.Cookies(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusServiceUnavailable, "no cookies: "+err.Error())
+		return
+	}
+	cookies := make([]sessionCookie, 0, len(raw))
+	pairs := make([]string, 0, len(raw))
+	for _, c := range raw {
+		cookies = append(cookies, sessionCookie{
+			Name: c.Name, Value: c.Value, Domain: c.Domain, Path: c.Path,
+			Secure: c.Secure, HTTPOnly: c.HttpOnly,
+		})
+		pairs = append(pairs, c.Name+"="+c.Value)
+	}
+	s.log.Info("session handed out", "tenant", label, "visitor_data_len", len(id.VisitorData), "cookies", len(cookies))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"visitor_data":   id.VisitorData,
+		"user_agent":     id.UserAgent,
+		"client_version": id.ClientVersion,
+		"cookies":        cookies,
+		"cookie_header":  strings.Join(pairs, "; "),
 	})
 }
 
-// statusWriter remembers the response status for access logging.
-type statusWriter struct {
-	http.ResponseWriter
-	status      int
-	wroteHeader bool
+// handleMetrics is unauthenticated ops data: per-tenant counters + state, no
+// tokens/cookies/keys.
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.tenants.MetricsSnapshot())
 }
 
-func (w *statusWriter) WriteHeader(code int) {
-	if !w.wroteHeader {
-		w.status = code
-		w.wroteHeader = true
-	}
-	w.ResponseWriter.WriteHeader(code)
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
 }
 
-// redact returns a short, non-reversible tag for a sensitive value (binding,
-// proxy) so logs are useful without leaking visitor_data/proxy credentials.
-func redact(s string) string {
+func writeErr(w http.ResponseWriter, status int, msg string) {
+	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+// ParseTenantKeys parses "label1=key1,label2=key2" (or bare "key") into a
+// key->label map. Empty input is keyless single-tenant mode.
+func ParseTenantKeys(s string) map[string]string {
+	s = strings.TrimSpace(s)
 	if s == "" {
-		return ""
+		return nil
 	}
-	h := sha256.Sum256([]byte(s))
-	return "sha256:" + hex.EncodeToString(h[:])[:12]
+	out := map[string]string{}
+	for i, pair := range strings.Split(s, ",") {
+		if pair = strings.TrimSpace(pair); pair == "" {
+			continue
+		}
+		before, after, found := strings.Cut(pair, "=")
+		key, label := strings.TrimSpace(before), ""
+		if found {
+			label, key = strings.TrimSpace(before), strings.TrimSpace(after)
+		} else {
+			label = "t" + strconv.Itoa(i+1) // don't echo the key as a label
+		}
+		if key != "" {
+			out[key] = label
+		}
+	}
+	return out
 }

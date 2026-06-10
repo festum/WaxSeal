@@ -1,0 +1,13 @@
+# Keep the build context small: only Go source + the committed bundle are needed.
+.git
+.github
+.toolchains
+dist
+docs
+provider
+build/js/node_modules
+**/*_test.go
+*.md
+compose*.yaml
+Dockerfile
+.dockerignore

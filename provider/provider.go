@@ -1,14 +1,12 @@
-// Package provider adapts a *waxseal.Client to WaxTap's potoken.Provider so
-// WaxTap can mint PO tokens on demand, including re-minting after a 403 hint.
-// It is a separate Go module so the WaxSeal core, server, and CLI stay free of
-// the WaxTap dependency. Only code that wires the two together imports this
-// package and, transitively, WaxTap.
+// Package provider adapts a WaxSeal client (waxseal/client) to WaxTap's
+// potoken.Provider, so an application embedding the WaxTap library mints PO
+// tokens from a WaxSeal daemon.
 //
-// It maps ScopeGVS (googlevideo stream URLs) to a WaxSeal session token bound to
-// the WaxTap-supplied visitor_data, and ScopePlayer (the /player request body,
-// since WaxTap v1.1.0 injects serviceIntegrityDimensions.poToken) to a content
-// token bound to the video_id. ScopeSubtitles returns a typed
-// ErrUnsupportedScope because WaxSeal does not currently serve subtitle tokens.
+// This is the only WaxTap-coupled piece, kept in a separate Go module so the
+// WaxSeal core/server/CLI stay WaxTap-free. The HTTP work is generic and lives in
+// waxseal/client; any application can use that client directly, or write its own
+// adapter for a different PO-token contract. This package is just the scope
+// mapping for WaxTap's interface.
 package provider
 
 import (
@@ -16,71 +14,53 @@ import (
 	"errors"
 	"fmt"
 
-	waxseal "github.com/colespringer/waxseal"
+	"github.com/colespringer/waxseal/client"
 	"github.com/colespringer/waxtap/potoken"
 )
 
-// ErrUnsupportedScope is returned for scopes WaxSeal cannot serve through the
-// WaxTap stream resolver (everything but ScopeGVS today). It is typed so callers
-// can branch on it rather than treating it as a mint failure.
+// ErrUnsupportedScope is returned for scopes WaxSeal does not serve (currently
+// only ScopeSubtitles). Typed so callers can branch on it.
 var ErrUnsupportedScope = errors.New("waxseal/provider: unsupported PO-token scope")
 
-// tokenProvider is the slice of *waxseal.Client this adapter needs, named so the
-// scope mapping is unit-testable without standing up the real VM.
-type tokenProvider interface {
-	Token(ctx context.Context, req waxseal.Request) (waxseal.Token, error)
-}
-
-// Provider implements potoken.Provider over a WaxSeal client.
+// Provider adapts a *client.Client to potoken.Provider.
 type Provider struct {
-	client tokenProvider
+	c *client.Client
 }
 
 var _ potoken.Provider = (*Provider)(nil)
 
-// New returns a potoken.Provider backed by c. WaxBin hands the same *http.Client
-// (egress and cookie jar) to WaxTap and to the waxseal.Client behind c, so
-// tokens mint from the identity used to download.
-func New(c *waxseal.Client) *Provider {
-	return &Provider{client: c}
-}
+// New wraps a WaxSeal client as a WaxTap potoken.Provider. Configure auth/HTTP on
+// the client (client.WithAPIKey, client.WithHTTPClient).
+func New(c *client.Client) *Provider { return &Provider{c: c} }
 
-// ProvidePOToken mints (or serves from cache) a token for req, minted with the
-// exact UA WaxTap will send for this scope (req.UserAgent); a 403 hint
-// (req.Failure) forces a cache-bypassing re-mint. ScopeGVS binds to the
-// authoritative req.VisitorData (stream URL); ScopePlayer binds to req.VideoID
-// (/player body). ScopeNone is a no-op; ScopeSubtitles returns ErrUnsupportedScope.
+// ProvidePOToken maps the WaxTap scope to a content_binding and mints via the
+// client. ScopeGVS binds visitor_data, ScopePlayer binds video_id; ScopeNone is a
+// no-op; ScopeSubtitles returns ErrUnsupportedScope.
 func (p *Provider) ProvidePOToken(ctx context.Context, req potoken.Request) (potoken.Response, error) {
-	wreq := waxseal.Request{
-		ClientName:    req.ClientName,
-		ClientVersion: req.ClientVersion,
-		UserAgent:     req.UserAgent, // profile and GVS/player UA from one value
-		BypassCache:   req.Failure != nil,
-	}
+	var binding, scope string
 	switch req.Scope {
 	case potoken.ScopeNone:
 		return potoken.Response{}, nil
 	case potoken.ScopeGVS:
-		// GVS stream URLs bind to the session (visitor_data).
-		wreq.Scope = waxseal.ScopeSession
-		wreq.VisitorData = req.VisitorData
+		binding, scope = req.VisitorData, "gvs"
 	case potoken.ScopePlayer:
-		// Bind the token to video_id and attest under WaxTap's visitor_data.
-		wreq.Scope = waxseal.ScopeContent
-		wreq.VideoID = req.VideoID
-		wreq.VisitorData = req.VisitorData
+		binding, scope = req.VideoID, "player"
 	default: // ScopeSubtitles or unknown
 		return potoken.Response{}, fmt.Errorf("%w: %s", ErrUnsupportedScope, req.Scope)
 	}
-
-	tok, err := p.client.Token(ctx, wreq)
+	tok, err := p.c.POToken(ctx, binding, scope)
 	if err != nil {
 		return potoken.Response{}, err
 	}
-	return potoken.Response{
-		Token:     tok.Value,
-		Headers:   tok.Headers,
-		Query:     tok.Query,
-		ExpiresAt: tok.ExpiresAt,
-	}, nil
+	return potoken.Response{Token: tok.Value, ExpiresAt: tok.ExpiresAt}, nil
+}
+
+// Session fetches WaxSeal's coherent guest session as a *potoken.Session, ready
+// for WaxTap's Options.Session.
+func (p *Provider) Session(ctx context.Context) (*potoken.Session, error) {
+	s, err := p.c.Session(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &potoken.Session{VisitorData: s.VisitorData, Cookies: s.Cookies}, nil
 }
