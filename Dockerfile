@@ -5,7 +5,7 @@
 # run time (compose.yaml: cap_drop, no-new-privileges). That container boundary is
 # the isolation, since headless Chromium runs with --no-sandbox inside it.
 
-# --- build stage -----------------------------------------------------------
+# build
 FROM golang:1.26-bookworm AS build
 WORKDIR /src
 COPY go.mod go.sum ./
@@ -19,7 +19,7 @@ ARG VERSION=docker
 RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
     -o /out/waxseal ./cmd/waxseal
 
-# --- runtime stage ---------------------------------------------------------
+# runtime
 FROM debian:bookworm-slim
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
