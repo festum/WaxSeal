@@ -15,14 +15,6 @@ its HTTP API is consumed by applications that embed the
 > `WAXSEAL_CHROME_BIN`). The Go binary cross-compiles normally, but it drives an
 > external browser, so it is not a self-contained static binary.
 
-> **Status.** It mints integrity tokens reliably (headless, no Xvfb). The daemon
-> exposes `/get_pot`, `/player-context` (the status-1 streaming context),
-> `/session` (the coherent visitor_data + cookies handoff), `/ping`, and
-> `/metrics`, is **multi-tenant** (per-tenant API keys → isolated browser
-> contexts), and wraps a reliability layer (single-flight attestation, a
-> generation-keyed token cache, a mint escalation ladder, crash recovery).
-> End-to-end verified with WaxTap v1.5.0 streaming WEB Opus audio.
-
 ## Layout
 
 ```
