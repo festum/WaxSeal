@@ -1,6 +1,7 @@
 package browser
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 )
@@ -29,5 +30,35 @@ func TestWithDefaults(t *testing.T) {
 func TestDefaultVideoSet(t *testing.T) {
 	if DefaultVideo == "" {
 		t.Error("DefaultVideo must be a non-empty (non-copyrighted) video id")
+	}
+}
+
+// TestAudioFormatTagDrift keeps the extracted JSON fields in sync with AudioFormat.
+func TestAudioFormatTagDrift(t *testing.T) {
+	const payload = `{"itag":251,"lmt":"171","is_drc":true,"audio_track_id":"en.4"}`
+	var f AudioFormat
+	if err := json.Unmarshal([]byte(payload), &f); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !f.IsDrc {
+		t.Error("is_drc did not decode into IsDrc")
+	}
+	if f.AudioTrackID != "en.4" {
+		t.Errorf("audio_track_id = %q, want en.4", f.AudioTrackID)
+	}
+}
+
+func TestFullLengthProbeModel(t *testing.T) {
+	outcomes := map[string]bool{
+		OutcomeFullLength:        true,
+		OutcomeTargetNotBuffered: true,
+		OutcomeNotEstablished:    true,
+		OutcomeVideoTooShort:     true,
+	}
+	if len(outcomes) != 4 {
+		t.Fatalf("outcome constants are not all distinct: %v", outcomes)
+	}
+	if OutcomeFullLength != "full-length" {
+		t.Errorf("OutcomeFullLength = %q, want full-length", OutcomeFullLength)
 	}
 }

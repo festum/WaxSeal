@@ -69,8 +69,8 @@ func TestGetChallengeWiresResolution(t *testing.T) {
 	defer swap(&attGetURL, srv.URL)()
 
 	_, err := GetChallenge(context.Background(), httpx.New(srv.Client()), "UA/1.0", nil)
-	var se *botguard.StageError
-	if !errors.As(err, &se) || se.Stage != botguard.StageInterp {
+	se, ok := errors.AsType[*botguard.StageError](err)
+	if !ok || se.Stage != botguard.StageInterp {
 		t.Fatalf("want StageInterp error, got %v", err)
 	}
 	if _, ok := gotBody["engagementType"]; !ok {
@@ -89,8 +89,8 @@ func TestGetChallengeBadJSON(t *testing.T) {
 	defer swap(&attGetURL, srv.URL)()
 
 	_, err := GetChallenge(context.Background(), httpx.New(srv.Client()), "UA/1.0", nil)
-	var se *botguard.StageError
-	if !errors.As(err, &se) || se.Stage != botguard.StageParse {
+	se, ok := errors.AsType[*botguard.StageError](err)
+	if !ok || se.Stage != botguard.StageParse {
 		t.Fatalf("want StageParse error, got %v", err)
 	}
 }
@@ -153,8 +153,8 @@ func TestGenerateVisitorDataMissing(t *testing.T) {
 	defer swap(&browseURL, srv.URL)()
 
 	_, err := GenerateVisitorData(context.Background(), httpx.New(srv.Client()), "UA/1.0")
-	var se *botguard.StageError
-	if !errors.As(err, &se) || se.Stage != botguard.StageParse {
+	se, ok := errors.AsType[*botguard.StageError](err)
+	if !ok || se.Stage != botguard.StageParse {
 		t.Fatalf("want StageParse error, got %v", err)
 	}
 }

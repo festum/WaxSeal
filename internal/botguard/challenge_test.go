@@ -167,8 +167,8 @@ func TestHostAllowlist(t *testing.T) {
 func TestStageErrorUnwrap(t *testing.T) {
 	base := errors.New("boom")
 	err := stageErr(StageDescramble, "%w", base)
-	var se *StageError
-	if !errors.As(err, &se) || se.Stage != StageDescramble {
+	se, ok := errors.AsType[*StageError](err)
+	if !ok || se.Stage != StageDescramble {
 		t.Fatalf("stage not preserved: %v", err)
 	}
 	if !errors.Is(err, base) {

@@ -37,12 +37,9 @@ type Server struct {
 	srv     *http.Server
 }
 
-// requestProcessTimeout bounds how long a single /get_pot or /player-context request
-// can hold the per-tenant page mutex. A legit cold ladder (two ~25s polls + an
-// ~80-95s relaunch+re-attest + a 25s poll ≈ 165s) must fit under it, so it is
-// generous; it only guarantees no single hung request pins the mutex indefinitely.
-// The negative cache + the no-escalate-on-terminal/cancel guards (not this value) are
-// what stop a caller from repeatedly holding it.
+// requestProcessTimeout bounds how long one request can hold the per-tenant page
+// mutex. It allows the full cold-start retry sequence while preventing a hung
+// request from holding the mutex indefinitely.
 const requestProcessTimeout = 3 * time.Minute
 
 // New launches the shared Chromium and builds the service. It does not attest
@@ -116,7 +113,7 @@ func apiKey(r *http.Request) string {
 func (s *Server) tenant(w http.ResponseWriter, r *http.Request) (*minter.Minter, string, bool) {
 	m, label, err := s.tenants.Minter(apiKey(r))
 	if err != nil {
-		writeErr(w, http.StatusUnauthorized, "invalid or missing API key")
+		writeErr(w, http.StatusUnauthorized, CodeUnauthorized, "invalid or missing API key")
 		return nil, "", false
 	}
 	return m, label, true
@@ -132,11 +129,11 @@ func (s *Server) handleGetPot(w http.ResponseWriter, r *http.Request) {
 		Scope          string `json:"scope"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
-		writeErr(w, http.StatusUnprocessableEntity, "invalid JSON: "+err.Error())
+		writeErr(w, http.StatusBadRequest, CodeInvalidRequest, "invalid JSON: "+err.Error())
 		return
 	}
 	if req.ContentBinding == "" {
-		writeErr(w, http.StatusBadRequest, "content_binding is required (the video_id for player, or the visitor_data for gvs)")
+		writeErr(w, http.StatusBadRequest, CodeInvalidRequest, "content_binding is required (the video_id for player, or the visitor_data for gvs)")
 		return
 	}
 	scope := req.Scope
@@ -147,7 +144,7 @@ func (s *Server) handleGetPot(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	res, cached, err := m.Mint(ctx, scope, req.ContentBinding)
 	if err != nil {
-		writeErr(w, http.StatusBadGateway, "mint failed: "+err.Error())
+		writeErr(w, http.StatusBadGateway, CodeMintFailed, "mint failed: "+err.Error())
 		return
 	}
 	// Use the token's real expiry (fixed at attest time, preserved through the
@@ -195,11 +192,17 @@ func (s *Server) handlePlayerContext(w http.ResponseWriter, r *http.Request) {
 		// broken one (502).
 		switch {
 		case errors.Is(err, browser.ErrUnplayable):
-			writeErr(w, http.StatusUnprocessableEntity, err.Error())
+			// Preserve the playabilityStatus so clients do not need to parse the
+			// human-readable error.
+			status := ""
+			if ue, ok := errors.AsType[*browser.UnplayableError](err); ok {
+				status = ue.Status
+			}
+			writeErrDetails(w, http.StatusUnprocessableEntity, CodeVideoUnavailable, err.Error(), status)
 		case errors.Is(err, context.DeadlineExceeded):
-			writeErr(w, http.StatusGatewayTimeout, "player-context timed out")
+			writeErr(w, http.StatusGatewayTimeout, CodeTimeout, "player-context timed out")
 		default:
-			writeErr(w, http.StatusBadGateway, "player-context failed: "+err.Error())
+			writeErr(w, http.StatusBadGateway, CodePlayerContextFailed, "player-context failed: "+err.Error())
 		}
 		return
 	}
@@ -223,18 +226,18 @@ func playerContextVideoID(w http.ResponseWriter, r *http.Request) (string, bool)
 		VideoID string `json:"video_id"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
-		writeErr(w, http.StatusUnprocessableEntity, "invalid JSON: "+err.Error())
+		writeErr(w, http.StatusBadRequest, CodeInvalidRequest, "invalid JSON: "+err.Error())
 		return "", false
 	}
 	if req.VideoID == "" {
 		req.VideoID = r.URL.Query().Get("video_id")
 	}
 	if req.VideoID == "" {
-		writeErr(w, http.StatusBadRequest, "video_id is required")
+		writeErr(w, http.StatusBadRequest, CodeInvalidRequest, "video_id is required")
 		return "", false
 	}
 	if !videoIDPattern.MatchString(req.VideoID) {
-		writeErr(w, http.StatusBadRequest, "video_id must be 1-64 chars of [A-Za-z0-9_-]")
+		writeErr(w, http.StatusBadRequest, CodeInvalidRequest, "video_id must be 1-64 chars of [A-Za-z0-9_-]")
 		return "", false
 	}
 	return req.VideoID, true
@@ -278,12 +281,12 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	}
 	id, err := m.Identity(r.Context())
 	if err != nil {
-		writeErr(w, http.StatusServiceUnavailable, "no session: "+err.Error())
+		writeErr(w, http.StatusServiceUnavailable, CodeNoSession, "no session: "+err.Error())
 		return
 	}
 	raw, err := m.Cookies(r.Context())
 	if err != nil {
-		writeErr(w, http.StatusServiceUnavailable, "no cookies: "+err.Error())
+		writeErr(w, http.StatusServiceUnavailable, CodeNoSession, "no cookies: "+err.Error())
 		return
 	}
 	cookies := make([]sessionCookie, 0, len(raw))
@@ -317,8 +320,36 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-func writeErr(w http.ResponseWriter, status int, msg string) {
-	writeJSON(w, status, map[string]string{"error": msg})
+const (
+	// CodeUnauthorized indicates a missing or invalid API key.
+	CodeUnauthorized = "unauthorized"
+	// CodeInvalidRequest indicates malformed input or a missing required field.
+	CodeInvalidRequest = "invalid-request"
+	// CodeMintFailed indicates that the daemon could not mint a token.
+	CodeMintFailed = "mint-failed"
+	// CodeVideoUnavailable indicates a terminal playabilityStatus.
+	CodeVideoUnavailable = "video-unavailable"
+	// CodeTimeout indicates that the player-context deadline elapsed.
+	CodeTimeout = "timeout"
+	// CodePlayerContextFailed indicates a non-terminal player-context failure.
+	CodePlayerContextFailed = "player-context-failed"
+	// CodeNoSession indicates that no attested session or cookies are available.
+	CodeNoSession = "no-session"
+)
+
+// errEnvelope is the JSON error response shared by the API endpoints.
+type errEnvelope struct {
+	Error   string `json:"error"`
+	Code    string `json:"code"`
+	Details string `json:"details,omitempty"`
+}
+
+func writeErr(w http.ResponseWriter, status int, code, msg string) {
+	writeJSON(w, status, errEnvelope{Error: msg, Code: code})
+}
+
+func writeErrDetails(w http.ResponseWriter, status int, code, msg, details string) {
+	writeJSON(w, status, errEnvelope{Error: msg, Code: code, Details: details})
 }
 
 // ParseTenantKeys parses "label1=key1,label2=key2" (or bare "key") into a

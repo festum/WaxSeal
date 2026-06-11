@@ -40,16 +40,12 @@ type Session struct {
 	Cookies       []*http.Cookie
 }
 
-// PlayerContext is WaxSeal's status-1 streaming context for one video: the SABR url
-// (carrying a SCRAMBLED throttling nonce the consumer descrambles with PlayerURL),
-// the ustreamer config, the visitor_data a GVS token binds to, the client version,
-// and the audio formats. WaxSeal mints it; descrambling the url's n and running the
-// SABR stream are the consumer's job.
+// PlayerContext contains the status-1 streaming context for one video. The SABR
+// URL includes a throttling nonce that the consumer must descramble with
+// PlayerURL before starting the stream.
 //
-// It re-declares browser.PlayerContext rather than importing it so the client stays
-// dependency-light: a consumer of waxseal/client should not pull in rod/Chromium.
-// Both sides are the same /player-context JSON contract, so the tags MUST stay in
-// sync, or decoding drifts silently.
+// This type mirrors browser.PlayerContext without importing the browser package
+// and its Chromium dependencies. Keep the JSON tags in sync.
 type PlayerContext struct {
 	Status                       string        `json:"status"`
 	PlayerURL                    string        `json:"player_url"`
@@ -77,6 +73,8 @@ type AudioFormat struct {
 	AudioSampleRate  int    `json:"audio_sample_rate"`
 	AudioChannels    int    `json:"audio_channels"`
 	AudioQuality     string `json:"audio_quality"`
+	IsDrc            bool   `json:"is_drc"`         // whether the rendition uses dynamic range compression
+	AudioTrackID     string `json:"audio_track_id"` // audioTrack.id; empty for the default or only track
 }
 
 // Option configures a Client.
@@ -216,7 +214,66 @@ func (c *Client) auth(req *http.Request) {
 	}
 }
 
+const (
+	// CodeUnauthorized indicates a missing or invalid API key.
+	CodeUnauthorized = "unauthorized"
+	// CodeInvalidRequest indicates malformed input or a missing required field.
+	CodeInvalidRequest = "invalid-request"
+	// CodeMintFailed indicates that the daemon could not mint a token.
+	CodeMintFailed = "mint-failed"
+	// CodeVideoUnavailable indicates a terminal playabilityStatus.
+	CodeVideoUnavailable = "video-unavailable"
+	// CodeTimeout indicates that the player-context deadline elapsed.
+	CodeTimeout = "timeout"
+	// CodePlayerContextFailed indicates a non-terminal player-context failure.
+	CodePlayerContextFailed = "player-context-failed"
+	// CodeNoSession indicates that no attested session or cookies are available.
+	CodeNoSession = "no-session"
+)
+
+// APIError describes a non-2xx response from the WaxSeal daemon. Callers can
+// extract it with errors.AsType[*APIError] and inspect Code instead of matching
+// Message.
+//
+// Code is empty for responses from older servers and for non-JSON proxy
+// responses. Message contains the raw body when the response is not a recognized
+// error envelope. StatusCode and Path are always set.
+type APIError struct {
+	Path       string // request path, such as "/player-context"
+	StatusCode int    // HTTP status code
+	Code       string // stable machine-readable code, when present
+	Message    string // error message or unrecognized raw response body
+	Details    string // optional machine-readable context
+}
+
+func (e *APIError) Error() string {
+	msg := e.Message
+	if msg == "" {
+		msg = "(no body)"
+	}
+	if e.Code != "" {
+		return fmt.Sprintf("waxseal/client: %s %d (%s): %s", e.Path, e.StatusCode, e.Code, msg)
+	}
+	return fmt.Sprintf("waxseal/client: %s %d: %s", e.Path, e.StatusCode, msg)
+}
+
 func (c *Client) statusErr(path string, resp *http.Response) error {
 	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<12))
-	return fmt.Errorf("waxseal/client: %s %s: %s", path, resp.Status, bytes.TrimSpace(b))
+	body := bytes.TrimSpace(b)
+	apiErr := &APIError{Path: path, StatusCode: resp.StatusCode}
+	if len(body) == 0 {
+		return apiErr
+	}
+	var env struct {
+		Error   string `json:"error"`
+		Code    string `json:"code"`
+		Details string `json:"details"`
+	}
+	if err := json.Unmarshal(body, &env); err == nil && (env.Error != "" || env.Code != "") {
+		apiErr.Message, apiErr.Code, apiErr.Details = env.Error, env.Code, env.Details
+		return apiErr
+	}
+	// Preserve proxy errors and other unrecognized bodies for diagnostics.
+	apiErr.Message = string(body)
+	return apiErr
 }

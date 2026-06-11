@@ -13,6 +13,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/colespringer/waxseal/client"
 	"github.com/colespringer/waxtap/potoken"
@@ -27,7 +28,10 @@ type Provider struct {
 	c *client.Client
 }
 
-var _ potoken.Provider = (*Provider)(nil)
+var (
+	_ potoken.Provider              = (*Provider)(nil)
+	_ potoken.PlayerContextProvider = (*Provider)(nil)
+)
 
 // New wraps a WaxSeal client as a WaxTap potoken.Provider. Configure auth/HTTP on
 // the client (client.WithAPIKey, client.WithHTTPClient).
@@ -63,4 +67,50 @@ func (p *Provider) Session(ctx context.Context) (*potoken.Session, error) {
 		return nil, err
 	}
 	return &potoken.Session{VisitorData: s.VisitorData, Cookies: s.Cookies}, nil
+}
+
+// ProvidePlayerContext fetches videoID's attested WEB /player streaming context
+// and maps it to the context used by WaxTap's optional WEB SABR audio path. It
+// rejects incomplete contexts before SABR setup so WaxTap can use its normal
+// fallback path.
+func (p *Provider) ProvidePlayerContext(ctx context.Context, videoID string) (potoken.PlayerContext, error) {
+	pc, err := p.c.PlayerContext(ctx, videoID)
+	if err != nil {
+		return potoken.PlayerContext{}, err
+	}
+	if pc.Status != "" && !strings.EqualFold(pc.Status, "OK") {
+		return potoken.PlayerContext{}, fmt.Errorf("waxseal/provider: player-context returned status %q", pc.Status)
+	}
+	if pc.ServerAbrStreamingURL == "" || pc.PlayerURL == "" || pc.VisitorData == "" || pc.VideoPlaybackUstreamerConfig == "" || len(pc.AudioFormats) == 0 {
+		return potoken.PlayerContext{}, fmt.Errorf("waxseal/provider: player-context missing server_abr_streaming_url, player_url, visitor_data, video_playback_ustreamer_config, or audio_formats")
+	}
+
+	formats := make([]potoken.PlayerContextFormat, 0, len(pc.AudioFormats))
+	for _, f := range pc.AudioFormats {
+		formats = append(formats, potoken.PlayerContextFormat{
+			Itag:             f.Itag,
+			LMT:              f.LMT,
+			XTags:            f.XTags,
+			MimeType:         f.MimeType,
+			Bitrate:          f.Bitrate,
+			AudioQuality:     f.AudioQuality,
+			AudioChannels:    f.AudioChannels,
+			AudioSampleRate:  f.AudioSampleRate,
+			ContentLength:    f.ContentLength,
+			ApproxDurationMs: int64(f.ApproxDurationMs),
+			IsDrc:            f.IsDrc,
+			AudioTrackID:     f.AudioTrackID,
+		})
+	}
+	return potoken.PlayerContext{
+		ServerAbrURL:    pc.ServerAbrStreamingURL,
+		PlayerURL:       pc.PlayerURL,
+		UstreamerConfig: pc.VideoPlaybackUstreamerConfig,
+		VisitorData:     pc.VisitorData,
+		ClientVersion:   pc.ClientVersion,
+		Title:           pc.Title,
+		Author:          pc.Author,
+		LengthSeconds:   pc.LengthSeconds,
+		AudioFormats:    formats,
+	}, nil
 }

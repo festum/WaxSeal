@@ -1,0 +1,38 @@
+package server_test
+
+import (
+	"testing"
+
+	"github.com/colespringer/waxseal/client"
+	"github.com/colespringer/waxseal/server"
+)
+
+// TestErrorCodeContract pins the error-code wire values and guards the two
+// declarations against drift: the server emits these codes and client re-declares
+// them so consumers can branch on Code without importing the rod/Chromium-heavy
+// server. A rename in one place (or away from the documented string) must update
+// the other and the README table, so this test fails loudly instead of silently
+// breaking a consumer's `apiErr.Code == client.Code*` comparison.
+func TestErrorCodeContract(t *testing.T) {
+	codes := []struct {
+		name           string
+		server, client string
+		want           string
+	}{
+		{"unauthorized", server.CodeUnauthorized, client.CodeUnauthorized, "unauthorized"},
+		{"invalid-request", server.CodeInvalidRequest, client.CodeInvalidRequest, "invalid-request"},
+		{"mint-failed", server.CodeMintFailed, client.CodeMintFailed, "mint-failed"},
+		{"video-unavailable", server.CodeVideoUnavailable, client.CodeVideoUnavailable, "video-unavailable"},
+		{"timeout", server.CodeTimeout, client.CodeTimeout, "timeout"},
+		{"player-context-failed", server.CodePlayerContextFailed, client.CodePlayerContextFailed, "player-context-failed"},
+		{"no-session", server.CodeNoSession, client.CodeNoSession, "no-session"},
+	}
+	for _, c := range codes {
+		if c.server != c.want {
+			t.Errorf("server.Code %s = %q, want %q (update the README error-code table)", c.name, c.server, c.want)
+		}
+		if c.client != c.want {
+			t.Errorf("client.Code %s = %q, want %q (drifted from the server's wire value)", c.name, c.client, c.want)
+		}
+	}
+}

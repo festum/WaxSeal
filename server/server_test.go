@@ -1,11 +1,16 @@
 package server
 
 import (
+	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
+
+	"github.com/colespringer/waxseal/internal/browser"
+	"github.com/colespringer/waxseal/internal/minter"
 )
 
 func TestParseTenantKeys(t *testing.T) {
@@ -56,7 +61,7 @@ func TestPlayerContextVideoID(t *testing.T) {
 		{name: "body wins over query", body: `{"video_id":"BID"}`, query: "?video_id=QID", wantID: "BID", wantOK: true},
 		{name: "empty body no query", body: "", wantOK: false, wantCode: http.StatusBadRequest},
 		{name: "empty json no query", body: `{}`, wantOK: false, wantCode: http.StatusBadRequest},
-		{name: "malformed json", body: `{not json`, wantOK: false, wantCode: http.StatusUnprocessableEntity},
+		{name: "malformed json", body: `{not json`, wantOK: false, wantCode: http.StatusBadRequest},
 		{name: "bad charset in body", body: `{"video_id":"bad id/../x"}`, wantOK: false, wantCode: http.StatusBadRequest},
 		{name: "bad charset in query", query: "?video_id=" + url.QueryEscape("a b!"), wantOK: false, wantCode: http.StatusBadRequest},
 		{name: "over length", body: `{"video_id":"` + strings.Repeat("a", 65) + `"}`, wantOK: false, wantCode: http.StatusBadRequest},
@@ -77,8 +82,48 @@ func TestPlayerContextVideoID(t *testing.T) {
 				return
 			}
 			if w.Code != tt.wantCode {
-				t.Errorf("code = %d, want %d", w.Code, tt.wantCode)
+				t.Errorf("status = %d, want %d", w.Code, tt.wantCode)
+			}
+			var env struct {
+				Error string `json:"error"`
+				Code  string `json:"code"`
+			}
+			if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+				t.Fatalf("error body is not JSON: %v (%q)", err, w.Body.String())
+			}
+			if env.Code != CodeInvalidRequest {
+				t.Errorf("code = %q, want %q", env.Code, CodeInvalidRequest)
 			}
 		})
+	}
+}
+
+func TestTenantUnauthorizedCode(t *testing.T) {
+	s := &Server{
+		tenants: minter.NewTenants(nil, "", map[string]string{"GOODKEY": "alice"}, browser.Options{}),
+		log:     slog.New(slog.DiscardHandler),
+	}
+	r := httptest.NewRequest(http.MethodPost, "/get_pot", nil)
+	r.Header.Set("X-API-Key", "BADKEY")
+	w := httptest.NewRecorder()
+
+	if _, _, ok := s.tenant(w, r); ok {
+		t.Fatal("tenant() accepted an unknown key")
+	}
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusUnauthorized)
+	}
+	var env struct {
+		Error string `json:"error"`
+		Code  string `json:"code"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("error body is not JSON: %v (%q)", err, w.Body.String())
+	}
+	if env.Code != CodeUnauthorized {
+		t.Errorf("code = %q, want %q", env.Code, CodeUnauthorized)
+	}
+	if env.Error == "" {
+		t.Error("error message is empty")
 	}
 }

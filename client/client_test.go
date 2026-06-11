@@ -3,6 +3,7 @@ package client_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -133,5 +134,78 @@ func TestPlayerContextEmptyVideoIDAndHTTPError(t *testing.T) {
 	}
 	if _, err := c.PlayerContext(context.Background(), "VID"); err == nil {
 		t.Error("a non-200 from /player-context should error")
+	}
+}
+
+func TestAPIErrorShapes(t *testing.T) {
+	tests := []struct {
+		name        string
+		status      int
+		contentType string
+		body        string
+		wantCode    string
+		wantMsg     string
+		wantDetails string
+	}{
+		{"structured", http.StatusUnprocessableEntity, "application/json", `{"error":"video unplayable","code":"video-unavailable","details":"LOGIN_REQUIRED"}`, client.CodeVideoUnavailable, "video unplayable", "LOGIN_REQUIRED"},
+		{"old-server", http.StatusBadGateway, "application/json", `{"error":"mint failed: boom"}`, "", "mint failed: boom", ""},
+		{"non-json", http.StatusBadGateway, "text/plain", "bad gateway from a proxy", "", "bad gateway from a proxy", ""},
+		{"empty", http.StatusServiceUnavailable, "", "", "", "", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if tt.contentType != "" {
+					w.Header().Set("Content-Type", tt.contentType)
+				}
+				w.WriteHeader(tt.status)
+				if tt.body != "" {
+					_, _ = w.Write([]byte(tt.body))
+				}
+			}))
+			defer srv.Close()
+
+			_, err := client.New(srv.URL).PlayerContext(context.Background(), "VID")
+			apiErr, ok := errors.AsType[*client.APIError](err)
+			if !ok {
+				t.Fatalf("err = %v (%T), want *client.APIError", err, err)
+			}
+			if apiErr.Path != "/player-context" {
+				t.Errorf("Path = %q, want /player-context", apiErr.Path)
+			}
+			if apiErr.StatusCode != tt.status {
+				t.Errorf("StatusCode = %d, want %d", apiErr.StatusCode, tt.status)
+			}
+			if apiErr.Code != tt.wantCode {
+				t.Errorf("Code = %q, want %q", apiErr.Code, tt.wantCode)
+			}
+			if apiErr.Message != tt.wantMsg {
+				t.Errorf("Message = %q, want %q", apiErr.Message, tt.wantMsg)
+			}
+			if apiErr.Details != tt.wantDetails {
+				t.Errorf("Details = %q, want %q", apiErr.Details, tt.wantDetails)
+			}
+		})
+	}
+}
+
+// TestAudioFormatTagDrift protects fields required by WaxTap's SABR setup from
+// silent JSON tag changes.
+func TestAudioFormatTagDrift(t *testing.T) {
+	const payload = `{
+		"itag": 251, "lmt": "171", "xtags": "X", "mime_type": "audio/webm", "bitrate": 130000,
+		"content_length": 1234, "approx_duration_ms": 634000, "audio_sample_rate": 48000,
+		"audio_channels": 2, "audio_quality": "AUDIO_QUALITY_MEDIUM",
+		"is_drc": true, "audio_track_id": "en.4"
+	}`
+	var f client.AudioFormat
+	if err := json.Unmarshal([]byte(payload), &f); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !f.IsDrc {
+		t.Error("is_drc did not decode into IsDrc")
+	}
+	if f.AudioTrackID != "en.4" {
+		t.Errorf("audio_track_id = %q, want en.4", f.AudioTrackID)
 	}
 }

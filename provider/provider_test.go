@@ -59,6 +59,103 @@ func TestProvideNoneAndUnsupported(t *testing.T) {
 	}
 }
 
+func TestProvidePlayerContextMapping(t *testing.T) {
+	var gotVideoID string
+	p, done := newProvider(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			VideoID string `json:"video_id"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		gotVideoID = req.VideoID
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status":                          "OK",
+			"player_url":                      "https://www.youtube.com/s/player/abc/base.js",
+			"server_abr_streaming_url":        "https://r1.googlevideo.com/videoplayback?n=scram",
+			"video_playback_ustreamer_config": "USTREAMER",
+			"visitor_data":                    "VD",
+			"client_version":                  "2.0",
+			"title":                           "Big Buck Bunny",
+			"author":                          "Blender",
+			"length_seconds":                  634,
+			"audio_formats": []map[string]any{{
+				"itag": 251, "lmt": "171", "xtags": "X", "mime_type": "audio/webm", "bitrate": 130000,
+				"content_length": 1234, "approx_duration_ms": 634000, "audio_sample_rate": 48000,
+				"audio_channels": 2, "audio_quality": "AUDIO_QUALITY_MEDIUM",
+				"is_drc": true, "audio_track_id": "en.4",
+			}},
+		})
+	})
+	defer done()
+
+	pc, err := p.ProvidePlayerContext(context.Background(), "VID")
+	if err != nil {
+		t.Fatalf("ProvidePlayerContext: %v", err)
+	}
+	if gotVideoID != "VID" {
+		t.Errorf("video_id = %q, want VID", gotVideoID)
+	}
+	if pc.ServerAbrURL != "https://r1.googlevideo.com/videoplayback?n=scram" || pc.PlayerURL == "" ||
+		pc.UstreamerConfig != "USTREAMER" || pc.VisitorData != "VD" || pc.ClientVersion != "2.0" {
+		t.Fatalf("context = %+v", pc)
+	}
+	if pc.Title != "Big Buck Bunny" || pc.Author != "Blender" || pc.LengthSeconds != 634 {
+		t.Errorf("metadata: title=%q author=%q len=%d", pc.Title, pc.Author, pc.LengthSeconds)
+	}
+	if len(pc.AudioFormats) != 1 {
+		t.Fatalf("audio formats = %d, want 1", len(pc.AudioFormats))
+	}
+	f := pc.AudioFormats[0]
+	if f.Itag != 251 || f.LMT != "171" || f.XTags != "X" || f.MimeType != "audio/webm" || f.Bitrate != 130000 {
+		t.Errorf("format core = %+v", f)
+	}
+	if f.ContentLength != 1234 || f.ApproxDurationMs != 634000 || f.AudioSampleRate != 48000 ||
+		f.AudioChannels != 2 || f.AudioQuality != "AUDIO_QUALITY_MEDIUM" {
+		t.Errorf("format detail = %+v", f)
+	}
+	// These fields are required by SABR setup and must survive both mappings.
+	if !f.IsDrc || f.AudioTrackID != "en.4" {
+		t.Errorf("DRC/track fields dropped: is_drc=%v audio_track_id=%q", f.IsDrc, f.AudioTrackID)
+	}
+}
+
+// TestProvidePlayerContextRejects starts from an otherwise-complete context so each
+// mutation is the sole reason the provider's stricter SABR validation rejects it.
+func TestProvidePlayerContextRejects(t *testing.T) {
+	full := func() map[string]any {
+		return map[string]any{
+			"status":                          "OK",
+			"player_url":                      "https://www.youtube.com/s/player/abc/base.js",
+			"server_abr_streaming_url":        "https://r1.googlevideo.com/videoplayback?n=s",
+			"video_playback_ustreamer_config": "U",
+			"visitor_data":                    "VD",
+			"audio_formats":                   []map[string]any{{"itag": 251}},
+		}
+	}
+	tests := []struct {
+		name   string
+		mutate func(m map[string]any)
+	}{
+		{"non-ok status", func(m map[string]any) { m["status"] = "LOGIN_REQUIRED" }},
+		{"missing player_url", func(m map[string]any) { delete(m, "player_url") }},
+		{"missing visitor_data", func(m map[string]any) { delete(m, "visitor_data") }},
+		{"missing ustreamer config", func(m map[string]any) { delete(m, "video_playback_ustreamer_config") }},
+		{"no audio formats", func(m map[string]any) { m["audio_formats"] = []map[string]any{} }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := full()
+			tt.mutate(body)
+			p, done := newProvider(func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(body)
+			})
+			defer done()
+			if _, err := p.ProvidePlayerContext(context.Background(), "VID"); err == nil {
+				t.Fatalf("expected rejection for %q, got nil", tt.name)
+			}
+		})
+	}
+}
+
 func TestSessionAdapts(t *testing.T) {
 	p, done := newProvider(func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{

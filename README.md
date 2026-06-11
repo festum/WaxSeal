@@ -108,6 +108,40 @@ coherent GVS session (matching token + session + IP) still streams under
 `STREAM_PROTECTION` status 2 (the ~70s preview), so use `/player-context` for the
 status-1 context. The session is anonymous (no Google login).
 
+## Error responses
+
+Every 4xx/5xx response from `/get_pot`, `/player-context`, and `/session` uses a
+JSON envelope with a stable machine-readable `code` and a human-readable `error`.
+Consumers can branch on the code without parsing the message:
+
+```json
+{
+  "error": "waxseal: video unplayable (playabilityStatus \"LOGIN_REQUIRED\")",
+  "code": "video-unavailable",
+  "details": "LOGIN_REQUIRED"
+}
+```
+
+`details` is optional. For `video-unavailable`, it contains the bare
+`playabilityStatus`.
+
+| `code` | HTTP | Meaning |
+|---|---|---|
+| `unauthorized` | 401 | Missing or invalid API key |
+| `invalid-request` | 400 | Malformed JSON or a missing or invalid field |
+| `mint-failed` | 502 | Token mint failed |
+| `video-unavailable` | 422 | Terminal `playabilityStatus`; `details` contains the status |
+| `timeout` | 504 | Player-context deadline elapsed |
+| `player-context-failed` | 502 | Other player-context failure |
+| `no-session` | 503 | No attested session or cookies available |
+
+`/ping` is outside this contract. It always returns 200 and reports failures as
+`{ok:false,error}`. Unknown paths use net/http's plain-text 404 response.
+
+The `waxseal/client` package parses error envelopes into `*client.APIError` and
+provides matching `Code*` constants. It also accepts the older `{error}` response
+and non-JSON proxy responses.
+
 ## License
 
 MIT. Implemented independently; the GPL-3.0 bgutil project is a behavioral/wire

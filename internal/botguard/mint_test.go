@@ -48,8 +48,8 @@ func TestParseGenerateITNeitherTokenErrors(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error when neither integrity nor fallback present")
 	}
-	var se *StageError
-	if !errors.As(err, &se) || se.Stage != StageGenerateIT {
+	se, ok := errors.AsType[*StageError](err)
+	if !ok || se.Stage != StageGenerateIT {
 		t.Fatalf("want StageGenerateIT, got %v", err)
 	}
 }

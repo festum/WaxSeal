@@ -37,12 +37,26 @@ const playerContextTimeout = 25 * time.Second
 // wait and the establish wait).
 const playerContextPollInterval = 300 * time.Millisecond
 
-// ErrUnplayable marks a video that will never stream (a terminal playabilityStatus:
-// private, deleted, age-gated, region-blocked). PlayerContext returns it (wrapped)
-// so the minter does NOT walk the escalation ladder (relaunch+re-attest cannot make
-// an unplayable video playable and would only burn the per-IP-scarce attestation)
-// and caches it negatively instead.
+// ErrUnplayable marks a terminal playabilityStatus. The minter caches this error
+// instead of relaunching and attesting again.
 var ErrUnplayable = errors.New("waxseal: video unplayable")
+
+// UnplayableError reports a terminal playabilityStatus, such as a private,
+// deleted, age-gated, region-blocked, or login-gated video. It wraps
+// ErrUnplayable and preserves the status for structured error responses.
+type UnplayableError struct {
+	Status string // playabilityStatus, such as "LOGIN_REQUIRED"
+	Detail string // player-provided reason, when present
+}
+
+func (e *UnplayableError) Error() string {
+	if e.Detail != "" {
+		return fmt.Sprintf("%s: %s (playabilityStatus %q)", ErrUnplayable.Error(), e.Detail, e.Status)
+	}
+	return fmt.Sprintf("%s (playabilityStatus %q)", ErrUnplayable.Error(), e.Status)
+}
+
+func (e *UnplayableError) Unwrap() error { return ErrUnplayable }
 
 // Options configure a browser Session. The zero value is usable: it auto-detects
 // a system Chromium, runs headless=new, and discards logs.
@@ -574,19 +588,15 @@ func (s *Session) Mint(ctx context.Context, identifier string) (MintResult, erro
 	return MintResult{Kind: "integrity", Token: token, TokenLen: len(token), Identifier: identifier, Lifetime: s.lifetimeSecs, ExpiresAt: s.tokenExpiresAt}, nil
 }
 
-// PlayerContext is the raw, status-1-graded streaming context an attested browser
-// gets from /player for one video: the SABR url (carrying a SCRAMBLED throttling
-// nonce the consumer must descramble), the ustreamer config, the visitor_data a
-// GVS PO token binds to, the client version, and the audio formats. WaxSeal returns
-// it verbatim; descrambling the url's n and running the SABR stream are the
-// consumer's job (audio-only WaxTap), not WaxSeal's. WaxSeal stays a token/context
-// minter and builds no SABR machinery.
+// PlayerContext is the status-1 streaming context returned by the attested
+// browser for one video. The consumer must descramble the SABR URL's n parameter
+// with PlayerURL before starting the stream.
 //
-// client.PlayerContext mirrors these json tags for the dependency-light client; the
-// two are one /player-context wire contract, so keep them in sync.
+// client.PlayerContext mirrors this wire format without importing the browser
+// package. Keep the JSON tags in sync.
 type PlayerContext struct {
 	Status                       string        `json:"status"`     // playabilityStatus.status; "OK" when streamable
-	PlayerURL                    string        `json:"player_url"` // absolute base.js URL this /player response is coherent with; the consumer MUST descramble the url's n with THIS player (client_version does not pin base.js)
+	PlayerURL                    string        `json:"player_url"` // base.js URL used to descramble the SABR URL's n parameter
 	ServerAbrStreamingURL        string        `json:"server_abr_streaming_url"`
 	VideoPlaybackUstreamerConfig string        `json:"video_playback_ustreamer_config"`
 	VisitorData                  string        `json:"visitor_data"`
@@ -597,12 +607,9 @@ type PlayerContext struct {
 	AudioFormats                 []AudioFormat `json:"audio_formats"`
 }
 
-// AudioFormat is one audio adaptiveFormat selector. The (itag, lmt, xtags) triple
-// must be carried together: a missing/mismatched xtags against the itag's lmt makes
-// the SABR server answer RELOAD_PLAYER_RESPONSE instead of media (e.g. a DRC lmt
-// requires its "CggKA2RyYxIBMQ" xtags), so all three are returned per format. The
-// rest is descriptive metadata so a consumer can name the file and pick a format
-// without a second /player call.
+// AudioFormat describes one adaptive audio format. Itag, LMT, and XTags must be
+// used together; an inconsistent selector causes the SABR server to request a
+// player-response reload instead of returning media.
 type AudioFormat struct {
 	Itag             int    `json:"itag"`
 	LMT              string `json:"lmt"` // lastModified; a large opaque integer, kept as a string url param
@@ -614,25 +621,17 @@ type AudioFormat struct {
 	AudioSampleRate  int    `json:"audio_sample_rate"`
 	AudioChannels    int    `json:"audio_channels"`
 	AudioQuality     string `json:"audio_quality"`
+	IsDrc            bool   `json:"is_drc"`         // whether client_abr_state.drc_enabled is required
+	AudioTrackID     string `json:"audio_track_id"` // audioTrack.id; empty for the default or only track
 }
 
-// playerReadyJS reports whether the YouTube player API has hydrated (movie_player
-// exists and exposes loadVideoById/getPlayerResponse). The load is gated on it so a
-// /player-context right after a (re)launch on a slow host polls for hydration
-// instead of failing instantly and triggering a needless escalation.
+// playerReadyJS reports whether the player exposes the APIs required to load and
+// inspect a video.
 const playerReadyJS = `() => { const p = document.getElementById('movie_player'); return !!(p && p.loadVideoById && p.getPlayerResponse); }`
 
-// playerLoadJS points the hydrated player at videoID and forces muted playback. It
-// is called once, after playerReadyJS confirms the API exists. The player's OWN
-// /player call + its first real videoplayback exchange (player PO-token + client
-// playback nonce + full playback context) is what grades the serverAbrStreamingUrl
-// to STREAM_PROTECTION status 1 (full); the url it exposes BEFORE streaming a beat
-// is status-2 (~70s preview). stopVideo() first unloads any prior media so a repeat
-// request for the SAME video waits for fresh media (the <video>.buffered gate
-// empties) instead of reading the previous call's leftover context. Headless reports
-// the tab hidden and auto-pauses, so the visibility override (installed configurable
-// so the cleanup can delete it) goes in before playback. Returns true once
-// loadVideoById was invoked.
+// playerLoadJS resets the player, applies the visibility overrides needed for
+// headless playback, and loads videoID. Resetting first prevents a repeated request
+// for the same video from observing buffered state from the previous request.
 const playerLoadJS = `(videoId) => {
 	try {
 		try { Object.defineProperty(document, 'visibilityState', { get: () => 'visible', configurable: true }); } catch (e) {}
@@ -646,11 +645,9 @@ const playerLoadJS = `(videoId) => {
 	} catch (e) { return false; }
 }`
 
-// playerDriveJS keeps the player playing (muted) each poll tick, so it issues the
-// real videoplayback exchange that establishes the status-1 session. Headless
-// autoplay needs the muted <video>.play() nudge in addition to the YT API call;
-// play() returns a promise whose NotAllowedError rejection is swallowed so it never
-// surfaces as unhandledrejection telemetry on the attested page.
+// playerDriveJS keeps muted playback active while the Go side polls for an
+// established context. Promise rejections are handled in-page to avoid unhandled
+// rejection events.
 const playerDriveJS = `() => {
 	try {
 		const p = document.getElementById('movie_player');
@@ -661,16 +658,9 @@ const playerDriveJS = `() => {
 	return true;
 }`
 
-// playerContextExtractJS reads the player's OWN getPlayerResponse() once the session
-// is ESTABLISHED (videoID is reflected, a streaming url is present, and real media is
-// buffered: a completed videoplayback exchange, so getPlayerResponse() now carries the
-// status-1 url), and projects the streaming context + audio formats with
-// snake_case keys matching the Go json tags (so it unmarshals straight into
-// PlayerContext). The url's n stays the SCRAMBLED throttling nonce; the consumer
-// descrambles it with player_url (WaxSeal does not run nsig). It returns
-// {error:"pending..."} until established (the Go side polls, driving playback each
-// tick), {error:...,terminal:true} for a terminal playabilityStatus (an unplayable
-// video that will never stream), or the full context.
+// playerContextExtractJS returns the player's context after videoID is loaded and
+// media has buffered. Pending and terminal results use the control fields consumed
+// by playerContextRaw.
 const playerContextExtractJS = `(videoId) => {
 	try {
 		const c = (typeof ytcfg !== 'undefined' && ytcfg) ? ytcfg : window.ytcfg;
@@ -696,6 +686,7 @@ const playerContextExtractJS = `(videoId) => {
 					itag: f.itag, lmt: String(f.lastModified || ''), xtags: f.xtags || '', mime_type: f.mimeType || '', bitrate: f.bitrate || 0,
 					content_length: Number(f.contentLength || 0), approx_duration_ms: Number(f.approxDurationMs || 0),
 					audio_sample_rate: Number(f.audioSampleRate || 0), audio_channels: Number(f.audioChannels || 0), audio_quality: f.audioQuality || '',
+					is_drc: f.isDrc === true, audio_track_id: (f.audioTrack && f.audioTrack.id) || '',
 				};
 			});
 		const visitorData = (function () {
@@ -738,106 +729,28 @@ const playerContextCleanupJS = `() => {
 	return true;
 }`
 
-// playerContextRaw is one extract-JS payload: the public context (its snake_case
-// json tags reused via embedding, so the payload unmarshals in place with no separate
-// field list to keep in sync) plus the poll's control fields.
+// playerContextRaw adds polling state to the public player context.
 type playerContextRaw struct {
 	PlayerContext
 	Error    string `json:"error"`
 	Terminal bool   `json:"terminal"` // a terminal playabilityStatus (unplayable; never retriable)
 }
 
-// PlayerContext returns videoID's status-1 streaming context by pointing the real
-// player at it and reading the player's OWN getPlayerResponse(), NOT a bare
-// in-page /player fetch. The distinction is the whole fix: the player's own /player
-// call carries the signals (player PO-token, client playback nonce, full playback
-// context) that grade the serverAbrStreamingUrl to STREAM_PROTECTION status 1 (full
-// audio), whereas a bare fetch gets status 2 (the ~70s preview). The returned url's
-// n is the SCRAMBLED throttling nonce; the consumer descrambles it with player_url.
-// This operates the genuine browser to mint a context; it does no SABR/streaming.
+// PlayerContext returns videoID's status-1 streaming context from the real player.
+// A bare in-page /player request lacks the playback signals needed for status 1.
+// The returned SABR URL still contains a throttling nonce for the consumer to
+// descramble with PlayerURL.
 //
-// A terminal playabilityStatus (an unplayable video) returns ErrUnplayable so the
-// caller does not retry/relaunch. Playback is always stopped and the visibility
-// override reverted on return (even on cancel/deadline) via a detached-context
-// defer, since the shared page is reused by Mint/Attest.
+// A terminal playabilityStatus returns ErrUnplayable. Playback and visibility
+// changes are reverted before the shared page is reused.
 func (s *Session) PlayerContext(ctx context.Context, videoID string) (PlayerContext, error) {
 	page := s.page.Context(ctx)
-	// Stop playback and revert the visibility override on every return path,
-	// including a cancelled request, on a context detached from ctx because the
-	// request-bound page can't run an eval once ctx is done.
-	defer func() {
-		cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
-		defer cancel()
-		_, _ = s.page.Context(cctx).Eval(playerContextCleanupJS)
-	}()
+	defer s.revertPlayerContext(ctx)
 
-	deadline := time.Now().Add(playerContextTimeout)
-
-	// Phase 1: wait for the player API to hydrate, then point it at videoID once.
-	for {
-		ready, err := page.Eval(playerReadyJS)
-		if err != nil {
-			return PlayerContext{}, fmt.Errorf("waxseal: player-context ready probe: %w", err)
-		}
-		if ready.Value.Bool() {
-			break
-		}
-		if time.Now().After(deadline) {
-			return PlayerContext{}, fmt.Errorf("waxseal: player-context: movie_player.loadVideoById unavailable before deadline")
-		}
-		select {
-		case <-ctx.Done():
-			return PlayerContext{}, ctx.Err()
-		case <-time.After(playerContextPollInterval):
-		}
-	}
-	loaded, err := page.Eval(playerLoadJS, videoID)
+	raw, err := s.establish(ctx, page, videoID, time.Now().Add(playerContextTimeout))
 	if err != nil {
-		return PlayerContext{}, fmt.Errorf("waxseal: player-context loadVideoById: %w", err)
+		return PlayerContext{}, err
 	}
-	if !loaded.Value.Bool() {
-		return PlayerContext{}, fmt.Errorf("waxseal: player-context: movie_player.loadVideoById unavailable")
-	}
-
-	// Phase 2: drive muted playback and poll the player's own response until the
-	// session is ESTABLISHED (videoID loaded, streaming url present, media buffered).
-	// The leading tick lets the async stopVideo+loadVideoById reset settle before the
-	// first read, so a repeat same-video call can't observe leftover state.
-	var raw playerContextRaw
-	evalErrs := 0
-	for {
-		select {
-		case <-ctx.Done():
-			return PlayerContext{}, ctx.Err()
-		case <-time.After(playerContextPollInterval):
-		}
-		_, _ = page.Eval(playerDriveJS)
-		obj, evalErr := page.Eval(playerContextExtractJS, videoID)
-		if evalErr != nil {
-			// Tolerate a one-off CDP hiccup, but fail fast on a crashed/closed page
-			// (persistent errors) instead of spinning to the deadline.
-			evalErrs++
-			if evalErrs >= 3 || time.Now().After(deadline) {
-				return PlayerContext{}, fmt.Errorf("waxseal: player-context extract: %w", evalErr)
-			}
-			continue
-		}
-		evalErrs = 0
-		raw = playerContextRaw{}
-		if err := json.Unmarshal([]byte(obj.Value.Str()), &raw); err != nil {
-			return PlayerContext{}, fmt.Errorf("waxseal: player-context parse: %w", err)
-		}
-		if raw.Terminal {
-			return PlayerContext{}, fmt.Errorf("%w: %s (playabilityStatus %q)", ErrUnplayable, raw.Error, raw.Status)
-		}
-		if raw.Error == "" {
-			break // established context captured
-		}
-		if time.Now().After(deadline) {
-			return PlayerContext{}, fmt.Errorf("waxseal: player-context: %s", raw.Error)
-		}
-	}
-
 	if raw.ServerAbrStreamingURL == "" {
 		return PlayerContext{}, fmt.Errorf("waxseal: player-context: no serverAbrStreamingUrl (playabilityStatus %q)", raw.Status)
 	}
@@ -848,6 +761,292 @@ func (s *Session) PlayerContext(ctx context.Context, videoID string) (PlayerCont
 		raw.AudioFormats = []AudioFormat{}
 	}
 	return raw.PlayerContext, nil
+}
+
+// revertPlayerContext stops playback and restores the visibility override used by
+// PlayerContext and VerifyFullLength. Its detached context allows cleanup to run
+// after the request context has been canceled.
+func (s *Session) revertPlayerContext(ctx context.Context) {
+	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+	defer cancel()
+	_, _ = s.page.Context(cctx).Eval(playerContextCleanupJS)
+}
+
+// establish loads videoID and drives muted playback until the player returns an
+// established context. Both PlayerContext and VerifyFullLength use this path so
+// the diagnostic probe exercises the same setup as the production endpoint. The
+// caller is responsible for restoring the shared page.
+func (s *Session) establish(ctx context.Context, page *rod.Page, videoID string, deadline time.Time) (playerContextRaw, error) {
+	// Phase 1: wait for the player API to hydrate, then point it at videoID once.
+	for {
+		ready, err := page.Eval(playerReadyJS)
+		if err != nil {
+			return playerContextRaw{}, fmt.Errorf("waxseal: player-context ready probe: %w", err)
+		}
+		if ready.Value.Bool() {
+			break
+		}
+		if time.Now().After(deadline) {
+			return playerContextRaw{}, fmt.Errorf("waxseal: player-context: movie_player.loadVideoById unavailable before deadline")
+		}
+		select {
+		case <-ctx.Done():
+			return playerContextRaw{}, ctx.Err()
+		case <-time.After(playerContextPollInterval):
+		}
+	}
+	loaded, err := page.Eval(playerLoadJS, videoID)
+	if err != nil {
+		return playerContextRaw{}, fmt.Errorf("waxseal: player-context loadVideoById: %w", err)
+	}
+	if !loaded.Value.Bool() {
+		return playerContextRaw{}, fmt.Errorf("waxseal: player-context: movie_player.loadVideoById unavailable")
+	}
+
+	// Wait once before the first read so the asynchronous stop and load operations
+	// cannot expose state left by a previous request for the same video.
+	evalErrs := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return playerContextRaw{}, ctx.Err()
+		case <-time.After(playerContextPollInterval):
+		}
+		_, _ = page.Eval(playerDriveJS)
+		obj, evalErr := page.Eval(playerContextExtractJS, videoID)
+		if evalErr != nil {
+			// Tolerate a one-off CDP hiccup, but fail fast on a crashed/closed page
+			// (persistent errors) instead of spinning to the deadline.
+			evalErrs++
+			if evalErrs >= 3 || time.Now().After(deadline) {
+				return playerContextRaw{}, fmt.Errorf("waxseal: player-context extract: %w", evalErr)
+			}
+			continue
+		}
+		evalErrs = 0
+		var raw playerContextRaw
+		if err := json.Unmarshal([]byte(obj.Value.Str()), &raw); err != nil {
+			return playerContextRaw{}, fmt.Errorf("waxseal: player-context parse: %w", err)
+		}
+		if raw.Terminal {
+			return playerContextRaw{}, &UnplayableError{Status: raw.Status, Detail: raw.Error}
+		}
+		if raw.Error == "" {
+			return raw, nil // established context captured
+		}
+		if time.Now().After(deadline) {
+			return playerContextRaw{}, fmt.Errorf("waxseal: player-context: %s", raw.Error)
+		}
+	}
+}
+
+// The full-length probe seeks beyond the ~70s status-2 preview cap and confirms
+// that playback advances through buffered media at the target.
+const (
+	fullLengthTargetSecs   = 100              // seek target beyond the preview cap
+	fullLengthMinVideoSecs = 120              // minimum duration that leaves enough media after the target
+	fullLengthTolSecs      = 2.0              // required buffered media after the target
+	fullLengthProbeBudget  = 30 * time.Second // maximum time spent after establishment
+	fullLengthStallWindow  = 8 * time.Second  // maximum time without playback progress
+)
+
+const (
+	// OutcomeFullLength means playback reached buffered media beyond the cap.
+	OutcomeFullLength = "full-length"
+	// OutcomeTargetNotBuffered means the context established but the target was
+	// not reached. It does not distinguish a cap from a player error or stall.
+	OutcomeTargetNotBuffered = "target-not-buffered"
+	// OutcomeNotEstablished means the player context failed before the seek.
+	OutcomeNotEstablished = "not-established"
+	// OutcomeVideoTooShort means the video has no suitable target beyond the cap.
+	OutcomeVideoTooShort = "video-too-short"
+)
+
+// playerSeekJS seeks past the preview cap and allows the player to request media at
+// the target immediately.
+const playerSeekJS = `(seconds) => {
+	try {
+		const p = document.getElementById('movie_player');
+		if (!p || !p.seekTo) return false;
+		p.seekTo(seconds, true);
+		return true;
+	} catch (e) { return false; }
+}`
+
+// playerBufferedJS reports playback and buffering at the seek target. It also
+// returns the player state, player error, and current serverAbrStreamingUrl for
+// diagnostics.
+const playerBufferedJS = `(target, tol) => {
+	try {
+		const p = document.getElementById('movie_player');
+		const v = document.querySelector('video');
+		const cur = (p && p.getCurrentTime) ? Number(p.getCurrentTime() || 0) : (v ? Number(v.currentTime || 0) : 0);
+		let bufEnd = 0, coversTarget = false;
+		if (v && v.buffered && v.buffered.length) {
+			for (let i = 0; i < v.buffered.length; i++) {
+				const st = v.buffered.start(i), en = v.buffered.end(i);
+				if (en > bufEnd) bufEnd = en;
+				if (st <= target && en >= target + tol) coversTarget = true;
+			}
+		}
+		let state = -2; try { if (p && p.getPlayerState) state = Number(p.getPlayerState()); } catch (e) {}
+		let perr = 0; try { if (p && p.getPlayerError) perr = Number(p.getPlayerError() || 0); } catch (e) {}
+		let abr = ''; try { const j = (p && p.getPlayerResponse) ? p.getPlayerResponse() : null; abr = (j && j.streamingData && j.streamingData.serverAbrStreamingUrl) || ''; } catch (e) {}
+		return JSON.stringify({ current: cur, buffered_end: bufEnd, covers_target: coversTarget, state: state, player_error: perr, abr_url: abr });
+	} catch (e) {
+		return JSON.stringify({ error: String(e) });
+	}
+}`
+
+// FullLengthProbe records whether playback reached buffered media beyond the
+// status-2 preview cap. A negative result is diagnostic only and does not prove
+// that the stream was status-2 capped.
+type FullLengthProbe struct {
+	Outcome           string  `json:"outcome"`     // one of the Outcome* constants
+	FullLength        bool    `json:"full_length"` // true when Outcome is OutcomeFullLength
+	Reason            string  `json:"reason"`      // human-readable diagnostic
+	VideoID           string  `json:"video_id"`
+	LengthSeconds     int     `json:"length_seconds"`      // duration reported by the established context
+	TargetSeconds     int     `json:"target_seconds"`      // seek target
+	CurrentSeconds    float64 `json:"current_seconds"`     // last observed playback position
+	BufferedEnd       float64 `json:"buffered_end"`        // furthest observed buffered position
+	ElapsedMs         int     `json:"elapsed_ms"`          // elapsed wall-clock time
+	PlayerState       int     `json:"player_state"`        // last getPlayerState result
+	ContextURLChanged bool    `json:"context_url_changed"` // whether serverAbrStreamingUrl changed during the probe
+}
+
+// VerifyFullLength checks whether the attested browser can stream beyond the
+// ~70s status-2 preview cap. It establishes a player context, seeks beyond the
+// cap, and requires both playback progress and buffered media at the target.
+//
+// A negative result does not prove that status-2 caused the failure. Reason
+// records the observed establishment failure, player error, stall, or timeout.
+// The returned error is non-nil only when the caller's context is canceled.
+//
+// The probe seeks and drives playback, so it should be run on demand rather than
+// as a frequent health check.
+func (s *Session) VerifyFullLength(ctx context.Context, videoID string) (FullLengthProbe, error) {
+	page := s.page.Context(ctx)
+	defer s.revertPlayerContext(ctx)
+
+	start := time.Now()
+	probe := FullLengthProbe{VideoID: videoID, TargetSeconds: fullLengthTargetSecs}
+	finish := func() { probe.ElapsedMs = int(time.Since(start).Milliseconds()) }
+
+	raw, err := s.establish(ctx, page, videoID, time.Now().Add(playerContextTimeout))
+	if err != nil {
+		// Establishment failures are reported as probe outcomes unless the caller
+		// canceled the operation.
+		probe.Outcome = OutcomeNotEstablished
+		probe.Reason = err.Error()
+		finish()
+		if ctx.Err() != nil {
+			return probe, ctx.Err()
+		}
+		return probe, nil
+	}
+	probe.LengthSeconds = raw.LengthSeconds
+	establishedURL := raw.ServerAbrStreamingURL
+
+	if raw.LengthSeconds > 0 && raw.LengthSeconds <= fullLengthMinVideoSecs {
+		probe.Outcome = OutcomeVideoTooShort
+		probe.Reason = fmt.Sprintf("video duration is %ds; probing requires more than %ds", raw.LengthSeconds, fullLengthMinVideoSecs)
+		finish()
+		return probe, nil
+	}
+
+	if seeked, serr := page.Eval(playerSeekJS, fullLengthTargetSecs); serr != nil || !seeked.Value.Bool() {
+		probe.Outcome = OutcomeTargetNotBuffered
+		if serr != nil {
+			probe.Reason = "seek past the cap failed: " + serr.Error()
+		} else {
+			probe.Reason = "movie_player.seekTo unavailable"
+		}
+		finish()
+		return probe, nil
+	}
+
+	budgetDeadline := time.Now().Add(fullLengthProbeBudget)
+	lastProgressAt := time.Now()
+	var lastCurrent float64
+	for {
+		select {
+		case <-ctx.Done():
+			finish()
+			return probe, ctx.Err()
+		case <-time.After(playerContextPollInterval):
+		}
+		_, _ = page.Eval(playerDriveJS)
+		obj, evalErr := page.Eval(playerBufferedJS, fullLengthTargetSecs, fullLengthTolSecs)
+		if evalErr != nil {
+			if time.Now().After(budgetDeadline) {
+				probe.Outcome = OutcomeTargetNotBuffered
+				probe.Reason = "buffered probe eval error: " + evalErr.Error()
+				finish()
+				return probe, nil
+			}
+			continue
+		}
+		var b struct {
+			Current      float64 `json:"current"`
+			BufferedEnd  float64 `json:"buffered_end"`
+			CoversTarget bool    `json:"covers_target"`
+			State        int     `json:"state"`
+			PlayerError  int     `json:"player_error"`
+			ABRURL       string  `json:"abr_url"`
+			Error        string  `json:"error"`
+		}
+		if jerr := json.Unmarshal([]byte(obj.Value.Str()), &b); jerr != nil {
+			// A malformed payload may be transient, but it must not extend the
+			// configured probe budget.
+			if time.Now().After(budgetDeadline) {
+				probe.Outcome = OutcomeTargetNotBuffered
+				probe.Reason = "buffered probe decode error: " + jerr.Error()
+				finish()
+				return probe, nil
+			}
+			continue
+		}
+		probe.CurrentSeconds = b.Current
+		probe.BufferedEnd = b.BufferedEnd
+		probe.PlayerState = b.State
+		if b.ABRURL != "" && b.ABRURL != establishedURL {
+			probe.ContextURLChanged = true
+		}
+
+		// Require both playback progress and buffered media at the target.
+		if b.Current > float64(fullLengthTargetSecs)+fullLengthTolSecs && b.CoversTarget {
+			probe.Outcome = OutcomeFullLength
+			probe.FullLength = true
+			probe.Reason = fmt.Sprintf("advanced to %.1fs and buffered past the %ds cap", b.Current, fullLengthTargetSecs)
+			finish()
+			return probe, nil
+		}
+		// A terminal player error will not recover within the probe budget.
+		if b.PlayerError != 0 {
+			probe.Outcome = OutcomeTargetNotBuffered
+			probe.Reason = fmt.Sprintf("player error %d (state %d) at %.1fs before reaching the target", b.PlayerError, b.State, b.Current)
+			finish()
+			return probe, nil
+		}
+		// Use playback progress rather than player state to identify a stall because
+		// transient buffering is normal.
+		if b.Current > lastCurrent+0.25 {
+			lastCurrent = b.Current
+			lastProgressAt = time.Now()
+		} else if time.Since(lastProgressAt) > fullLengthStallWindow {
+			probe.Outcome = OutcomeTargetNotBuffered
+			probe.Reason = fmt.Sprintf("playback stalled at %.1fs (state %d, buffered end %.1f); never reached the %ds target", b.Current, b.State, b.BufferedEnd, fullLengthTargetSecs)
+			finish()
+			return probe, nil
+		}
+		if time.Now().After(budgetDeadline) {
+			probe.Outcome = OutcomeTargetNotBuffered
+			probe.Reason = fmt.Sprintf("budget expired at %.1fs/%ds target (state %d, buffered end %.1f)", b.Current, fullLengthTargetSecs, b.State, b.BufferedEnd)
+			finish()
+			return probe, nil
+		}
+	}
 }
 
 // AttestKind reports the attestation outcome ("integrity" or "fallback") after
