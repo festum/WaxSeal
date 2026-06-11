@@ -7,8 +7,11 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -33,6 +36,14 @@ type Server struct {
 	log     *slog.Logger
 	srv     *http.Server
 }
+
+// requestProcessTimeout bounds how long a single /get_pot or /player-context request
+// can hold the per-tenant page mutex. A legit cold ladder (two ~25s polls + an
+// ~80-95s relaunch+re-attest + a 25s poll ≈ 165s) must fit under it, so it is
+// generous; it only guarantees no single hung request pins the mutex indefinitely.
+// The negative cache + the no-escalate-on-terminal/cancel guards (not this value) are
+// what stop a caller from repeatedly holding it.
+const requestProcessTimeout = 3 * time.Minute
 
 // New launches the shared Chromium and builds the service. It does not attest
 // until Warm or the first request. Shutdown tears the browser down.
@@ -62,10 +73,11 @@ func New(cfg Config) (*Server, error) {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/get_pot", s.handleGetPot)
+	mux.HandleFunc("/player-context", s.handlePlayerContext)
 	mux.HandleFunc("/ping", s.handlePing)
 	mux.HandleFunc("/session", s.handleSession)
 	mux.HandleFunc("/metrics", s.handleMetrics)
-	s.srv = &http.Server{Addr: cfg.Addr, Handler: mux}
+	s.srv = &http.Server{Addr: cfg.Addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 	return s, nil
 }
 
@@ -131,7 +143,9 @@ func (s *Server) handleGetPot(w http.ResponseWriter, r *http.Request) {
 	if scope == "" {
 		scope = "pot" // the binding distinguishes player (video_id) vs gvs (visitor_data)
 	}
-	res, cached, err := m.Mint(r.Context(), scope, req.ContentBinding)
+	ctx, cancel := context.WithTimeout(r.Context(), requestProcessTimeout)
+	defer cancel()
+	res, cached, err := m.Mint(ctx, scope, req.ContentBinding)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "mint failed: "+err.Error())
 		return
@@ -154,6 +168,76 @@ func (s *Server) handleGetPot(w http.ResponseWriter, r *http.Request) {
 		"contentBinding": req.ContentBinding,
 		"expiresAt":      expires.UTC().Format(time.RFC3339),
 	})
+}
+
+// handlePlayerContext returns the attested browser's /player streaming context for
+// a video_id: the serverAbrStreamingUrl (status-1 graded by the browser's
+// provenance, carrying a SCRAMBLED throttling nonce the consumer descrambles), the
+// ustreamer config, the visitor_data to bind a GVS PO token to, the client version,
+// and the audio formats (each with the itag+lmt+xtags triple needed to select a
+// coherent format). This hands the consumer everything needed to stream WEB SABR
+// audio from its own Go client; WaxSeal does no SABR/streaming itself.
+func (s *Server) handlePlayerContext(w http.ResponseWriter, r *http.Request) {
+	m, label, ok := s.tenant(w, r)
+	if !ok {
+		return
+	}
+	videoID, ok := playerContextVideoID(w, r)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), requestProcessTimeout)
+	defer cancel()
+	pc, err := m.PlayerContext(ctx, videoID)
+	if err != nil {
+		// Give the terminal and timeout cases their own codes so a caller can skip
+		// retrying an unplayable video (422) and tell a slow browser (504) from a
+		// broken one (502).
+		switch {
+		case errors.Is(err, browser.ErrUnplayable):
+			writeErr(w, http.StatusUnprocessableEntity, err.Error())
+		case errors.Is(err, context.DeadlineExceeded):
+			writeErr(w, http.StatusGatewayTimeout, "player-context timed out")
+		default:
+			writeErr(w, http.StatusBadGateway, "player-context failed: "+err.Error())
+		}
+		return
+	}
+	s.log.Info("player-context handed out", "tenant", label, "video_id_len", len(videoID),
+		"status", pc.Status, "abr_url_len", len(pc.ServerAbrStreamingURL), "audio_formats", len(pc.AudioFormats))
+	writeJSON(w, http.StatusOK, pc)
+}
+
+// videoIDPattern is a cheap sanity check on a video id: base64url characters,
+// bounded length. It rejects obvious junk (an overlong id, or path/quote/space
+// characters) with a 400 instead of burning the whole browser poll budget on it.
+// Real ids are 11 chars; the looser bound avoids hard-coding that.
+var videoIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+
+// playerContextVideoID reads the video_id from the JSON body or, for a bodyless
+// request, the query param. An empty body decodes to io.EOF (not a JSON error), so it
+// falls through to the query form rather than 422-ing. It writes the error response
+// and returns ok=false on a malformed body, or a missing or malformed id.
+func playerContextVideoID(w http.ResponseWriter, r *http.Request) (string, bool) {
+	var req struct {
+		VideoID string `json:"video_id"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		writeErr(w, http.StatusUnprocessableEntity, "invalid JSON: "+err.Error())
+		return "", false
+	}
+	if req.VideoID == "" {
+		req.VideoID = r.URL.Query().Get("video_id")
+	}
+	if req.VideoID == "" {
+		writeErr(w, http.StatusBadRequest, "video_id is required")
+		return "", false
+	}
+	if !videoIDPattern.MatchString(req.VideoID) {
+		writeErr(w, http.StatusBadRequest, "video_id must be 1-64 chars of [A-Za-z0-9_-]")
+		return "", false
+	}
+	return req.VideoID, true
 }
 
 func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
@@ -182,8 +266,11 @@ type sessionCookie struct {
 }
 
 // handleSession hands out the tenant context's coherent {visitor_data, cookies}
-// pair so a consumer can adopt the browser-as-origin (the only way GVS reaches
-// STREAM_PROTECTION status 1). The session is anonymous (no Google login).
+// pair so a consumer can present the same anonymous identity the GVS PO token is
+// bound to. Adopting it keeps the token, session, and egress IP coherent, which
+// is necessary but does not by itself drive STREAM_PROTECTION status: a fully
+// coherent GVS session (matching token + session + IP) still streams under
+// status 2. The session is anonymous (no Google login).
 func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	m, label, ok := s.tenant(w, r)
 	if !ok {

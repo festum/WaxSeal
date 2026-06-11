@@ -2,6 +2,7 @@ package minter
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"github.com/colespringer/waxseal/internal/browser"
 	"net/http"
@@ -14,13 +15,25 @@ import (
 // fakeSession is an in-memory minterSession for testing the Minter's reliability
 // logic without a browser.
 type fakeSession struct {
-	mint   func(identifier string) (browser.MintResult, error)
-	id     browser.Identity // zero value reports a default visitor_data
-	closed atomic.Bool
+	mint      func(identifier string) (browser.MintResult, error)
+	playerCtx func(videoID string) (browser.PlayerContext, error)
+	id        browser.Identity // zero value reports a default visitor_data
+	closed    atomic.Bool
 }
 
 func (f *fakeSession) Mint(_ context.Context, id string) (browser.MintResult, error) {
 	return f.mint(id)
+}
+func (f *fakeSession) PlayerContext(ctx context.Context, videoID string) (browser.PlayerContext, error) {
+	// Model the real Session, whose poll loops return ctx.Err() on cancel/deadline, so
+	// the cancel test's guarantee holds even if ensure ever stops gating a warm session.
+	if err := ctx.Err(); err != nil {
+		return browser.PlayerContext{}, err
+	}
+	if f.playerCtx == nil {
+		return browser.PlayerContext{ServerAbrStreamingURL: "https://example.googlevideo.com/videoplayback?n=scrambled", VisitorData: "vd"}, nil
+	}
+	return f.playerCtx(videoID)
 }
 func (f *fakeSession) AttestKind() string { return "integrity" }
 func (f *fakeSession) Identity() browser.Identity {
@@ -35,13 +48,20 @@ func (f *fakeSession) Close()                         { f.closed.Store(true) }
 // newTestMinter returns a Minter whose launcher records each created session and
 // uses the supplied per-mint behaviour.
 func newTestMinter(mint func(id string) (browser.MintResult, error)) (*Minter, *int64, *[]*fakeSession, *sync.Mutex) {
+	m, launches, sessions, smu := newTestMinterFull(mint, nil)
+	return m, launches, sessions, smu
+}
+
+// newTestMinterFull is newTestMinter with an explicit per-session PlayerContext
+// behaviour (nil uses the fakeSession default).
+func newTestMinterFull(mint func(id string) (browser.MintResult, error), playerCtx func(videoID string) (browser.PlayerContext, error)) (*Minter, *int64, *[]*fakeSession, *sync.Mutex) {
 	var launches int64
 	var sessions []*fakeSession
 	var smu sync.Mutex
 	m := NewMinter("v", browser.Options{})
 	m.launch = func(context.Context) (minterSession, error) {
 		atomic.AddInt64(&launches, 1)
-		fs := &fakeSession{mint: mint}
+		fs := &fakeSession{mint: mint, playerCtx: playerCtx}
 		smu.Lock()
 		sessions = append(sessions, fs)
 		smu.Unlock()
@@ -236,5 +256,196 @@ func TestMinterCrashKeepsCacheThenRelaunchInvalidates(t *testing.T) {
 	// The gen-1 gvs/vd entry is now stale (generation advanced) → re-mints.
 	if _, cached, _ := m.Mint(ctx, "gvs", "vd"); cached {
 		t.Errorf("old-generation cache entry should be invalidated by the relaunch")
+	}
+}
+
+// TestMinterPlayerContextReusesWarmSession: PlayerContext serves off the warm
+// attested session without a fresh attestation (the genuine-browser provenance,
+// not a new mint, is what the url needs), and returns the session's context.
+func TestMinterPlayerContextReusesWarmSession(t *testing.T) {
+	var calls int64
+	m, launches, _, _ := newTestMinterFull(
+		func(string) (browser.MintResult, error) { return browser.MintResult{Lifetime: 3600}, nil },
+		func(videoID string) (browser.PlayerContext, error) {
+			atomic.AddInt64(&calls, 1)
+			return browser.PlayerContext{
+				Status:                "OK",
+				ServerAbrStreamingURL: "https://r1.googlevideo.com/videoplayback?n=scram-" + videoID,
+				VisitorData:           "vd",
+				ClientVersion:         "2.20260606.02.00",
+				AudioFormats:          []browser.AudioFormat{{Itag: 251, LMT: "1719185012384481", MimeType: "audio/webm"}},
+			}, nil
+		},
+	)
+	ctx := context.Background()
+	if err := m.Warm(ctx); err != nil { // gen 1
+		t.Fatalf("warm: %v", err)
+	}
+	pc, err := m.PlayerContext(ctx, "vid")
+	if err != nil {
+		t.Fatalf("player-context: %v", err)
+	}
+	if pc.ServerAbrStreamingURL != "https://r1.googlevideo.com/videoplayback?n=scram-vid" || len(pc.AudioFormats) != 1 {
+		t.Fatalf("unexpected context: %+v", pc)
+	}
+	if got := atomic.LoadInt64(launches); got != 1 {
+		t.Errorf("launches = %d, want 1 (player-context reuses the warm session)", got)
+	}
+	if got := atomic.LoadInt64(&calls); got != 1 {
+		t.Errorf("player-context calls = %d, want 1", got)
+	}
+}
+
+// TestMinterPlayerContextEscalation: a player-context that fails twice triggers one
+// in-place retry then a relaunch+re-attest on a fresh session, mirroring the mint
+// escalation ladder; the failed session is closed.
+func TestMinterPlayerContextEscalation(t *testing.T) {
+	var attempt int64
+	m, launches, sessions, smu := newTestMinterFull(
+		func(string) (browser.MintResult, error) { return browser.MintResult{Lifetime: 3600}, nil },
+		func(string) (browser.PlayerContext, error) {
+			if n := atomic.AddInt64(&attempt, 1); n <= 2 {
+				return browser.PlayerContext{}, fmt.Errorf("transient failure %d", n)
+			}
+			return browser.PlayerContext{Status: "OK", ServerAbrStreamingURL: "https://r/ok", VisitorData: "vd"}, nil
+		},
+	)
+	ctx := context.Background()
+
+	pc, err := m.PlayerContext(ctx, "vid")
+	if err != nil {
+		t.Fatalf("player-context after escalation: %v", err)
+	}
+	if pc.ServerAbrStreamingURL != "https://r/ok" {
+		t.Fatalf("got url=%q, want https://r/ok", pc.ServerAbrStreamingURL)
+	}
+	if got := atomic.LoadInt64(launches); got != 2 {
+		t.Errorf("launches = %d, want 2 (initial + one relaunch)", got)
+	}
+	if got := m.metrics.Escalations.Load(); got != 1 {
+		t.Errorf("escalations = %d, want 1", got)
+	}
+	smu.Lock()
+	defer smu.Unlock()
+	if len(*sessions) != 2 {
+		t.Fatalf("sessions created = %d, want 2", len(*sessions))
+	}
+	if !(*sessions)[0].closed.Load() {
+		t.Errorf("first (failed) session should be closed after escalation")
+	}
+	if (*sessions)[1].closed.Load() {
+		t.Errorf("second (current) session should be live")
+	}
+}
+
+// TestMinterPlayerContextUnplayableNoEscalation: a terminal ErrUnplayable does NOT
+// walk the ladder (no relaunch, no re-attest, the warm session survives), since
+// relaunching cannot make an unplayable video playable.
+func TestMinterPlayerContextUnplayableNoEscalation(t *testing.T) {
+	m, launches, sessions, smu := newTestMinterFull(
+		func(string) (browser.MintResult, error) { return browser.MintResult{Lifetime: 3600}, nil },
+		func(string) (browser.PlayerContext, error) {
+			return browser.PlayerContext{}, fmt.Errorf("%w: UNPLAYABLE", browser.ErrUnplayable)
+		},
+	)
+	ctx := context.Background()
+	if err := m.Warm(ctx); err != nil { // gen 1
+		t.Fatalf("warm: %v", err)
+	}
+	_, err := m.PlayerContext(ctx, "vid")
+	if err == nil || !errors.Is(err, browser.ErrUnplayable) {
+		t.Fatalf("err = %v, want ErrUnplayable", err)
+	}
+	if got := atomic.LoadInt64(launches); got != 1 {
+		t.Errorf("launches = %d, want 1 (unplayable must NOT relaunch/re-attest)", got)
+	}
+	if got := m.metrics.Escalations.Load(); got != 0 {
+		t.Errorf("escalations = %d, want 0", got)
+	}
+	if got := m.metrics.PlayerContextFailures.Load(); got != 1 {
+		t.Errorf("player_context_failures = %d, want 1", got)
+	}
+	smu.Lock()
+	defer smu.Unlock()
+	if (*sessions)[0].closed.Load() {
+		t.Errorf("session should NOT be retired for an unplayable video")
+	}
+}
+
+// TestMinterPlayerContextUnplayableNegativeCache: a repeat request for a
+// known-unplayable video is served from the negative cache: the session's
+// PlayerContext is not called again (no mintMu, no eval).
+func TestMinterPlayerContextUnplayableNegativeCache(t *testing.T) {
+	var calls int64
+	m, _, _, _ := newTestMinterFull(
+		func(string) (browser.MintResult, error) { return browser.MintResult{Lifetime: 3600}, nil },
+		func(string) (browser.PlayerContext, error) {
+			atomic.AddInt64(&calls, 1)
+			return browser.PlayerContext{}, fmt.Errorf("%w: LOGIN_REQUIRED", browser.ErrUnplayable)
+		},
+	)
+	ctx := context.Background()
+	if err := m.Warm(ctx); err != nil {
+		t.Fatalf("warm: %v", err)
+	}
+	if _, err := m.PlayerContext(ctx, "vid"); !errors.Is(err, browser.ErrUnplayable) {
+		t.Fatalf("first: err = %v, want ErrUnplayable", err)
+	}
+	if _, err := m.PlayerContext(ctx, "vid"); !errors.Is(err, browser.ErrUnplayable) {
+		t.Fatalf("second: err = %v, want ErrUnplayable (from negative cache)", err)
+	}
+	if got := atomic.LoadInt64(&calls); got != 1 {
+		t.Errorf("session PlayerContext calls = %d, want 1 (second served from negative cache)", got)
+	}
+	if got := m.metrics.PlayerContextFailures.Load(); got != 2 {
+		t.Errorf("player_context_failures = %d, want 2", got)
+	}
+}
+
+// TestMinterPlayerContextCancelNoEscalation: a cancelled caller context fails without
+// escalating: the warm attested session is not retired and there is no relaunch.
+func TestMinterPlayerContextCancelNoEscalation(t *testing.T) {
+	m, launches, sessions, smu := newTestMinterFull(
+		func(string) (browser.MintResult, error) { return browser.MintResult{Lifetime: 3600}, nil },
+		func(string) (browser.PlayerContext, error) { return browser.PlayerContext{}, context.Canceled },
+	)
+	if err := m.Warm(context.Background()); err != nil { // gen 1, live ctx
+		t.Fatalf("warm: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // client disconnected
+	if _, err := m.PlayerContext(ctx, "vid"); err == nil {
+		t.Fatal("want error on cancelled ctx")
+	}
+	if got := atomic.LoadInt64(launches); got != 1 {
+		t.Errorf("launches = %d, want 1 (a cancel must NOT relaunch)", got)
+	}
+	if got := m.metrics.Escalations.Load(); got != 0 {
+		t.Errorf("escalations = %d, want 0", got)
+	}
+	smu.Lock()
+	defer smu.Unlock()
+	if (*sessions)[0].closed.Load() {
+		t.Errorf("warm session should survive a client cancel")
+	}
+}
+
+// TestMinterNegCacheBoundedEvicts: at capacity with every entry live, a new terminal
+// result is still cached (evicting an older one) instead of dropped, so the map stays
+// bounded and the newest unplayable id is the one kept.
+func TestMinterNegCacheBoundedEvicts(t *testing.T) {
+	m := NewMinter("v", browser.Options{})
+	for i := 0; i < minterNegCacheMax; i++ {
+		m.negCachePut(fmt.Sprintf("vid%05d", i), browser.ErrUnplayable)
+	}
+	if got := len(m.negCache); got != minterNegCacheMax {
+		t.Fatalf("negCache size = %d, want %d (filled to capacity)", got, minterNegCacheMax)
+	}
+	m.negCachePut("newestUnplay", browser.ErrUnplayable) // one past capacity, all others live
+	if got := len(m.negCache); got != minterNegCacheMax {
+		t.Errorf("negCache size = %d, want %d (stays bounded after eviction)", got, minterNegCacheMax)
+	}
+	if err := m.negCacheGet("newestUnplay"); !errors.Is(err, browser.ErrUnplayable) {
+		t.Errorf("newest terminal result should be cached after eviction, got %v", err)
 	}
 }

@@ -3,6 +3,8 @@ package server
 import (
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strings"
 	"testing"
 )
 
@@ -37,5 +39,46 @@ func TestAPIKeyExtraction(t *testing.T) {
 	}
 	if got := apiKey(httptest.NewRequest(http.MethodGet, "/", nil)); got != "" {
 		t.Errorf("no key = %q, want empty", got)
+	}
+}
+
+func TestPlayerContextVideoID(t *testing.T) {
+	tests := []struct {
+		name     string
+		body     string
+		query    string
+		wantID   string
+		wantOK   bool
+		wantCode int // checked only when !wantOK
+	}{
+		{name: "body", body: `{"video_id":"VID"}`, wantID: "VID", wantOK: true},
+		{name: "empty body + query", body: "", query: "?video_id=QID", wantID: "QID", wantOK: true},
+		{name: "body wins over query", body: `{"video_id":"BID"}`, query: "?video_id=QID", wantID: "BID", wantOK: true},
+		{name: "empty body no query", body: "", wantOK: false, wantCode: http.StatusBadRequest},
+		{name: "empty json no query", body: `{}`, wantOK: false, wantCode: http.StatusBadRequest},
+		{name: "malformed json", body: `{not json`, wantOK: false, wantCode: http.StatusUnprocessableEntity},
+		{name: "bad charset in body", body: `{"video_id":"bad id/../x"}`, wantOK: false, wantCode: http.StatusBadRequest},
+		{name: "bad charset in query", query: "?video_id=" + url.QueryEscape("a b!"), wantOK: false, wantCode: http.StatusBadRequest},
+		{name: "over length", body: `{"video_id":"` + strings.Repeat("a", 65) + `"}`, wantOK: false, wantCode: http.StatusBadRequest},
+		{name: "real id", body: `{"video_id":"aqz-KE-bpKQ"}`, wantID: "aqz-KE-bpKQ", wantOK: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodPost, "/player-context"+tt.query, strings.NewReader(tt.body))
+			w := httptest.NewRecorder()
+			id, ok := playerContextVideoID(w, r)
+			if ok != tt.wantOK {
+				t.Fatalf("ok = %v, want %v (body=%q query=%q)", ok, tt.wantOK, tt.body, tt.query)
+			}
+			if tt.wantOK {
+				if id != tt.wantID {
+					t.Errorf("id = %q, want %q", id, tt.wantID)
+				}
+				return
+			}
+			if w.Code != tt.wantCode {
+				t.Errorf("code = %d, want %d", w.Code, tt.wantCode)
+			}
+		})
 	}
 }

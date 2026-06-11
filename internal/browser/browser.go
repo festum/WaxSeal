@@ -3,6 +3,7 @@ package browser
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -27,6 +28,21 @@ import (
 // "Big Buck Bunny", a Creative Commons open movie. Keep every video id in this
 // codebase non-copyrighted.
 const DefaultVideo = "aqz-KE-bpKQ"
+
+// playerContextTimeout bounds how long PlayerContext waits for the player to load a
+// video and expose its (status-1 graded) getPlayerResponse().
+const playerContextTimeout = 25 * time.Second
+
+// playerContextPollInterval paces the player-context poll loop (both the hydration
+// wait and the establish wait).
+const playerContextPollInterval = 300 * time.Millisecond
+
+// ErrUnplayable marks a video that will never stream (a terminal playabilityStatus:
+// private, deleted, age-gated, region-blocked). PlayerContext returns it (wrapped)
+// so the minter does NOT walk the escalation ladder (relaunch+re-attest cannot make
+// an unplayable video playable and would only burn the per-IP-scarce attestation)
+// and caches it negatively instead.
+var ErrUnplayable = errors.New("waxseal: video unplayable")
 
 // Options configure a browser Session. The zero value is usable: it auto-detects
 // a system Chromium, runs headless=new, and discards logs.
@@ -556,6 +572,282 @@ func (s *Session) Mint(ctx context.Context, identifier string) (MintResult, erro
 	}
 	s.log.Info("waxseal: integrity token minted", "len", len(token), "identifier_len", len(identifier))
 	return MintResult{Kind: "integrity", Token: token, TokenLen: len(token), Identifier: identifier, Lifetime: s.lifetimeSecs, ExpiresAt: s.tokenExpiresAt}, nil
+}
+
+// PlayerContext is the raw, status-1-graded streaming context an attested browser
+// gets from /player for one video: the SABR url (carrying a SCRAMBLED throttling
+// nonce the consumer must descramble), the ustreamer config, the visitor_data a
+// GVS PO token binds to, the client version, and the audio formats. WaxSeal returns
+// it verbatim; descrambling the url's n and running the SABR stream are the
+// consumer's job (audio-only WaxTap), not WaxSeal's. WaxSeal stays a token/context
+// minter and builds no SABR machinery.
+//
+// client.PlayerContext mirrors these json tags for the dependency-light client; the
+// two are one /player-context wire contract, so keep them in sync.
+type PlayerContext struct {
+	Status                       string        `json:"status"`     // playabilityStatus.status; "OK" when streamable
+	PlayerURL                    string        `json:"player_url"` // absolute base.js URL this /player response is coherent with; the consumer MUST descramble the url's n with THIS player (client_version does not pin base.js)
+	ServerAbrStreamingURL        string        `json:"server_abr_streaming_url"`
+	VideoPlaybackUstreamerConfig string        `json:"video_playback_ustreamer_config"`
+	VisitorData                  string        `json:"visitor_data"`
+	ClientVersion                string        `json:"client_version"`
+	Title                        string        `json:"title"`
+	Author                       string        `json:"author"`
+	LengthSeconds                int           `json:"length_seconds"`
+	AudioFormats                 []AudioFormat `json:"audio_formats"`
+}
+
+// AudioFormat is one audio adaptiveFormat selector. The (itag, lmt, xtags) triple
+// must be carried together: a missing/mismatched xtags against the itag's lmt makes
+// the SABR server answer RELOAD_PLAYER_RESPONSE instead of media (e.g. a DRC lmt
+// requires its "CggKA2RyYxIBMQ" xtags), so all three are returned per format. The
+// rest is descriptive metadata so a consumer can name the file and pick a format
+// without a second /player call.
+type AudioFormat struct {
+	Itag             int    `json:"itag"`
+	LMT              string `json:"lmt"` // lastModified; a large opaque integer, kept as a string url param
+	XTags            string `json:"xtags"`
+	MimeType         string `json:"mime_type"`
+	Bitrate          int    `json:"bitrate"`
+	ContentLength    int64  `json:"content_length"`
+	ApproxDurationMs int    `json:"approx_duration_ms"`
+	AudioSampleRate  int    `json:"audio_sample_rate"`
+	AudioChannels    int    `json:"audio_channels"`
+	AudioQuality     string `json:"audio_quality"`
+}
+
+// playerReadyJS reports whether the YouTube player API has hydrated (movie_player
+// exists and exposes loadVideoById/getPlayerResponse). The load is gated on it so a
+// /player-context right after a (re)launch on a slow host polls for hydration
+// instead of failing instantly and triggering a needless escalation.
+const playerReadyJS = `() => { const p = document.getElementById('movie_player'); return !!(p && p.loadVideoById && p.getPlayerResponse); }`
+
+// playerLoadJS points the hydrated player at videoID and forces muted playback. It
+// is called once, after playerReadyJS confirms the API exists. The player's OWN
+// /player call + its first real videoplayback exchange (player PO-token + client
+// playback nonce + full playback context) is what grades the serverAbrStreamingUrl
+// to STREAM_PROTECTION status 1 (full); the url it exposes BEFORE streaming a beat
+// is status-2 (~70s preview). stopVideo() first unloads any prior media so a repeat
+// request for the SAME video waits for fresh media (the <video>.buffered gate
+// empties) instead of reading the previous call's leftover context. Headless reports
+// the tab hidden and auto-pauses, so the visibility override (installed configurable
+// so the cleanup can delete it) goes in before playback. Returns true once
+// loadVideoById was invoked.
+const playerLoadJS = `(videoId) => {
+	try {
+		try { Object.defineProperty(document, 'visibilityState', { get: () => 'visible', configurable: true }); } catch (e) {}
+		try { Object.defineProperty(document, 'hidden', { get: () => false, configurable: true }); } catch (e) {}
+		document.dispatchEvent(new Event('visibilitychange'));
+		const p = document.getElementById('movie_player');
+		if (!p || !p.loadVideoById) return false;
+		try { if (p.stopVideo) p.stopVideo(); } catch (e) {}
+		p.loadVideoById(videoId);
+		return true;
+	} catch (e) { return false; }
+}`
+
+// playerDriveJS keeps the player playing (muted) each poll tick, so it issues the
+// real videoplayback exchange that establishes the status-1 session. Headless
+// autoplay needs the muted <video>.play() nudge in addition to the YT API call;
+// play() returns a promise whose NotAllowedError rejection is swallowed so it never
+// surfaces as unhandledrejection telemetry on the attested page.
+const playerDriveJS = `() => {
+	try {
+		const p = document.getElementById('movie_player');
+		if (p && p.playVideo) { try { p.playVideo(); } catch (e) {} }
+		const v = document.querySelector('video');
+		if (v) { v.muted = true; try { const pr = v.play(); if (pr && pr.catch) pr.catch(function () {}); } catch (e) {} }
+	} catch (e) {}
+	return true;
+}`
+
+// playerContextExtractJS reads the player's OWN getPlayerResponse() once the session
+// is ESTABLISHED (videoID is reflected, a streaming url is present, and real media is
+// buffered: a completed videoplayback exchange, so getPlayerResponse() now carries the
+// status-1 url), and projects the streaming context + audio formats with
+// snake_case keys matching the Go json tags (so it unmarshals straight into
+// PlayerContext). The url's n stays the SCRAMBLED throttling nonce; the consumer
+// descrambles it with player_url (WaxSeal does not run nsig). It returns
+// {error:"pending..."} until established (the Go side polls, driving playback each
+// tick), {error:...,terminal:true} for a terminal playabilityStatus (an unplayable
+// video that will never stream), or the full context.
+const playerContextExtractJS = `(videoId) => {
+	try {
+		const c = (typeof ytcfg !== 'undefined' && ytcfg) ? ytcfg : window.ytcfg;
+		const p = document.getElementById('movie_player');
+		if (!p || !p.getPlayerResponse) return JSON.stringify({ error: 'player api unavailable' });
+		const j = p.getPlayerResponse();
+		if (!j || !j.videoDetails || j.videoDetails.videoId !== videoId) return JSON.stringify({ error: 'pending: player response not yet for ' + videoId });
+		const status = (j.playabilityStatus && j.playabilityStatus.status) || '';
+		if (status && status !== 'OK') return JSON.stringify({ error: 'unplayable: ' + status, status: status, terminal: true });
+		const sd = j.streamingData || {};
+		if (!sd.serverAbrStreamingUrl) return JSON.stringify({ error: 'pending: no serverAbrStreamingUrl', status: status });
+		const v = document.querySelector('video');
+		const buffered = (v && v.buffered && v.buffered.length) ? v.buffered.end(v.buffered.length - 1) : 0;
+		if (buffered <= 0) return JSON.stringify({ error: 'pending: session not established (no buffered media yet)', status: status });
+		const vd = j.videoDetails;
+		const urc = (j.playerConfig && j.playerConfig.mediaCommonConfig && j.playerConfig.mediaCommonConfig.mediaUstreamerRequestConfig) || {};
+		const ctxData = (c && c.get) ? c.get('INNERTUBE_CONTEXT') : null;
+		const playerJs = (c && c.get) ? (c.get('PLAYER_JS_URL') || '') : '';
+		const audioFormats = (sd.adaptiveFormats || [])
+			.filter(function (f) { return (f.mimeType || '').indexOf('audio/') === 0; })
+			.map(function (f) {
+				return {
+					itag: f.itag, lmt: String(f.lastModified || ''), xtags: f.xtags || '', mime_type: f.mimeType || '', bitrate: f.bitrate || 0,
+					content_length: Number(f.contentLength || 0), approx_duration_ms: Number(f.approxDurationMs || 0),
+					audio_sample_rate: Number(f.audioSampleRate || 0), audio_channels: Number(f.audioChannels || 0), audio_quality: f.audioQuality || '',
+				};
+			});
+		const visitorData = (function () {
+			if (j.responseContext && j.responseContext.visitorData) return j.responseContext.visitorData;
+			if (c && c.get) return c.get('VISITOR_DATA') || (ctxData && ctxData.client && ctxData.client.visitorData) || '';
+			return '';
+		})();
+		return JSON.stringify({
+			status: status,
+			player_url: playerJs ? new URL(playerJs, location.origin).href : '',
+			server_abr_streaming_url: sd.serverAbrStreamingUrl,
+			video_playback_ustreamer_config: urc.videoPlaybackUstreamerConfig || '',
+			visitor_data: visitorData,
+			client_version: (c && c.get) ? (c.get('INNERTUBE_CLIENT_VERSION') || '') : '',
+			title: vd.title || '', author: vd.author || '', length_seconds: Number(vd.lengthSeconds || 0),
+			audio_formats: audioFormats,
+		});
+	} catch (e) {
+		return JSON.stringify({ error: String(e) });
+	}
+}`
+
+// playerContextCleanupJS stops the muted playback loadVideoById started AND reverts
+// the visibility override, restoring the native Document.prototype getters so a later
+// Mint/Attest on this shared page sees the same (hidden) state it saw before
+// player-context ran (the known-good pre-feature state). delete removes the
+// own-property accessor; if for any reason it persists, redefine it to the
+// native-equivalent value as a last resort so the page never keeps reporting
+// 'visible' to YT telemetry.
+const playerContextCleanupJS = `() => {
+	try { const p = document.getElementById('movie_player'); if (p && p.pauseVideo) p.pauseVideo(); } catch (e) {}
+	try {
+		delete document.visibilityState;
+		if (Object.getOwnPropertyDescriptor(document, 'visibilityState')) Object.defineProperty(document, 'visibilityState', { get: () => 'hidden', configurable: true });
+	} catch (e) {}
+	try {
+		delete document.hidden;
+		if (Object.getOwnPropertyDescriptor(document, 'hidden')) Object.defineProperty(document, 'hidden', { get: () => true, configurable: true });
+	} catch (e) {}
+	return true;
+}`
+
+// playerContextRaw is one extract-JS payload: the public context (its snake_case
+// json tags reused via embedding, so the payload unmarshals in place with no separate
+// field list to keep in sync) plus the poll's control fields.
+type playerContextRaw struct {
+	PlayerContext
+	Error    string `json:"error"`
+	Terminal bool   `json:"terminal"` // a terminal playabilityStatus (unplayable; never retriable)
+}
+
+// PlayerContext returns videoID's status-1 streaming context by pointing the real
+// player at it and reading the player's OWN getPlayerResponse(), NOT a bare
+// in-page /player fetch. The distinction is the whole fix: the player's own /player
+// call carries the signals (player PO-token, client playback nonce, full playback
+// context) that grade the serverAbrStreamingUrl to STREAM_PROTECTION status 1 (full
+// audio), whereas a bare fetch gets status 2 (the ~70s preview). The returned url's
+// n is the SCRAMBLED throttling nonce; the consumer descrambles it with player_url.
+// This operates the genuine browser to mint a context; it does no SABR/streaming.
+//
+// A terminal playabilityStatus (an unplayable video) returns ErrUnplayable so the
+// caller does not retry/relaunch. Playback is always stopped and the visibility
+// override reverted on return (even on cancel/deadline) via a detached-context
+// defer, since the shared page is reused by Mint/Attest.
+func (s *Session) PlayerContext(ctx context.Context, videoID string) (PlayerContext, error) {
+	page := s.page.Context(ctx)
+	// Stop playback and revert the visibility override on every return path,
+	// including a cancelled request, on a context detached from ctx because the
+	// request-bound page can't run an eval once ctx is done.
+	defer func() {
+		cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+		defer cancel()
+		_, _ = s.page.Context(cctx).Eval(playerContextCleanupJS)
+	}()
+
+	deadline := time.Now().Add(playerContextTimeout)
+
+	// Phase 1: wait for the player API to hydrate, then point it at videoID once.
+	for {
+		ready, err := page.Eval(playerReadyJS)
+		if err != nil {
+			return PlayerContext{}, fmt.Errorf("waxseal: player-context ready probe: %w", err)
+		}
+		if ready.Value.Bool() {
+			break
+		}
+		if time.Now().After(deadline) {
+			return PlayerContext{}, fmt.Errorf("waxseal: player-context: movie_player.loadVideoById unavailable before deadline")
+		}
+		select {
+		case <-ctx.Done():
+			return PlayerContext{}, ctx.Err()
+		case <-time.After(playerContextPollInterval):
+		}
+	}
+	loaded, err := page.Eval(playerLoadJS, videoID)
+	if err != nil {
+		return PlayerContext{}, fmt.Errorf("waxseal: player-context loadVideoById: %w", err)
+	}
+	if !loaded.Value.Bool() {
+		return PlayerContext{}, fmt.Errorf("waxseal: player-context: movie_player.loadVideoById unavailable")
+	}
+
+	// Phase 2: drive muted playback and poll the player's own response until the
+	// session is ESTABLISHED (videoID loaded, streaming url present, media buffered).
+	// The leading tick lets the async stopVideo+loadVideoById reset settle before the
+	// first read, so a repeat same-video call can't observe leftover state.
+	var raw playerContextRaw
+	evalErrs := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return PlayerContext{}, ctx.Err()
+		case <-time.After(playerContextPollInterval):
+		}
+		_, _ = page.Eval(playerDriveJS)
+		obj, evalErr := page.Eval(playerContextExtractJS, videoID)
+		if evalErr != nil {
+			// Tolerate a one-off CDP hiccup, but fail fast on a crashed/closed page
+			// (persistent errors) instead of spinning to the deadline.
+			evalErrs++
+			if evalErrs >= 3 || time.Now().After(deadline) {
+				return PlayerContext{}, fmt.Errorf("waxseal: player-context extract: %w", evalErr)
+			}
+			continue
+		}
+		evalErrs = 0
+		raw = playerContextRaw{}
+		if err := json.Unmarshal([]byte(obj.Value.Str()), &raw); err != nil {
+			return PlayerContext{}, fmt.Errorf("waxseal: player-context parse: %w", err)
+		}
+		if raw.Terminal {
+			return PlayerContext{}, fmt.Errorf("%w: %s (playabilityStatus %q)", ErrUnplayable, raw.Error, raw.Status)
+		}
+		if raw.Error == "" {
+			break // established context captured
+		}
+		if time.Now().After(deadline) {
+			return PlayerContext{}, fmt.Errorf("waxseal: player-context: %s", raw.Error)
+		}
+	}
+
+	if raw.ServerAbrStreamingURL == "" {
+		return PlayerContext{}, fmt.Errorf("waxseal: player-context: no serverAbrStreamingUrl (playabilityStatus %q)", raw.Status)
+	}
+	if raw.PlayerURL == "" {
+		return PlayerContext{}, fmt.Errorf("waxseal: player-context: no player_url (PLAYER_JS_URL missing); consumer cannot descramble n")
+	}
+	if raw.AudioFormats == nil {
+		raw.AudioFormats = []AudioFormat{}
+	}
+	return raw.PlayerContext, nil
 }
 
 // AttestKind reports the attestation outcome ("integrity" or "fallback") after

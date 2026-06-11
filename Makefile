@@ -16,8 +16,13 @@ REGISTRY    ?= ghcr.io
 IMAGE_OWNER ?= colespringer
 IMAGE       := $(REGISTRY)/$(IMAGE_OWNER)/waxseal
 
+# PUSH_LATEST gates whether docker-push moves the :latest tag. Default 0 (publish
+# only the VERSION tag); set PUSH_LATEST=1 for a real release that should move latest,
+# so an out-of-band hotfix can't repoint :latest by accident.
+PUSH_LATEST ?= 0
+
 .PHONY: all test jsbundle-browser verify-assets release deps clean \
-        docker-build docker-login docker-push
+        docker-build docker-login docker-push release-guard
 
 all: jsbundle-browser
 
@@ -59,26 +64,42 @@ release:
 
 # Publish the runtime image to GitHub Container Registry. Auth reuses your gh
 # login: the token is piped to docker on stdin, so it never lands in args, env,
-# or shell history. Publish 1.0.0 with:  make docker-push VERSION=1.0.0
+# or shell history. Publish 1.0.0 and move :latest with:
+#   PUSH_LATEST=1 make docker-push VERSION=1.0.0
 
 # docker-build builds the runtime image, tagged VERSION and latest.
 docker-build:
 	docker build --build-arg VERSION=$(VERSION) -t $(IMAGE):$(VERSION) -t $(IMAGE):latest .
 
-# docker-login signs in to GHCR with the gh token (never printed). It needs the
-# write:packages scope; the check prints the one-time fix if the scope is absent.
+# release-guard refuses to publish the default/empty VERSION, which would tag an
+# unreleased build and (with PUSH_LATEST=1) repoint the public :latest at it.
+release-guard:
+	@if [ -z "$(VERSION)" ] || [ "$(VERSION)" = "dev" ]; then \
+	  echo "ERROR: docker-push needs VERSION=x.y.z (not empty or 'dev')"; exit 1; fi
+
+# docker-login signs in to GHCR with the gh token (never printed). It distinguishes
+# "not logged in" from "logged in but missing the write:packages scope" and prints
+# the one-time fix for each.
 docker-login:
+	@gh auth status >/dev/null 2>&1 || { \
+	  echo "not logged in to gh. Run once, then retry:"; \
+	  echo "    gh auth login"; \
+	  exit 1; }
 	@gh api -i user 2>/dev/null | grep -qi '^X-Oauth-Scopes:.*write:packages' || { \
 	  echo "gh token is missing the 'write:packages' scope. Run once, then retry:"; \
 	  echo "    gh auth refresh -h github.com -s write:packages"; \
 	  exit 1; }
 	@gh auth token | docker login $(REGISTRY) -u $(IMAGE_OWNER) --password-stdin
 
-# docker-push builds, logs in, and pushes VERSION + latest to GHCR.
-docker-push: docker-build docker-login
+# docker-push validates VERSION + auth (release-guard, docker-login) BEFORE the build,
+# then pushes the VERSION tag, plus :latest only when PUSH_LATEST=1.
+docker-push: release-guard docker-login docker-build
 	docker push $(IMAGE):$(VERSION)
-	docker push $(IMAGE):latest
-	@echo "pushed $(IMAGE):$(VERSION) and $(IMAGE):latest"
+	@if [ "$(PUSH_LATEST)" = "1" ]; then \
+	  docker push $(IMAGE):latest && echo "pushed $(IMAGE):$(VERSION) and moved :latest"; \
+	else \
+	  echo "pushed $(IMAGE):$(VERSION) (PUSH_LATEST=0; :latest not moved)"; \
+	fi
 
 # deps installs the Node toolchain used to rebuild the browser bundle
 # (deterministically, from the committed lockfile).

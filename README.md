@@ -16,12 +16,12 @@ its HTTP API is consumed by applications that embed the
 > external browser, so it is not a self-contained static binary.
 
 > **Status.** It mints integrity tokens reliably (headless, no Xvfb). The daemon
-> exposes `/get_pot`, `/session` (the coherent
-> visitor_data + cookies handoff), `/ping`, and `/metrics`, is **multi-tenant**
-> (per-tenant API keys → isolated browser contexts), and wraps a reliability
-> layer (single-flight attestation, a generation-keyed token cache, a mint
-> escalation ladder, crash recovery). End-to-end verified with WaxTap v1.5.0
-> streaming WEB Opus audio.
+> exposes `/get_pot`, `/player-context` (the status-1 streaming context),
+> `/session` (the coherent visitor_data + cookies handoff), `/ping`, and
+> `/metrics`, is **multi-tenant** (per-tenant API keys → isolated browser
+> contexts), and wraps a reliability layer (single-flight attestation, a
+> generation-keyed token cache, a mint escalation ladder, crash recovery).
+> End-to-end verified with WaxTap v1.5.0 streaming WEB Opus audio.
 
 ## Layout
 
@@ -59,6 +59,7 @@ make jsbundle-browser   # regenerate internal/browser/bg_browser_bundle.js
 # HTTP daemon (defaults to loopback 127.0.0.1:4416). Warms a browser at startup.
 go run ./cmd/waxseal server
 curl -s localhost:4416/get_pot -d '{"content_binding":"<videoID>"}'   # -> {"poToken",...}
+curl -s localhost:4416/player-context -d '{"video_id":"<videoID>"}'   # -> status-1 streaming context
 curl -s localhost:4416/session                                        # visitor_data + cookies (coherence handoff)
 curl -s localhost:4416/ping                                           # health check; never mints
 curl -s localhost:4416/metrics                                        # per-tenant counters
@@ -93,12 +94,27 @@ stays unauthenticated for generic yt-dlp). The key may be sent as `X-API-Key`,
 `Authorization: Bearer <key>`, or `?key=<key>`. Per-tenant egress is a future
 seam; residential self-hosting uses the one host IP.
 
+## Player context (`/player-context`)
+
+`POST /player-context {"video_id":"<id>"}` (or `?video_id=<id>`) returns the
+attested browser's **status-1** streaming context for a video: the
+`server_abr_streaming_url` (graded `STREAM_PROTECTION` status 1 by the genuine
+browser's own `/player` call, carrying a **scrambled** throttling nonce the
+consumer descrambles with `player_url`; `client_version` does not pin base.js),
+the ustreamer config, the visitor_data a GVS token binds to, the client version,
+and the audio formats (each with the itag+lmt+xtags triple needed to select a
+coherent format). This is the endpoint that delivers full WEB SABR audio: WaxSeal
+mints the context, the consumer runs the stream (it does no SABR/streaming itself).
+
 ## Coherence handoff (`/session`)
 
-GVS reaches `STREAM_PROTECTION` status 1 only with the **coherent**
-{visitor_data, cookies} pair. `GET /session` exports the tenant context's
-identity so a consumer embedding WaxTap can adopt the browser-as-origin; pair it with a
-`/get_pot` token bound to that same visitor_data, egressing the same IP.
+`GET /session` exports the tenant context's coherent {visitor_data, cookies}
+identity so a consumer embedding WaxTap can adopt the browser-as-origin; pair it
+with a `/get_pot` token bound to that same visitor_data, egressing the same IP.
+This coherence is **necessary but not sufficient** for full streams: a fully
+coherent GVS session (matching token + session + IP) still streams under
+`STREAM_PROTECTION` status 2 (the ~70s preview), so use `/player-context` for the
+status-1 context. The session is anonymous (no Google login).
 
 ## License
 

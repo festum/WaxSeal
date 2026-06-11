@@ -40,6 +40,45 @@ type Session struct {
 	Cookies       []*http.Cookie
 }
 
+// PlayerContext is WaxSeal's status-1 streaming context for one video: the SABR url
+// (carrying a SCRAMBLED throttling nonce the consumer descrambles with PlayerURL),
+// the ustreamer config, the visitor_data a GVS token binds to, the client version,
+// and the audio formats. WaxSeal mints it; descrambling the url's n and running the
+// SABR stream are the consumer's job.
+//
+// It re-declares browser.PlayerContext rather than importing it so the client stays
+// dependency-light: a consumer of waxseal/client should not pull in rod/Chromium.
+// Both sides are the same /player-context JSON contract, so the tags MUST stay in
+// sync, or decoding drifts silently.
+type PlayerContext struct {
+	Status                       string        `json:"status"`
+	PlayerURL                    string        `json:"player_url"`
+	ServerAbrStreamingURL        string        `json:"server_abr_streaming_url"`
+	VideoPlaybackUstreamerConfig string        `json:"video_playback_ustreamer_config"`
+	VisitorData                  string        `json:"visitor_data"`
+	ClientVersion                string        `json:"client_version"`
+	Title                        string        `json:"title"`
+	Author                       string        `json:"author"`
+	LengthSeconds                int           `json:"length_seconds"`
+	AudioFormats                 []AudioFormat `json:"audio_formats"`
+}
+
+// AudioFormat is one audio adaptiveFormat selector; the (Itag, LMT, XTags) triple
+// must be carried together to select a coherent format from the SABR server. It
+// mirrors browser.AudioFormat over the wire (see PlayerContext); keep the tags in sync.
+type AudioFormat struct {
+	Itag             int    `json:"itag"`
+	LMT              string `json:"lmt"`
+	XTags            string `json:"xtags"`
+	MimeType         string `json:"mime_type"`
+	Bitrate          int    `json:"bitrate"`
+	ContentLength    int64  `json:"content_length"`
+	ApproxDurationMs int    `json:"approx_duration_ms"`
+	AudioSampleRate  int    `json:"audio_sample_rate"`
+	AudioChannels    int    `json:"audio_channels"`
+	AudioQuality     string `json:"audio_quality"`
+}
+
 // Option configures a Client.
 type Option func(*Client)
 
@@ -137,6 +176,38 @@ func (c *Client) Session(ctx context.Context) (*Session, error) {
 		})
 	}
 	return &Session{VisitorData: out.VisitorData, UserAgent: out.UserAgent, ClientVersion: out.ClientVersion, Cookies: cookies}, nil
+}
+
+// PlayerContext fetches videoID's status-1 streaming context (server_abr_streaming_url
+// + ustreamer config + visitor_data + client version + audio formats). The url's n is
+// scrambled; descramble it with the returned PlayerURL.
+func (c *Client) PlayerContext(ctx context.Context, videoID string) (*PlayerContext, error) {
+	if videoID == "" {
+		return nil, errors.New("waxseal/client: video_id is required")
+	}
+	body, _ := json.Marshal(map[string]string{"video_id": videoID})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/player-context", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	c.auth(req)
+	resp, err := c.hc.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, c.statusErr("/player-context", resp)
+	}
+	var out PlayerContext
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("waxseal/client: decode /player-context: %w", err)
+	}
+	if out.ServerAbrStreamingURL == "" {
+		return nil, errors.New("waxseal/client: /player-context returned no server_abr_streaming_url")
+	}
+	return &out, nil
 }
 
 func (c *Client) auth(req *http.Request) {

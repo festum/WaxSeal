@@ -40,7 +40,7 @@ func newRootCmd() *cobra.Command {
 		RunE:          func(cmd *cobra.Command, _ []string) error { return runGenerate(cmd, &g) },
 	}
 	bindGenerateFlags(root, &g)
-	root.AddCommand(newServerCmd(), newDoctorCmd(), newGetPotCmd(), newPingCmd())
+	root.AddCommand(newServerCmd(), newDoctorCmd(), newGetPotCmd(), newPingCmd(), newPlayerContextCmd())
 	return root
 }
 

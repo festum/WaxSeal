@@ -25,9 +25,11 @@ services:
       waxseal:
         condition: service_healthy
     restart: "no"
-    # Point the embedded WaxTap at the daemon: /get_pot for tokens, /session for the
-    # coherent visitor_data + cookies handoff. e.g.:
+    # Point the embedded WaxTap at the daemon: /get_pot for tokens, /player-context
+    # for the status-1 streaming context, /session for the coherent visitor_data +
+    # cookies handoff. e.g.:
     #   environment:
     #     - WAXSEAL_POTOKEN_URL=http://127.0.0.1:4416
+    #     - WAXSEAL_PLAYER_CONTEXT_URL=http://127.0.0.1:4416/player-context
     #     - WAXSEAL_SESSION_URL=http://127.0.0.1:4416/session
     # command: ["..."]
