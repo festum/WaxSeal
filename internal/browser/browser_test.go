@@ -48,6 +48,64 @@ func TestAudioFormatTagDrift(t *testing.T) {
 	}
 }
 
+// TestConfirmTerminal covers stale evidence that must not mark the current video
+// unavailable.
+func TestConfirmTerminal(t *testing.T) {
+	const want = "vid123"
+	raw := func(mut func(*playerContextRaw)) playerContextRaw {
+		r := playerContextRaw{Error: "pending"}
+		mut(&r)
+		return r
+	}
+	tests := []struct {
+		name         string
+		raw          playerContextRaw
+		wantTerminal bool
+		wantStatus   string
+	}{
+		{"gen-matched onError 100, id match", raw(func(r *playerContextRaw) { r.ErrCode = 100; r.ErrGenMatch = true; r.ErrVideoID = want }), true, "ERROR"},
+		{"gen-matched onError 150, id match", raw(func(r *playerContextRaw) { r.ErrCode = 150; r.ErrGenMatch = true; r.ErrVideoID = want }), true, "ERROR"},
+		{"gen-matched onError 100, stale video id", raw(func(r *playerContextRaw) { r.ErrCode = 100; r.ErrGenMatch = true; r.ErrVideoID = "othervid" }), false, ""},
+		{"gen-matched onError 100, empty video id", raw(func(r *playerContextRaw) { r.ErrCode = 100; r.ErrGenMatch = true; r.ErrVideoID = "" }), false, ""},
+		{"non-OK status + id match", raw(func(r *playerContextRaw) { r.Status = "LOGIN_REQUIRED"; r.VideoIDMatch = true }), true, "LOGIN_REQUIRED"},
+		{"non-OK status for another video", raw(func(r *playerContextRaw) { r.Status = "ERROR"; r.VideoIDMatch = false }), false, ""},
+		{"onError 100 with gen mismatch", raw(func(r *playerContextRaw) { r.ErrCode = 100; r.ErrGenMatch = false; r.ErrVideoID = want }), false, ""},
+		{"onError 5 (non-terminal code)", raw(func(r *playerContextRaw) { r.ErrCode = 5; r.ErrGenMatch = true; r.ErrVideoID = want }), false, ""},
+		{"status OK + id match", raw(func(r *playerContextRaw) { r.Status = "OK"; r.VideoIDMatch = true }), false, ""},
+		{"no evidence", raw(func(r *playerContextRaw) {}), false, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ue, ok := confirmTerminal(tt.raw, want)
+			if ok != tt.wantTerminal {
+				t.Fatalf("terminal = %v, want %v", ok, tt.wantTerminal)
+			}
+			if !ok {
+				if ue != nil {
+					t.Errorf("non-terminal returned a non-nil error: %v", ue)
+				}
+				return
+			}
+			if ue.Status != tt.wantStatus {
+				t.Errorf("status = %q, want %q", ue.Status, tt.wantStatus)
+			}
+		})
+	}
+}
+
+func TestIsUnavailableCode(t *testing.T) {
+	for _, c := range []int{2, 100, 101, 150} {
+		if !isUnavailableCode(c) {
+			t.Errorf("isUnavailableCode(%d) = false, want true", c)
+		}
+	}
+	for _, c := range []int{0, 5, 3, 104, 999} {
+		if isUnavailableCode(c) {
+			t.Errorf("isUnavailableCode(%d) = true, want false", c)
+		}
+	}
+}
+
 func TestFullLengthProbeModel(t *testing.T) {
 	outcomes := map[string]bool{
 		OutcomeFullLength:        true,

@@ -22,12 +22,10 @@ type pingOpts struct {
 func newPingCmd() *cobra.Command {
 	var p pingOpts
 	c := &cobra.Command{
-		Use:           "ping",
-		Short:         "Health-check a running waxseal server (exit 0 if healthy)",
-		Args:          cobra.NoArgs,
-		SilenceUsage:  true,
-		SilenceErrors: true,
-		RunE:          func(cmd *cobra.Command, _ []string) error { return runPing(cmd, &p) },
+		Use:   "ping",
+		Short: "Health-check a running waxseal server (exit 0 if healthy)",
+		Args:  cobra.NoArgs,
+		RunE:  func(cmd *cobra.Command, _ []string) error { return runPing(cmd, &p) },
 	}
 	f := c.Flags()
 	f.StringVar(&p.addr, "addr", "127.0.0.1:4416", "server address to connect to")
@@ -36,7 +34,6 @@ func newPingCmd() *cobra.Command {
 }
 
 func runPing(cmd *cobra.Command, p *pingOpts) error {
-	stdout, stderr := cmd.OutOrStdout(), cmd.ErrOrStderr()
 	u := "http://" + p.addr + "/ping"
 	if p.key != "" {
 		u += "?key=" + url.QueryEscape(p.key)
@@ -46,8 +43,7 @@ func runPing(cmd *cobra.Command, p *pingOpts) error {
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		fmt.Fprintln(stderr, "unreachable:", err)
-		return err
+		return fmt.Errorf("unreachable: %w", err)
 	}
 	defer resp.Body.Close()
 	var body struct {
@@ -56,9 +52,8 @@ func runPing(cmd *cobra.Command, p *pingOpts) error {
 	}
 	_ = json.NewDecoder(resp.Body).Decode(&body)
 	if resp.StatusCode != http.StatusOK || !body.OK {
-		fmt.Fprintf(stderr, "unhealthy: status=%d ok=%v\n", resp.StatusCode, body.OK)
-		return fmt.Errorf("unhealthy")
+		return fmt.Errorf("unhealthy: status=%d ok=%v", resp.StatusCode, body.OK)
 	}
-	fmt.Fprintf(stdout, "ok (attest=%s)\n", body.Attest)
+	fmt.Fprintf(cmd.OutOrStdout(), "ok (attest=%s)\n", body.Attest)
 	return nil
 }

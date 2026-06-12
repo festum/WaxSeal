@@ -33,10 +33,8 @@ func newServerCmd() *cobra.Command {
 			"(127.0.0.1:4416); set --host 0.0.0.0 to expose it. With --tenant-keys it is\n" +
 			"multi-tenant (one isolated browser context per key); without, it is keyless.\n" +
 			"It drains in-flight requests on SIGTERM/SIGINT.",
-		Args:          cobra.NoArgs,
-		SilenceUsage:  true,
-		SilenceErrors: true,
-		RunE:          func(cmd *cobra.Command, _ []string) error { return runServer(cmd, &o) },
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error { return runServer(cmd, &o) },
 	}
 	f := c.Flags()
 	f.StringVar(&o.host, "host", "127.0.0.1", "bind address (set 0.0.0.0 to expose)")

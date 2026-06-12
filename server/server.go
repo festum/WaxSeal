@@ -136,9 +136,10 @@ func (s *Server) handleGetPot(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, CodeInvalidRequest, "content_binding is required (the video_id for player, or the visitor_data for gvs)")
 		return
 	}
-	scope := req.Scope
-	if scope == "" {
-		scope = "pot" // the binding distinguishes player (video_id) vs gvs (visitor_data)
+	scope, ok := normalizeScope(req.Scope)
+	if !ok {
+		writeErr(w, http.StatusBadRequest, CodeInvalidRequest, `scope must be "player", "gvs", or omitted`)
+		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), requestProcessTimeout)
 	defer cancel()
@@ -237,10 +238,28 @@ func playerContextVideoID(w http.ResponseWriter, r *http.Request) (string, bool)
 		return "", false
 	}
 	if !videoIDPattern.MatchString(req.VideoID) {
-		writeErr(w, http.StatusBadRequest, CodeInvalidRequest, "video_id must be 1-64 chars of [A-Za-z0-9_-]")
+		msg := "video_id must be 1-64 chars of [A-Za-z0-9_-]"
+		if strings.Contains(req.VideoID, "://") {
+			msg = "video_id must be a bare id, not a URL"
+		}
+		writeErr(w, http.StatusBadRequest, CodeInvalidRequest, msg)
 		return "", false
 	}
 	return req.VideoID, true
+}
+
+// normalizeScope canonicalizes the cache scope for /get_pot. It trims whitespace
+// and accepts names case-insensitively. Empty scope and "pot" map to the generic
+// scope. The content_binding, not the scope, determines the token type.
+func normalizeScope(raw string) (string, bool) {
+	switch s := strings.ToLower(strings.TrimSpace(raw)); s {
+	case "", "pot":
+		return "pot", true
+	case "player", "gvs":
+		return s, true
+	default:
+		return "", false
+	}
 }
 
 func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {

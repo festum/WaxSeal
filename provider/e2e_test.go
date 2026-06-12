@@ -5,6 +5,7 @@ package provider_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -26,7 +27,8 @@ import (
 // names an external daemon, each test starts a fresh daemon and browser session.
 // Big Buck Bunny is used under its Creative Commons license.
 const (
-	bbbURL           = "https://www.youtube.com/watch?v=aqz-KE-bpKQ"
+	bbbVideoID       = "aqz-KE-bpKQ"
+	bbbURL           = "https://www.youtube.com/watch?v=" + bbbVideoID
 	bbbContentLength = 30767611 // approximate reference size for logs
 	fullLengthFloor  = 8 << 20  // safely beyond BBB's roughly 1 MB status-2 preview
 )
@@ -267,5 +269,125 @@ func TestPlainWEBBaselineHTTP(t *testing.T) {
 	}
 	if want := os.Getenv("WAXSEAL_EXPECT_PLAIN"); want != "" && want != classification {
 		t.Errorf("WAXSEAL_EXPECT_PLAIN=%q but classified %q (n=%d, contentLength=%d)", want, classification, n, info.ContentLength)
+	}
+}
+
+// escalationMetrics contains the counters used to detect an unnecessary relaunch.
+// Values are summed so the test does not depend on the cold daemon's tenant label.
+type escalationMetrics struct {
+	Generation            int64
+	Attestations          int64
+	Escalations           int64
+	PlayerContextFailures int64
+}
+
+func readEscalationMetrics(t *testing.T, base string) escalationMetrics {
+	t.Helper()
+	resp, err := http.Get(base + "/metrics")
+	if err != nil {
+		t.Fatalf("GET /metrics: %v", err)
+	}
+	defer resp.Body.Close()
+	var m struct {
+		PerTenant map[string]struct {
+			Generation            int64 `json:"generation"`
+			Attestations          int64 `json:"attestations"`
+			Escalations           int64 `json:"escalations"`
+			PlayerContextFailures int64 `json:"player_context_failures"`
+		} `json:"per_tenant"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
+		t.Fatalf("decode /metrics: %v", err)
+	}
+	var out escalationMetrics
+	for _, v := range m.PerTenant {
+		out.Generation += v.Generation
+		out.Attestations += v.Attestations
+		out.Escalations += v.Escalations
+		out.PlayerContextFailures += v.PlayerContextFailures
+	}
+	return out
+}
+
+// TestPlayerContextUnavailableFastHTTP verifies that unavailable videos fail
+// without relaunching, are negatively cached, and do not affect the next valid
+// video. The short first-call deadline catches regressions to the slow relaunch
+// path.
+func TestPlayerContextUnavailableFastHTTP(t *testing.T) {
+	base := startColdDaemon(t)
+	c := client.New(base, client.WithAPIKey(os.Getenv("WAXSEAL_KEY")))
+
+	// call measures a request made with an independent deadline.
+	call := func(videoID string, d time.Duration) (*client.PlayerContext, error, time.Duration) {
+		ctx, cancel := context.WithTimeout(context.Background(), d)
+		defer cancel()
+		start := time.Now()
+		pc, err := c.PlayerContext(ctx, videoID)
+		return pc, err, time.Since(start)
+	}
+
+	requireUnavailable := func(t *testing.T, err error) {
+		t.Helper()
+		if err == nil {
+			t.Fatal("dead id returned no error")
+		}
+		apiErr, ok := errors.AsType[*client.APIError](err)
+		if !ok {
+			t.Fatalf("error = %T, want *client.APIError; the slow relaunch path likely timed out: %v", err, err)
+		}
+		if apiErr.StatusCode != http.StatusUnprocessableEntity {
+			t.Errorf("status = %d, want 422", apiErr.StatusCode)
+		}
+		if apiErr.Code != client.CodeVideoUnavailable {
+			t.Errorf("code = %q, want %q", apiErr.Code, client.CodeVideoUnavailable)
+		}
+		if apiErr.Details == "" {
+			t.Error("details is empty, want the playabilityStatus")
+		}
+	}
+
+	const deadID = "aaaaaaaaaaa" // well-formed but nonexistent
+
+	before := readEscalationMetrics(t, base)
+
+	// The first request must return a 422 without escalating. The 10-second
+	// deadline catches the old relaunch path, which took about 80 seconds.
+	_, err, elapsed := call(deadID, 10*time.Second)
+	requireUnavailable(t, err)
+	if elapsed > 9*time.Second {
+		t.Errorf("dead id took %v, want well under the 10s deadline", elapsed)
+	}
+	t.Logf("dead id -> 422 in %v", elapsed)
+
+	after := readEscalationMetrics(t, base)
+	if after.Generation != before.Generation {
+		t.Errorf("generation changed %d -> %d (a relaunch happened)", before.Generation, after.Generation)
+	}
+	if after.Attestations != before.Attestations {
+		t.Errorf("attestations changed %d -> %d (a re-attest happened)", before.Attestations, after.Attestations)
+	}
+	if after.Escalations != before.Escalations {
+		t.Errorf("escalations changed %d -> %d", before.Escalations, after.Escalations)
+	}
+	// player_context_failures counts failed attempts and negative-cache hits.
+	if after.PlayerContextFailures <= before.PlayerContextFailures {
+		t.Errorf("player_context_failures did not increase: %d -> %d", before.PlayerContextFailures, after.PlayerContextFailures)
+	}
+
+	// A repeat request should be served from the negative cache.
+	_, err2, elapsed2 := call(deadID, 10*time.Second)
+	requireUnavailable(t, err2)
+	if elapsed2 > 2*time.Second {
+		t.Errorf("negative-cache repeat took %v, want near-instant", elapsed2)
+	}
+	t.Logf("dead id repeat (negative cache) in %v", elapsed2)
+
+	// A valid ID immediately afterward must still establish.
+	pc, err3, _ := call(bbbVideoID, 90*time.Second)
+	if err3 != nil {
+		t.Fatalf("good id after dead id: %v", err3)
+	}
+	if pc.Status != "OK" {
+		t.Errorf("good id status = %q, want OK", pc.Status)
 	}
 }

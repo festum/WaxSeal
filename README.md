@@ -71,6 +71,11 @@ go run ./cmd/waxseal ping
 **visitor_data** for a GVS token. The token is bound to the minting host's egress
 IP, so the consumer must egress the **same IP** for the SABR media stage.
 
+The optional `scope` may be **`player`** or **`gvs`**. If omitted, WaxSeal uses
+the generic, bgutil-compatible cache key. The `content_binding` determines the
+token type; `scope` only distinguishes cache entries. An unknown scope returns
+`400 invalid-request`.
+
 ## Multi-tenant
 
 One Chromium hosts N isolated incognito **browser contexts**, one guest identity

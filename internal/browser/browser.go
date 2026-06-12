@@ -632,6 +632,10 @@ const playerReadyJS = `() => { const p = document.getElementById('movie_player')
 // playerLoadJS resets the player, applies the visibility overrides needed for
 // headless playback, and loads videoID. Resetting first prevents a repeated request
 // for the same video from observing buffered state from the previous request.
+//
+// Each load gets a new generation and clears the previous error marker. The
+// onError marker records both the generation and the player's video ID so late
+// errors from a previous load can be ignored.
 const playerLoadJS = `(videoId) => {
 	try {
 		try { Object.defineProperty(document, 'visibilityState', { get: () => 'visible', configurable: true }); } catch (e) {}
@@ -639,6 +643,21 @@ const playerLoadJS = `(videoId) => {
 		document.dispatchEvent(new Event('visibilitychange'));
 		const p = document.getElementById('movie_player');
 		if (!p || !p.loadVideoById) return false;
+		var gen = (window.__wsGen || 0) + 1;
+		window.__wsGen = gen;
+		window.__wsErr = null;
+		try { if (window.__wsErrH && p.removeEventListener) p.removeEventListener('onError', window.__wsErrH); } catch (e) {}
+		var handler = function (code) {
+			if (window.__wsGen !== gen) return;
+			// movie_player passes a number today, while the iframe API uses {data, target}.
+			// Accept both forms so a change in event shape does not disable fast failure.
+			var c = (code && typeof code === 'object') ? code.data : code;
+			var vid = '';
+			try { var vd = p.getVideoData && p.getVideoData(); vid = (vd && vd.video_id) || ''; } catch (e) {}
+			window.__wsErr = { gen: gen, code: Number(c), vid: vid };
+		};
+		window.__wsErrH = handler;
+		try { if (p.addEventListener) p.addEventListener('onError', handler); } catch (e) {}
 		try { if (p.stopVideo) p.stopVideo(); } catch (e) {}
 		p.loadVideoById(videoId);
 		return true;
@@ -658,23 +677,32 @@ const playerDriveJS = `() => {
 	return true;
 }`
 
-// playerContextExtractJS returns the player's context after videoID is loaded and
-// media has buffered. Pending and terminal results use the control fields consumed
-// by playerContextRaw.
+// playerContextExtractJS reads the player context and returns it once videoID has
+// loaded and media has buffered. Until then, it returns polling state and the
+// evidence confirmTerminal needs to reject stale errors from previous loads.
 const playerContextExtractJS = `(videoId) => {
 	try {
 		const c = (typeof ytcfg !== 'undefined' && ytcfg) ? ytcfg : window.ytcfg;
 		const p = document.getElementById('movie_player');
 		if (!p || !p.getPlayerResponse) return JSON.stringify({ error: 'player api unavailable' });
 		const j = p.getPlayerResponse();
-		if (!j || !j.videoDetails || j.videoDetails.videoId !== videoId) return JSON.stringify({ error: 'pending: player response not yet for ' + videoId });
-		const status = (j.playabilityStatus && j.playabilityStatus.status) || '';
-		if (status && status !== 'OK') return JSON.stringify({ error: 'unplayable: ' + status, status: status, terminal: true });
+		const errMark = window.__wsErr;
+		const status = (j && j.playabilityStatus && j.playabilityStatus.status) || '';
+		const evidence = {
+			status: status,
+			reason: (j && j.playabilityStatus && j.playabilityStatus.reason) || '',
+			error_code: (errMark && typeof errMark.code === 'number') ? errMark.code : 0,
+			err_gen_match: !!(errMark && errMark.gen === window.__wsGen),
+			err_video_id: (errMark && errMark.vid) || '',
+			video_id_match: !!(j && j.videoDetails && j.videoDetails.videoId === videoId),
+		};
+		if (!evidence.video_id_match) return JSON.stringify(Object.assign({ error: 'pending: player response not yet for ' + videoId }, evidence));
+		if (status && status !== 'OK') return JSON.stringify(Object.assign({ error: 'unplayable: ' + status }, evidence));
 		const sd = j.streamingData || {};
-		if (!sd.serverAbrStreamingUrl) return JSON.stringify({ error: 'pending: no serverAbrStreamingUrl', status: status });
+		if (!sd.serverAbrStreamingUrl) return JSON.stringify(Object.assign({ error: 'pending: no serverAbrStreamingUrl' }, evidence));
 		const v = document.querySelector('video');
 		const buffered = (v && v.buffered && v.buffered.length) ? v.buffered.end(v.buffered.length - 1) : 0;
-		if (buffered <= 0) return JSON.stringify({ error: 'pending: session not established (no buffered media yet)', status: status });
+		if (buffered <= 0) return JSON.stringify(Object.assign({ error: 'pending: session not established (no buffered media yet)' }, evidence));
 		const vd = j.videoDetails;
 		const urc = (j.playerConfig && j.playerConfig.mediaCommonConfig && j.playerConfig.mediaCommonConfig.mediaUstreamerRequestConfig) || {};
 		const ctxData = (c && c.get) ? c.get('INNERTUBE_CONTEXT') : null;
@@ -709,13 +737,9 @@ const playerContextExtractJS = `(videoId) => {
 	}
 }`
 
-// playerContextCleanupJS stops the muted playback loadVideoById started AND reverts
-// the visibility override, restoring the native Document.prototype getters so a later
-// Mint/Attest on this shared page sees the same (hidden) state it saw before
-// player-context ran (the known-good pre-feature state). delete removes the
-// own-property accessor; if for any reason it persists, redefine it to the
-// native-equivalent value as a last resort so the page never keeps reporting
-// 'visible' to YT telemetry.
+// playerContextCleanupJS stops playback and restores the page's native visibility
+// state before the shared page is reused. The fallback definitions keep the page
+// hidden if an own-property accessor cannot be deleted.
 const playerContextCleanupJS = `() => {
 	try { const p = document.getElementById('movie_player'); if (p && p.pauseVideo) p.pauseVideo(); } catch (e) {}
 	try {
@@ -729,11 +753,44 @@ const playerContextCleanupJS = `() => {
 	return true;
 }`
 
-// playerContextRaw adds polling state to the public player context.
+// playerContextRaw combines the public context with polling state and the evidence
+// used to reject stale player errors.
 type playerContextRaw struct {
 	PlayerContext
-	Error    string `json:"error"`
-	Terminal bool   `json:"terminal"` // a terminal playabilityStatus (unplayable; never retriable)
+	Error        string `json:"error"`
+	Reason       string `json:"reason"`         // playabilityStatus.reason, when present
+	ErrCode      int    `json:"error_code"`     // movie_player onError code; zero if none
+	ErrGenMatch  bool   `json:"err_gen_match"`  // error marker belongs to the current load generation
+	ErrVideoID   string `json:"err_video_id"`   // video reported by the player when onError fired
+	VideoIDMatch bool   `json:"video_id_match"` // player response belongs to the requested video
+}
+
+// confirmTerminal returns a terminal error only when the evidence belongs to
+// videoID. Requiring both generation and video ID for onError events prevents a
+// late error from a previous load from marking the current video unavailable. A
+// non-OK playability status is terminal only when its player response matches
+// videoID.
+func confirmTerminal(raw playerContextRaw, videoID string) (*UnplayableError, bool) {
+	if raw.ErrGenMatch && raw.ErrVideoID == videoID && isUnavailableCode(raw.ErrCode) {
+		return &UnplayableError{Status: "ERROR", Detail: fmt.Sprintf("player onError %d", raw.ErrCode)}, true
+	}
+	if raw.Status != "" && raw.Status != "OK" && raw.VideoIDMatch {
+		return &UnplayableError{Status: raw.Status, Detail: raw.Reason}, true
+	}
+	return nil, false
+}
+
+// isUnavailableCode reports whether a movie_player onError code describes a video
+// that cannot become playable on retry. Codes 2, 100, 101, and 150 cover invalid
+// IDs, missing videos, and playback restrictions. Recoverable and unknown errors
+// remain subject to the normal polling deadline.
+func isUnavailableCode(code int) bool {
+	switch code {
+	case 2, 100, 101, 150:
+		return true
+	default:
+		return false
+	}
 }
 
 // PlayerContext returns videoID's status-1 streaming context from the real player.
@@ -828,8 +885,8 @@ func (s *Session) establish(ctx context.Context, page *rod.Page, videoID string,
 		if err := json.Unmarshal([]byte(obj.Value.Str()), &raw); err != nil {
 			return playerContextRaw{}, fmt.Errorf("waxseal: player-context parse: %w", err)
 		}
-		if raw.Terminal {
-			return playerContextRaw{}, &UnplayableError{Status: raw.Status, Detail: raw.Error}
+		if ue, ok := confirmTerminal(raw, videoID); ok {
+			return playerContextRaw{}, ue
 		}
 		if raw.Error == "" {
 			return raw, nil // established context captured

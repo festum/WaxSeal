@@ -28,10 +28,8 @@ func newPlayerContextCmd() *cobra.Command {
 			"--video, and print its status-1 streaming context (server_abr_streaming_url +\n" +
 			"player_url + visitor_data + audio formats) as JSON. For a warm daemon, POST\n" +
 			"/player-context instead; a fresh browser per call is slow.",
-		Args:          cobra.NoArgs,
-		SilenceUsage:  true,
-		SilenceErrors: true,
-		RunE:          func(cmd *cobra.Command, _ []string) error { return runPlayerContext(cmd, &o) },
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error { return runPlayerContext(cmd, &o) },
 	}
 	f := c.Flags()
 	f.StringVar(&o.video, "video", "", "video_id to fetch the streaming context for (required)")
@@ -43,8 +41,10 @@ func newPlayerContextCmd() *cobra.Command {
 func runPlayerContext(cmd *cobra.Command, o *playerContextOpts) error {
 	stdout, stderr := cmd.OutOrStdout(), cmd.ErrOrStderr()
 	if o.video == "" {
-		fmt.Fprintln(stderr, "--video (the video_id) is required")
-		return fmt.Errorf("missing --video")
+		return &usageError{msg: "--video (the video_id) is required"}
+	}
+	if looksLikeURL(o.video) {
+		return &usageError{msg: "--video expects a video ID (e.g. dQw4w9WgXcQ), not a URL"}
 	}
 	level := "warn"
 	if o.verbose {
@@ -59,19 +59,16 @@ func runPlayerContext(cmd *cobra.Command, o *playerContextOpts) error {
 	// Park the session on the target video, then read its own status-1 context.
 	sess, err := browser.Launch(ctx, o.video, browser.Options{Headful: o.headful, NormalizeUA: !o.headful, Logger: logger})
 	if err != nil {
-		fmt.Fprintln(stderr, "FAIL: browser launch/identity:", err)
-		return err
+		return fmt.Errorf("browser launch/identity: %w", err)
 	}
 	defer sess.Close()
 
 	if err := sess.Attest(ctx); err != nil {
-		fmt.Fprintln(stderr, "FAIL: attestation:", err)
-		return err
+		return fmt.Errorf("attestation: %w", err)
 	}
 	pc, err := sess.PlayerContext(ctx, o.video)
 	if err != nil {
-		fmt.Fprintln(stderr, "FAIL: player-context:", err)
-		return err
+		return fmt.Errorf("player-context: %w", err)
 	}
 	enc := json.NewEncoder(stdout)
 	enc.SetIndent("", "  ")

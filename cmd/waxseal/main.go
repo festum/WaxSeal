@@ -5,10 +5,13 @@
 package main
 
 import (
+	"context"
 	"io"
 	"log/slog"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 
 	"github.com/spf13/cobra"
 )
@@ -17,9 +20,23 @@ import (
 var version = "dev"
 
 func main() {
-	if err := newRootCmd().Execute(); err != nil {
-		os.Exit(1)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	os.Exit(execute(ctx, os.Args[1:], os.Stdout, os.Stderr))
+}
+
+// execute runs the root command and returns its process exit code. The stdout and
+// stderr parameters let tests inspect output without spawning a process.
+func execute(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	root := newRootCmd()
+	root.SetArgs(args)
+	root.SetOut(stdout)
+	root.SetErr(stderr)
+	if err := root.ExecuteContext(ctx); err != nil {
+		renderError(stderr, err)
+		return exitCodeFor(err)
 	}
+	return 0
 }
 
 // newRootCmd assembles the command tree. The root runs generate mode, so
@@ -33,14 +50,18 @@ func newRootCmd() *cobra.Command {
 			"actual browser). With no subcommand it runs generate mode, compatible with\n" +
 			"bgutil's script provider: it prints the token as JSON on the last stdout line,\n" +
 			"or {} and a nonzero exit on failure. For yt-dlp, prefer `waxseal server`.",
-		Version:       version,
-		Args:          cobra.NoArgs,
-		SilenceUsage:  true,
-		SilenceErrors: true,
-		RunE:          func(cmd *cobra.Command, _ []string) error { return runGenerate(cmd, &g) },
+		Version: version,
+		Args:    cobra.NoArgs,
+		RunE:    func(cmd *cobra.Command, _ []string) error { return runGenerate(cmd, &g) },
 	}
 	bindGenerateFlags(root, &g)
 	root.AddCommand(newServerCmd(), newDoctorCmd(), newGetPotCmd(), newPingCmd(), newPlayerContextCmd())
+	// Cobra normally creates these commands during Execute. Initialize them before
+	// wrapping validators so their usage errors also exit with code 2.
+	root.InitDefaultHelpCmd()
+	root.InitDefaultCompletionCmd()
+	// Apply shared error handling after building the complete command tree.
+	wrapUsageErrors(root)
 	return root
 }
 

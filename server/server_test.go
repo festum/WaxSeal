@@ -65,6 +65,7 @@ func TestPlayerContextVideoID(t *testing.T) {
 		{name: "bad charset in body", body: `{"video_id":"bad id/../x"}`, wantOK: false, wantCode: http.StatusBadRequest},
 		{name: "bad charset in query", query: "?video_id=" + url.QueryEscape("a b!"), wantOK: false, wantCode: http.StatusBadRequest},
 		{name: "over length", body: `{"video_id":"` + strings.Repeat("a", 65) + `"}`, wantOK: false, wantCode: http.StatusBadRequest},
+		{name: "url rejected", body: `{"video_id":"https://youtu.be/x"}`, wantOK: false, wantCode: http.StatusBadRequest},
 		{name: "real id", body: `{"video_id":"aqz-KE-bpKQ"}`, wantID: "aqz-KE-bpKQ", wantOK: true},
 	}
 	for _, tt := range tests {
@@ -95,6 +96,28 @@ func TestPlayerContextVideoID(t *testing.T) {
 				t.Errorf("code = %q, want %q", env.Code, CodeInvalidRequest)
 			}
 		})
+	}
+}
+
+func TestNormalizeScope(t *testing.T) {
+	ok := map[string]string{
+		"":       "pot",
+		"pot":    "pot",
+		"player": "player",
+		"gvs":    "gvs",
+		" GVS ":  "gvs",
+		"Player": "player",
+	}
+	for in, want := range ok {
+		got, valid := normalizeScope(in)
+		if !valid || got != want {
+			t.Errorf("normalizeScope(%q) = (%q, %v), want (%q, true)", in, got, valid, want)
+		}
+	}
+	for _, bad := range []string{"garbagescope", "subtitles", "web", "sabr"} {
+		if got, valid := normalizeScope(bad); valid {
+			t.Errorf("normalizeScope(%q) = (%q, true), want rejected", bad, got)
+		}
 	}
 }
 

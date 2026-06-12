@@ -28,10 +28,8 @@ func newDoctorCmd() *cobra.Command {
 			"With --full, also verify that the browser can stream beyond the ~70s status-2\n" +
 			"preview cap. The report includes full_length_probe, and the command exits\n" +
 			"nonzero unless the probe verifies full-length streaming.",
-		Args:          cobra.NoArgs,
-		SilenceUsage:  true,
-		SilenceErrors: true,
-		RunE:          func(cmd *cobra.Command, _ []string) error { return runDoctor(cmd, &o) },
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error { return runDoctor(cmd, &o) },
 	}
 	f := c.Flags()
 	f.StringVar(&o.video, "video", browser.DefaultVideo, "landing video for the browser session")
@@ -55,14 +53,12 @@ func runDoctor(cmd *cobra.Command, o *doctorOpts) error {
 	}
 	sess, err := browser.Launch(ctx, o.video, browser.Options{Headful: o.headful, NormalizeUA: !o.headful, Logger: logger})
 	if err != nil {
-		fmt.Fprintln(stderr, "FAIL: browser launch/identity:", err)
-		return err
+		return fmt.Errorf("browser launch/identity: %w", err)
 	}
 	defer sess.Close()
 
 	if err := sess.Attest(ctx); err != nil {
-		fmt.Fprintln(stderr, "FAIL: attestation:", err)
-		return err
+		return fmt.Errorf("attestation: %w", err)
 	}
 	kind := sess.AttestKind()
 	report := map[string]any{
@@ -83,23 +79,25 @@ func runDoctor(cmd *cobra.Command, o *doctorOpts) error {
 	enc.SetIndent("", "  ")
 	_ = enc.Encode(report)
 
-	if kind != "integrity" {
-		fmt.Fprintf(stderr, "WARN: attest grade is %q, not integrity\n", kind)
-	}
 	if o.full {
-		// A successful full-length probe is stronger evidence than the attest grade.
+		// A successful full-length probe is stronger evidence than the
+		// attestation grade.
 		if probeErr != nil {
-			fmt.Fprintln(stderr, "FAIL: full-length probe:", probeErr)
-			return probeErr
+			return fmt.Errorf("full-length probe: %w", probeErr)
 		}
 		if probe.Outcome != browser.OutcomeFullLength {
-			fmt.Fprintf(stderr, "WARN: full-length not verified (outcome %q): %s\n", probe.Outcome, probe.Reason)
-			return fmt.Errorf("full-length not verified: %s", probe.Outcome)
+			return fmt.Errorf("full-length not verified (outcome %q): %s", probe.Outcome, probe.Reason)
+		}
+		// Once full-length playback is verified, a non-integrity attestation grade
+		// is informational rather than fatal.
+		if kind != "integrity" {
+			fmt.Fprintf(stderr, "waxseal: note: attestation grade is %q, but full-length streaming was verified\n", kind)
 		}
 		return nil
 	}
+	// Without the full-length probe, require an integrity attestation.
 	if kind != "integrity" {
-		return fmt.Errorf("no integrity grant")
+		return fmt.Errorf("attestation grade is %q, not integrity", kind)
 	}
 	return nil
 }

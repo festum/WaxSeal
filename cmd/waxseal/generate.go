@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -30,26 +31,24 @@ func bindGenerateFlags(cmd *cobra.Command, g *genOpts) {
 func newGetPotCmd() *cobra.Command {
 	var g genOpts
 	c := &cobra.Command{
-		Use:           "get-pot",
-		Short:         "Generate a PO token (alias for the default command)",
-		Args:          cobra.NoArgs,
-		SilenceUsage:  true,
-		SilenceErrors: true,
-		RunE:          func(cmd *cobra.Command, _ []string) error { return runGenerate(cmd, &g) },
+		Use:   "get-pot",
+		Short: "Generate a PO token (alias for the default command)",
+		Args:  cobra.NoArgs,
+		RunE:  func(cmd *cobra.Command, _ []string) error { return runGenerate(cmd, &g) },
 	}
 	bindGenerateFlags(c, &g)
 	return c
 }
 
 // runGenerate launches a browser, attests, mints one token, and prints JSON on
-// the last stdout line. On failure it prints "{}" and returns a nonzero exit.
+// the last stdout line. On failure it prints "{}" to satisfy the bgutil
+// script-provider contract, then returns the error for centralized reporting.
 // (One-shot launches a fresh browser each call; for yt-dlp use `waxseal server`.)
 func runGenerate(cmd *cobra.Command, g *genOpts) error {
 	stdout, stderr := cmd.OutOrStdout(), cmd.ErrOrStderr()
 	if g.contentBinding == "" {
 		fmt.Fprintln(stdout, "{}")
-		fmt.Fprintln(stderr, "content-binding (-c) is required")
-		return fmt.Errorf("missing content-binding")
+		return errors.New("content-binding (-c) is required")
 	}
 	level := "error"
 	if g.verbose {
@@ -64,7 +63,6 @@ func runGenerate(cmd *cobra.Command, g *genOpts) error {
 	sess, err := browser.Launch(ctx, g.video, browser.Options{Headful: g.headful, NormalizeUA: !g.headful, Logger: logger})
 	if err != nil {
 		fmt.Fprintln(stdout, "{}")
-		logger.Error("launch", "err", err)
 		return err
 	}
 	defer sess.Close()
@@ -72,7 +70,6 @@ func runGenerate(cmd *cobra.Command, g *genOpts) error {
 	res, err := sess.Mint(ctx, g.contentBinding)
 	if err != nil {
 		fmt.Fprintln(stdout, "{}")
-		logger.Error("mint", "err", err)
 		return err
 	}
 	expires := time.Now().Add(6 * time.Hour)
