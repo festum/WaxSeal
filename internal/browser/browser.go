@@ -16,6 +16,7 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/colespringer/waxseal/internal/botguard"
@@ -38,6 +39,18 @@ const playerContextTimeout = 25 * time.Second
 
 // playerContextPollInterval paces the player-context polling loops.
 const playerContextPollInterval = 300 * time.Millisecond
+
+// Pool recovery timings. The liveness timeout allows for a busy host, while the
+// capped relaunch backoff limits process creation during a crash loop.
+const (
+	aliveProbeTimeout   = 5 * time.Second
+	relaunchBackoffBase = 10 * time.Second
+	relaunchBackoffMax  = 60 * time.Second
+	teardownTimeout     = 5 * time.Second
+	// relaunchStableWindow must exceed relaunchBackoffMax so waiting through the
+	// maximum backoff does not reset the streak during a crash loop.
+	relaunchStableWindow = 2 * relaunchBackoffMax
+)
 
 // ErrUnplayable marks a terminal playabilityStatus. The minter caches this error
 // instead of relaunching and attesting again.
@@ -93,6 +106,12 @@ type Session struct {
 	id      Identity
 	client  *httpx.Client // egresses with the browser's cookies
 	log     *slog.Logger
+
+	// landingVideo is the watch video used to initialize the session. Establishment
+	// falls back to DefaultVideo when this video is too short for the proof.
+	landingVideo string
+	// establishedStreaming is written only while the minter holds its page lock.
+	establishedStreaming bool
 
 	// One attestation installs a warm minter that mints many identifiers: a player
 	// token bound to a video_id, or a GVS token bound to a visitor_data.
@@ -274,7 +293,7 @@ func secureLeaklessDir() error {
 // the bundle, and builds the HTTP client. dispose is left for the caller to set.
 // On error the caller is responsible for teardown.
 func setupSession(ctx context.Context, browser *rod.Browser, videoID string, opts Options) (_ *Session, err error) {
-	s := &Session{browser: browser, log: opts.Logger}
+	s := &Session{browser: browser, log: opts.Logger, landingVideo: videoID}
 
 	page, err := browser.Page(proto.TargetCreateTarget{URL: "about:blank"})
 	if err != nil {
@@ -333,35 +352,122 @@ func setupSession(ctx context.Context, browser *rod.Browser, videoID string, opt
 	return s, nil
 }
 
+// errPoolClosed is returned when a pool operation runs after Close.
+var errPoolClosed = errors.New("waxseal: browser pool is closed")
+
+// browserInstance groups a Chromium connection with the resources that must be
+// released with it. Pool relaunches replace the entire instance.
+type browserInstance struct {
+	browser      *rod.Browser
+	launcher     *launcher.Launcher
+	profile      string
+	onTeardown   func()    // test hook; nil in production
+	teardownOnce sync.Once // teardown runs at most once even if Close races a relaunch
+}
+
+// teardown closes the browser, kills the launcher, and removes the profile. The
+// bounded browser close prevents a stalled CDP connection from blocking recovery.
+// teardown is idempotent and accepts partially initialized instances.
+func (i *browserInstance) teardown() {
+	if i == nil {
+		return
+	}
+	i.teardownOnce.Do(func() {
+		if i.browser != nil {
+			tctx, cancel := context.WithTimeout(context.Background(), teardownTimeout)
+			_ = i.browser.Context(tctx).Close()
+			cancel()
+		}
+		if i.launcher != nil {
+			i.launcher.Kill()
+		}
+		if i.profile != "" {
+			_ = os.RemoveAll(i.profile)
+		}
+		if i.onTeardown != nil {
+			i.onTeardown()
+		}
+	})
+}
+
+// launchInstance launches Chromium and groups its resources for teardown.
+func launchInstance(opts Options) (*browserInstance, error) {
+	b, l, profile, err := launchChromium(opts)
+	if err != nil {
+		return nil, err
+	}
+	return &browserInstance{browser: b, launcher: l, profile: profile}, nil
+}
+
 // Pool owns one Chromium and creates isolated incognito-context Sessions. Each
 // session has its own guest identity, cookies, and storage. All sessions share
 // the browser's egress IP.
+//
+// If Chromium dies, the next NewSession attempts to relaunch it. Concurrent
+// callers share one relaunch, and repeated relaunches are subject to a capped
+// backoff.
 type Pool struct {
-	browser  *rod.Browser
-	launcher *launcher.Launcher
-	profile  string
-	opts     Options
+	opts Options
+
+	// Tests replace newInstance to exercise recovery without launching Chromium.
+	newInstance func() (*browserInstance, error)
+
+	mu             sync.Mutex
+	cur            *browserInstance
+	closed         bool
+	relaunching    chan struct{} // non-nil while a relaunch is in progress
+	lastRelaunchAt time.Time     // start time of the last relaunch attempt
+	relaunchStreak int           // consecutive relaunches within the stability window
 }
 
 // LaunchPool starts the shared Chromium. Close it to tear everything down.
 func LaunchPool(opts Options) (*Pool, error) {
 	opts = withDefaults(opts)
-	browser, l, profile, err := launchChromium(opts)
+	p := &Pool{opts: opts, newInstance: func() (*browserInstance, error) { return launchInstance(opts) }}
+	inst, err := p.newInstance()
 	if err != nil {
 		return nil, err
 	}
-	return &Pool{browser: browser, launcher: l, profile: profile, opts: opts}, nil
+	p.cur = inst
+	return p, nil
+}
+
+// acquire returns the current instance unless the pool is closed.
+func (p *Pool) acquire() (*browserInstance, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed || p.cur == nil {
+		return nil, errPoolClosed
+	}
+	return p.cur, nil
 }
 
 // NewSession creates a fresh isolated browser context and parks a Session in it.
-// Closing the Session disposes its context without closing the shared browser.
+// Closing the Session disposes its context without closing the shared browser. If
+// the shared Chromium has died, NewSession relaunches it once and retries.
 func (p *Pool) NewSession(ctx context.Context, videoID string) (*Session, error) {
-	incog, err := p.browser.Incognito()
+	inst, err := p.acquire()
 	if err != nil {
-		return nil, fmt.Errorf("waxseal: new browser context: %w", err)
+		return nil, err
 	}
-	cid := incog.BrowserContextID
-	dispose := func() { _ = proto.TargetDisposeBrowserContext{BrowserContextID: cid}.Call(p.browser) }
+	incog, err := inst.browser.Incognito()
+	if err != nil {
+		// Relaunch only when the context error came from a dead browser.
+		if browserAlive(inst.browser) {
+			return nil, fmt.Errorf("waxseal: new browser context: %w", err)
+		}
+		p.opts.Logger.Warn("waxseal: pooled chromium is unreachable; relaunching", "err", err)
+		inst, err = p.relaunch(inst)
+		if err != nil {
+			return nil, err
+		}
+		if incog, err = inst.browser.Incognito(); err != nil {
+			return nil, fmt.Errorf("waxseal: new browser context after relaunch: %w", err)
+		}
+	}
+	// Incognito copies the browser connection by value. Closing this copy disposes
+	// the original context without affecting a replacement pool instance.
+	dispose := func() { _ = incog.Close() }
 	s, err := setupSession(ctx, incog, videoID, p.opts)
 	if err != nil {
 		dispose()
@@ -371,20 +477,118 @@ func (p *Pool) NewSession(ctx context.Context, videoID string) (*Session, error)
 	return s, nil
 }
 
-// Close tears down the shared browser and removes the temp profile.
+// browserAlive reports whether the browser answers a CDP Version request within
+// aliveProbeTimeout.
+func browserAlive(b *rod.Browser) bool {
+	actx, cancel := context.WithTimeout(context.Background(), aliveProbeTimeout)
+	defer cancel()
+	_, err := b.Context(actx).Version()
+	return err == nil
+}
+
+// relaunch replaces stale with a new browser instance. Concurrent callers that
+// observed the same stale instance wait for the same relaunch.
+//
+// Attempts are counted before launch so the backoff also covers browsers that
+// start successfully and die during session setup. The streak resets only after
+// relaunchStableWindow without another relaunch.
+func (p *Pool) relaunch(stale *browserInstance) (*browserInstance, error) {
+	for {
+		p.mu.Lock()
+		if p.closed {
+			p.mu.Unlock()
+			return nil, errPoolClosed
+		}
+		if p.cur != stale {
+			cur := p.cur // Another caller replaced the stale instance.
+			p.mu.Unlock()
+			return cur, nil
+		}
+		if p.relaunching != nil {
+			ch := p.relaunching
+			p.mu.Unlock()
+			<-ch // Wait for the in-progress relaunch, then check again.
+			continue
+		}
+		now := time.Now()
+		// A browser that survives the stability window starts a new backoff streak.
+		if !p.lastRelaunchAt.IsZero() && now.Sub(p.lastRelaunchAt) >= relaunchStableWindow {
+			p.relaunchStreak = 0
+		}
+		if p.relaunchStreak > 0 {
+			if wait := p.lastRelaunchAt.Add(p.backoffWindow()).Sub(now); wait > 0 {
+				streak := p.relaunchStreak
+				p.mu.Unlock()
+				return nil, fmt.Errorf("waxseal: pooled chromium relaunch backing off %s after %d consecutive relaunches", wait.Round(time.Second), streak)
+			}
+		}
+		// Count the attempt before launching so an immediate post-launch crash
+		// increases the next backoff.
+		p.relaunchStreak++
+		p.lastRelaunchAt = now
+		ch := make(chan struct{})
+		p.relaunching = ch
+		p.mu.Unlock()
+
+		stale.teardown()
+		inst, lerr := p.newInstance()
+
+		p.mu.Lock()
+		p.relaunching = nil
+		close(ch)
+		if lerr != nil {
+			p.mu.Unlock()
+			return nil, fmt.Errorf("waxseal: relaunch chromium: %w", lerr)
+		}
+		if p.closed {
+			p.mu.Unlock()
+			inst.teardown() // Close won the race; discard the replacement.
+			return nil, errPoolClosed
+		}
+		p.cur = inst
+		p.mu.Unlock()
+		return inst, nil
+	}
+}
+
+// CurrentLauncherPID returns the process ID of the current Chromium launcher, or
+// 0 if no launcher is available.
+func (p *Pool) CurrentLauncherPID() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.cur == nil || p.cur.launcher == nil {
+		return 0
+	}
+	return p.cur.launcher.PID()
+}
+
+// backoffWindow returns the capped exponential delay for relaunchStreak.
+func (p *Pool) backoffWindow() time.Duration {
+	backoff := relaunchBackoffBase
+	for i := 1; i < p.relaunchStreak; i++ {
+		if backoff *= 2; backoff >= relaunchBackoffMax {
+			return relaunchBackoffMax
+		}
+	}
+	return backoff
+}
+
+// Close tears down the shared browser and removes its temporary profile. A
+// concurrent relaunch may finish, but its replacement is discarded.
 func (p *Pool) Close() {
 	if p == nil {
 		return
 	}
-	if p.browser != nil {
-		_ = p.browser.Close()
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return
 	}
-	if p.launcher != nil {
-		p.launcher.Kill()
-	}
-	if p.profile != "" {
-		_ = os.RemoveAll(p.profile)
-	}
+	p.closed = true
+	inst := p.cur
+	p.cur = nil
+	p.mu.Unlock()
+	inst.teardown()
 }
 
 // captureIdentity polls ytcfg after the SPA boots and records visitor_data, the
@@ -537,10 +741,10 @@ func (s *Session) Identity() Identity { return s.id }
 //
 // It reads the browser-level cookie store because page-level reads can be empty
 // after the page leaves youtube.com.
-func (s *Session) BrowserCookies() []*http.Cookie {
+func (s *Session) BrowserCookies() ([]*http.Cookie, error) {
 	cs, err := s.browser.GetCookies()
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("waxseal: read browser cookies: %w", err)
 	}
 	out := make([]*http.Cookie, 0, len(cs))
 	for _, c := range cs {
@@ -552,11 +756,18 @@ func (s *Session) BrowserCookies() []*http.Cookie {
 			Secure: c.Secure, HttpOnly: c.HTTPOnly,
 		})
 	}
-	return out
+	return out, nil
 }
 
 // Page returns the underlying rod page used by the minter's crash watcher.
 func (s *Session) Page() *rod.Page { return s.page }
+
+// Ping checks whether the session page answers a CDP request. It does not mint or
+// establish the session.
+func (s *Session) Ping(ctx context.Context) error {
+	_, err := s.page.Context(ctx).Eval(`() => true`)
+	return err
+}
 
 // MintResult is one mint outcome: the token, whether it came from the integrity
 // or fallback path, and its binding.
@@ -804,11 +1015,12 @@ const playerContextExtractJS = `(videoId) => {
 	}
 }`
 
-// playerContextCleanupJS stops playback and restores the page's native visibility
-// state before the shared page is reused. The fallback definitions keep the page
-// hidden if an own-property accessor cannot be deleted.
+// playerContextCleanupJS stops playback to release buffered media and restores
+// the page's native visibility state before the shared page is reused. The
+// fallback definitions keep the page hidden if an own-property accessor cannot be
+// deleted.
 const playerContextCleanupJS = `() => {
-	try { const p = document.getElementById('movie_player'); if (p && p.pauseVideo) p.pauseVideo(); } catch (e) {}
+	try { const p = document.getElementById('movie_player'); if (p && p.stopVideo) p.stopVideo(); } catch (e) {}
 	try {
 		delete document.visibilityState;
 		if (Object.getOwnPropertyDescriptor(document, 'visibilityState')) Object.defineProperty(document, 'visibilityState', { get: () => 'hidden', configurable: true });
@@ -866,6 +1078,12 @@ func isUnavailableCode(code int) bool {
 // A terminal playabilityStatus returns ErrUnplayable. Playback and visibility
 // changes are reverted before the shared page is reused.
 func (s *Session) PlayerContext(ctx context.Context, videoID string) (PlayerContext, error) {
+	// A cold status-2 stream can buffer within the preview window. Seek past the
+	// cap before returning a context claimed to support full-length streaming.
+	if err := s.EnsureEstablished(ctx); err != nil {
+		return PlayerContext{}, err
+	}
+
 	page := s.page.Context(ctx)
 	defer s.revertPlayerContext(ctx)
 
@@ -970,6 +1188,8 @@ const (
 	fullLengthTolSecs      = 2.0              // required buffered media after the target
 	fullLengthProbeBudget  = 30 * time.Second // maximum time spent after establishment
 	fullLengthStallWindow  = 8 * time.Second  // maximum time without playback progress
+	// fullLengthHardTimeout bounds the entire proof when the caller has no deadline.
+	fullLengthHardTimeout = 60 * time.Second
 )
 
 const (
@@ -1037,17 +1257,55 @@ type FullLengthProbe struct {
 	ContextURLChanged bool    `json:"context_url_changed"` // whether serverAbrStreamingUrl changed during the probe
 }
 
+// EnsureEstablished proves once per session that playback can advance beyond the
+// status-2 preview cap.
+//
+// The proof uses the landing video first and retries with DefaultVideo if the
+// landing video is too short. Successful establishment applies to later videos
+// requested through the same session.
+//
+// proveFullLength restores the shared page before returning.
+func (s *Session) EnsureEstablished(ctx context.Context) error {
+	if s.establishedStreaming {
+		return nil
+	}
+	probe, err := s.proveFullLength(ctx, s.landingVideo)
+	if err != nil {
+		return err
+	}
+	if probe.Outcome == OutcomeVideoTooShort && s.landingVideo != DefaultVideo {
+		s.log.Info("waxseal: landing video too short to prove establishment; proving on the default video",
+			"landing", s.landingVideo, "proof", DefaultVideo)
+		if probe, err = s.proveFullLength(ctx, DefaultVideo); err != nil {
+			return err
+		}
+	}
+	if probe.Outcome != OutcomeFullLength {
+		return fmt.Errorf("waxseal: session not established: full-length proof outcome %q: %s", probe.Outcome, probe.Reason)
+	}
+	s.establishedStreaming = true
+	return nil
+}
+
 // VerifyFullLength checks whether the attested browser can stream beyond the
-// roughly 70-second status-2 preview cap. It establishes a player context, seeks
-// beyond the cap, and requires playback progress and buffered media at the target.
+// roughly 70-second status-2 preview cap.
+func (s *Session) VerifyFullLength(ctx context.Context, videoID string) (FullLengthProbe, error) {
+	return s.proveFullLength(ctx, videoID)
+}
+
+// proveFullLength establishes a player context, seeks beyond the cap, and
+// requires playback progress and buffered media at the target.
 //
 // A negative result does not prove that status-2 caused the failure. Reason
 // records the observed establishment failure, player error, stall, or timeout.
-// The returned error is non-nil only when the caller's context is canceled.
+// The returned error is non-nil only when the context is canceled or the hard
+// timeout expires.
 //
 // The probe seeks and drives playback, so it should be run on demand rather than
 // as a frequent health check.
-func (s *Session) VerifyFullLength(ctx context.Context, videoID string) (FullLengthProbe, error) {
+func (s *Session) proveFullLength(ctx context.Context, videoID string) (FullLengthProbe, error) {
+	ctx, cancelHard := context.WithTimeout(ctx, fullLengthHardTimeout)
+	defer cancelHard()
 	page := s.page.Context(ctx)
 	defer s.revertPlayerContext(ctx)
 

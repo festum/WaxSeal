@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"os"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -25,25 +24,50 @@ import (
 
 // These manual e2e tests require Chromium and network access. Unless WAXSEAL_URL
 // names an external daemon, each test starts a fresh daemon and browser session.
-// Big Buck Bunny is used under its Creative Commons license.
+// Big Buck Bunny is used under its Creative Commons license; the other IDs are
+// long public videos used only to seek past the status-2 preview cap.
 const (
-	bbbVideoID       = "aqz-KE-bpKQ"
+	bbbVideoID       = "aqz-KE-bpKQ" // Big Buck Bunny, approximately 635 seconds
 	bbbURL           = "https://www.youtube.com/watch?v=" + bbbVideoID
-	bbbContentLength = 30767611 // approximate reference size for logs
-	fullLengthFloor  = 8 << 20  // safely beyond BBB's roughly 1 MB status-2 preview
+	bbbContentLength = 30767611      // approximate reference size for logs
+	robPikeVideoID   = "rFejpH_tAHM" // different long video, approximately 1,391 seconds
+	robPikeURL       = "https://www.youtube.com/watch?v=" + robPikeVideoID
+	shortVideoID     = "jNQXAC9IVRw" // "Me at the zoo", approximately 19 seconds
+	shortURL         = "https://www.youtube.com/watch?v=" + shortVideoID
+	fullLengthFloor  = 8 << 20 // safely beyond a status-2 preview of a long video
+
+	clientWebContext = "WEB_CONTEXT" // info.Client when the attested player-context path is used
+	clientWeb        = "WEB"         // info.Client for the plain WEB chain
 )
 
-// startColdDaemon starts an isolated in-process daemon or uses WAXSEAL_URL when
-// set. Another process may claim the selected loopback port before server startup.
-// waitDaemonReady reports that failure. Teardown is registered before startup so
-// failures still close the browser.
+// startColdDaemon uses WAXSEAL_URL when set. Otherwise, it starts an isolated
+// keyless daemon and warms one session.
+//
+// The in-process path omits SelfTest so the first endpoint call exercises on-demand
+// establishment.
 func startColdDaemon(t *testing.T) string {
 	t.Helper()
 	if ext := os.Getenv("WAXSEAL_URL"); ext != "" {
 		t.Logf("using external daemon at %s (WAXSEAL_URL)", ext)
 		return ext
 	}
+	srv, addr := newInProcessDaemon(t, server.Config{})
+	warmCtx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	if err := srv.Warm(warmCtx, ""); err != nil {
+		t.Fatalf("warm cold daemon (browser attest): %v", err)
+	}
+	go func() { _ = srv.ListenAndServe() }()
+	base := "http://" + addr
+	waitDaemonReady(t, base)
+	return base
+}
 
+// newInProcessDaemon selects a loopback address and registers server cleanup. The
+// address is not reserved after selection, so waitDaemonReady reports any bind
+// failure. The caller is responsible for warming and serving the daemon.
+func newInProcessDaemon(t *testing.T, cfg server.Config) (*server.Server, string) {
+	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("grab free port: %v", err)
@@ -51,28 +75,17 @@ func startColdDaemon(t *testing.T) string {
 	addr := ln.Addr().String()
 	_ = ln.Close()
 
-	srv, err := server.New(server.Config{Addr: addr})
+	cfg.Addr = addr
+	srv, err := server.New(cfg)
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}
-	// Register teardown before Warm/readiness so a t.Fatalf in either path still
-	// shuts down the launched browser instead of leaking it.
 	t.Cleanup(func() {
 		shutCtx, c := context.WithTimeout(context.Background(), 10*time.Second)
 		defer c()
 		_ = srv.Shutdown(shutCtx)
 	})
-
-	warmCtx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-	defer cancel()
-	if err := srv.Warm(warmCtx, ""); err != nil {
-		t.Fatalf("warm cold daemon (browser attest): %v", err)
-	}
-	go func() { _ = srv.ListenAndServe() }()
-
-	base := "http://" + addr
-	waitDaemonReady(t, base)
-	return base
+	return srv, addr
 }
 
 // waitDaemonReady waits for the server goroutine to bind its listener.
@@ -116,8 +129,8 @@ func playerContexts(t *testing.T, base string) int64 {
 	return total
 }
 
-// classifyStream uses the reported content length when available and a conservative
-// byte threshold otherwise.
+// classifyStream uses the reported content length when available and a
+// conservative byte threshold otherwise.
 func classifyStream(n, contentLength int64) string {
 	if contentLength > 0 {
 		if n >= int64(0.98*float64(contentLength)) {
@@ -131,98 +144,76 @@ func classifyStream(n, contentLength int64) string {
 	return "capped"
 }
 
-// TestPlayerContextFullLengthHTTP verifies both full-length streaming and use of
-// the player-context path. A successful fallback stream could also be full length,
-// so byte count alone is insufficient.
-func TestPlayerContextFullLengthHTTP(t *testing.T) {
-	base := startColdDaemon(t)
-
-	p := provider.New(client.New(base, client.WithAPIKey(os.Getenv("WAXSEAL_KEY"))))
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-
-	sess, err := p.Session(ctx)
-	if err != nil {
-		t.Fatalf("session handoff: %v", err)
-	}
-	if sess.VisitorData == "" {
-		t.Fatalf("daemon returned an empty visitor_data")
-	}
-
-	// Count calls to distinguish this path from a successful fallback.
-	var pcCalls atomic.Int64
-	countingPC := potoken.PlayerContextProviderFunc(func(ctx context.Context, videoID string) (potoken.PlayerContext, error) {
-		pcCalls.Add(1)
-		return p.ProvidePlayerContext(ctx, videoID)
-	})
-
-	var mu sync.Mutex
-	var fellBack bool
+// streamWEBContext streams through the attested player-context path and reports
+// whether WaxTap fell back to plain WEB.
+func streamWEBContext(t *testing.T, ctx context.Context, p *provider.Provider, sess *potoken.Session, videoURL string) (int64, waxtap.StreamInfo, bool) {
+	t.Helper()
+	var fellBack atomic.Bool
 	capture := func(ev waxtap.Event) {
 		if ev.Stage == waxtap.StageWarning && ev.Warning != nil && ev.Warning.Code == waxtap.WarnWebContextFallback {
-			mu.Lock()
-			fellBack = true
-			mu.Unlock()
+			fellBack.Store(true)
 		}
 	}
-
-	pcBefore := playerContexts(t, base)
-
 	jar, _ := cookiejar.New(nil)
 	tap, err := waxtap.New(waxtap.Options{
 		HTTPClient:            &http.Client{Jar: jar, Timeout: 120 * time.Second},
-		POTokenProvider:       p,          // GVS PO token for the WEB stream (required alongside a PC provider)
-		PlayerContextProvider: countingPC, // the opt-in WEB SABR path under test
-		Session:               sess,       // adopt the coherent identity unchanged
-		Client:                "WEB",      // uniform chain (required for session adoption); also the fallback
+		POTokenProvider:       p, // GVS token required by the WEB context
+		PlayerContextProvider: p, // attested WEB SABR path under test
+		Session:               sess,
+		Client:                clientWeb, // the fallback chain; the PC path is preferred
 	})
 	if err != nil {
 		t.Fatalf("waxtap.New: %v", err)
 	}
-
-	rc, info, err := tap.Stream(ctx, waxtap.Request{
-		URL:         bbbURL,
-		ProcessSpec: waxtap.ProcessSpec{Events: capture},
-	})
+	rc, info, err := tap.Stream(ctx, waxtap.Request{URL: videoURL, ProcessSpec: waxtap.ProcessSpec{Events: capture}})
 	if err != nil {
-		t.Fatalf("stream: %v", err)
+		t.Fatalf("stream %s: %v", videoURL, err)
 	}
 	defer rc.Close()
-
 	n, rerr := io.Copy(io.Discard, rc)
 	if rerr != nil {
-		t.Fatalf("read stream: %v", rerr)
+		t.Fatalf("read stream %s: %v", videoURL, rerr)
 	}
-
-	if got := pcCalls.Load(); got < 1 {
-		t.Errorf("ProvidePlayerContext was not called (count=%d)", got)
-	}
-	mu.Lock()
-	fb := fellBack
-	mu.Unlock()
-	if fb {
-		t.Errorf("WEB player-context fell back (WarnWebContextFallback emitted); the player-context path did not hold")
-	}
-	if pcAfter := playerContexts(t, base); pcAfter <= pcBefore {
-		t.Errorf("player_contexts did not increase across the call: before=%d after=%d", pcBefore, pcAfter)
-	}
-	// Content length can be under-reported, so only enforce lower bounds.
-	if n <= fullLengthFloor {
-		t.Errorf("streamed only %d bytes (<= %d floor); expected full-length past the ~70s cap", n, fullLengthFloor)
-	}
-	if info.ContentLength > 0 && n < int64(0.98*float64(info.ContentLength)) {
-		t.Errorf("streamed %d bytes < 98%% of contentLength %d", n, info.ContentLength)
-	}
-	t.Logf("full-length stream: %d bytes (%s; contentLength=%d, reference=%d), ProvidePlayerContext calls=%d",
-		n, classifyStream(n, info.ContentLength), info.ContentLength, bbbContentLength, pcCalls.Load())
+	return n, info, fellBack.Load()
 }
 
-// TestPlainWEBBaselineHTTP records the result of the plain WEB path without a
-// player context. A capped stream is valid on an unfavored egress. Set
-// WAXSEAL_EXPECT_PLAIN to "full" or "capped" to enforce a known environment.
-func TestPlainWEBBaselineHTTP(t *testing.T) {
-	base := startColdDaemon(t)
+// requireFullLength asserts a long-video stream cleared the status-2 preview cap.
+func requireFullLength(t *testing.T, n int64, info waxtap.StreamInfo, label string) {
+	t.Helper()
+	if n <= fullLengthFloor {
+		t.Errorf("%s: streamed only %d bytes (<= %d floor); expected data past the roughly 70-second cap", label, n, fullLengthFloor)
+	}
+	if info.ContentLength > 0 && n < int64(0.98*float64(info.ContentLength)) {
+		t.Errorf("%s: streamed %d bytes < 98%% of contentLength %d", label, n, info.ContentLength)
+	}
+}
 
+// The player-context path must stream full length without an adopted session.
+func TestPlayerContextOnlyFullLengthHTTP(t *testing.T) {
+	base := startColdDaemon(t)
+	p := provider.New(client.New(base, client.WithAPIKey(os.Getenv("WAXSEAL_KEY"))))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	pcBefore := playerContexts(t, base)
+	n, info, fellBack := streamWEBContext(t, ctx, p, nil, bbbURL)
+	if fellBack {
+		t.Errorf("WEB player-context fell back without an adopted session")
+	}
+	if info.Client != clientWebContext {
+		t.Errorf("info.Client = %q, want %q (the player-context path)", info.Client, clientWebContext)
+	}
+	if pcAfter := playerContexts(t, base); pcAfter <= pcBefore {
+		t.Errorf("player_contexts did not increase: before=%d after=%d", pcBefore, pcAfter)
+	}
+	requireFullLength(t, n, info, "player-context only")
+	t.Logf("player-context only: %d bytes (%s; contentLength=%d, reference=%d)", n, classifyStream(n, info.ContentLength), info.ContentLength, bbbContentLength)
+}
+
+// An adopted session and GVS token must stream full length without a
+// player-context provider.
+func TestSessionOnlyFullLengthHTTP(t *testing.T) {
+	base := startColdDaemon(t)
 	p := provider.New(client.New(base, client.WithAPIKey(os.Getenv("WAXSEAL_KEY"))))
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -238,38 +229,129 @@ func TestPlainWEBBaselineHTTP(t *testing.T) {
 	jar, _ := cookiejar.New(nil)
 	tap, err := waxtap.New(waxtap.Options{
 		HTTPClient:      &http.Client{Jar: jar, Timeout: 120 * time.Second},
-		POTokenProvider: p,     // GVS PO token only; no player-context provider
-		Session:         sess,  // adopt the coherent identity verbatim
-		Client:          "WEB", // uniform client chain is required for session adoption
+		POTokenProvider: p,         // GVS token only; no player-context provider
+		Session:         sess,      // adopt the established identity
+		Client:          clientWeb, // uniform client chain is required for session adoption
 	})
 	if err != nil {
 		t.Fatalf("waxtap.New: %v", err)
 	}
-
 	rc, info, err := tap.Stream(ctx, waxtap.Request{URL: bbbURL})
 	if err != nil {
 		t.Fatalf("stream: %v", err)
 	}
 	defer rc.Close()
-
 	n, rerr := io.Copy(io.Discard, rc)
 	if rerr != nil {
 		t.Fatalf("read stream: %v", rerr)
 	}
-	if n <= 0 {
-		t.Fatalf("stream yielded no bytes (info=%+v)", info)
+	if info.Client != clientWeb {
+		t.Errorf("info.Client = %q, want %q (plain WEB)", info.Client, clientWeb)
 	}
+	requireFullLength(t, n, info, "session only")
+	t.Logf("session only: %d bytes (%s; contentLength=%d)", n, classifyStream(n, info.ContentLength), info.ContentLength)
+}
 
-	classification := classifyStream(n, info.ContentLength)
-	t.Logf("plain WEB baseline: streamed %d bytes (%s; contentLength=%d)", n, classification, info.ContentLength)
+// A proof completed on the landing video must apply to another long video.
+func TestPlayerContextCrossVideoFullLengthHTTP(t *testing.T) {
+	base := startColdDaemon(t)
+	p := provider.New(client.New(base, client.WithAPIKey(os.Getenv("WAXSEAL_KEY"))))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
 
-	// A cap is valid here, but the stream must progress beyond initialization.
-	if n < 256<<10 {
-		t.Errorf("plain WEB did not stream past init: %d bytes", n)
+	// The first request targets a different video from the session's landing page.
+	n, info, fellBack := streamWEBContext(t, ctx, p, nil, robPikeURL)
+	if fellBack {
+		t.Errorf("WEB player-context fell back; establishment did not carry over to another video")
 	}
-	if want := os.Getenv("WAXSEAL_EXPECT_PLAIN"); want != "" && want != classification {
-		t.Errorf("WAXSEAL_EXPECT_PLAIN=%q but classified %q (n=%d, contentLength=%d)", want, classification, n, info.ContentLength)
+	if info.Client != clientWebContext {
+		t.Errorf("info.Client = %q, want %q", info.Client, clientWebContext)
 	}
+	requireFullLength(t, n, info, "cross-video player-context")
+	t.Logf("cross-video player-context (%s): %d bytes (%s; contentLength=%d)", robPikeVideoID, n, classifyStream(n, info.ContentLength), info.ContentLength)
+}
+
+// A short first request must not prevent a later long video from streaming fully.
+func TestPlayerContextShortThenLongHTTP(t *testing.T) {
+	base := startColdDaemon(t)
+	p := provider.New(client.New(base, client.WithAPIKey(os.Getenv("WAXSEAL_KEY"))))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	// The short video ends before the preview cap.
+	nShort, infoShort, fellBackShort := streamWEBContext(t, ctx, p, nil, shortURL)
+	if fellBackShort {
+		t.Errorf("WEB player-context fell back for the short video")
+	}
+	if nShort <= 0 {
+		t.Errorf("short video streamed no bytes")
+	}
+	t.Logf("short video first: %d bytes (%s; contentLength=%d)", nShort, classifyStream(nShort, infoShort.ContentLength), infoShort.ContentLength)
+
+	nLong, infoLong, fellBackLong := streamWEBContext(t, ctx, p, nil, bbbURL)
+	if fellBackLong {
+		t.Errorf("WEB player-context fell back for the long video after a short first call")
+	}
+	requireFullLength(t, nLong, infoLong, "long after short")
+}
+
+// A lazy tenant's first player-context request must establish on demand.
+func TestLazyTenantFirstCallFullLengthHTTP(t *testing.T) {
+	if ext := os.Getenv("WAXSEAL_URL"); ext != "" {
+		t.Skip("lazy-tenant test requires an in-process daemon")
+	}
+	const warmKey, lazyKey = "KEYWARM", "KEYLAZY"
+	srv, addr := newInProcessDaemon(t, server.Config{TenantKeys: map[string]string{"warm": warmKey, "lazy": lazyKey}})
+	warmCtx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	if err := srv.Warm(warmCtx, warmKey); err != nil { // warm only the "warm" tenant
+		cancel()
+		t.Fatalf("warm warm-tenant: %v", err)
+	}
+	cancel()
+	go func() { _ = srv.ListenAndServe() }()
+	base := "http://" + addr
+	waitDaemonReady(t, base)
+
+	p := provider.New(client.New(base, client.WithAPIKey(lazyKey)))
+	ctx, cancel2 := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel2()
+	n, info, fellBack := streamWEBContext(t, ctx, p, nil, bbbURL)
+	if fellBack {
+		t.Errorf("lazy tenant's first call fell back from the player-context path")
+	}
+	if info.Client != clientWebContext {
+		t.Errorf("info.Client = %q, want %q", info.Client, clientWebContext)
+	}
+	requireFullLength(t, n, info, "lazy tenant first call")
+}
+
+// A short landing video must fall back to the default proof video.
+func TestShortLandingVideoEstablishesHTTP(t *testing.T) {
+	if ext := os.Getenv("WAXSEAL_URL"); ext != "" {
+		t.Skip("short-landing-video test requires an in-process daemon")
+	}
+	srv, addr := newInProcessDaemon(t, server.Config{Video: shortVideoID})
+	warmCtx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	if err := srv.Warm(warmCtx, ""); err != nil {
+		cancel()
+		t.Fatalf("warm with a short landing video: %v", err)
+	}
+	cancel()
+	go func() { _ = srv.ListenAndServe() }()
+	base := "http://" + addr
+	waitDaemonReady(t, base)
+
+	p := provider.New(client.New(base, client.WithAPIKey(os.Getenv("WAXSEAL_KEY"))))
+	ctx, cancel2 := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel2()
+	n, info, fellBack := streamWEBContext(t, ctx, p, nil, robPikeURL)
+	if fellBack {
+		t.Errorf("WEB player-context fell back; the default proof video did not establish the session")
+	}
+	if info.Client != clientWebContext {
+		t.Errorf("info.Client = %q, want %q", info.Client, clientWebContext)
+	}
+	requireFullLength(t, n, info, "short landing video")
 }
 
 // escalationMetrics contains the counters used to detect an unnecessary relaunch.
@@ -350,13 +432,10 @@ func TestPlayerContextUnavailableFastHTTP(t *testing.T) {
 
 	before := readEscalationMetrics(t, base)
 
-	// The first request must return a 422 without escalating. The 10-second
-	// deadline catches the old relaunch path, which took about 80 seconds.
-	_, err, elapsed := call(deadID, 10*time.Second)
+	// Allow time for first-use establishment while still detecting the old
+	// relaunch path, which took about 80 seconds.
+	_, err, elapsed := call(deadID, 60*time.Second)
 	requireUnavailable(t, err)
-	if elapsed > 9*time.Second {
-		t.Errorf("dead id took %v, want well under the 10s deadline", elapsed)
-	}
 	t.Logf("dead id returned 422 in %v", elapsed)
 
 	after := readEscalationMetrics(t, base)
@@ -369,7 +448,6 @@ func TestPlayerContextUnavailableFastHTTP(t *testing.T) {
 	if after.Escalations != before.Escalations {
 		t.Errorf("escalations changed from %d to %d", before.Escalations, after.Escalations)
 	}
-	// player_context_failures counts failed attempts and negative-cache hits.
 	if after.PlayerContextFailures <= before.PlayerContextFailures {
 		t.Errorf("player_context_failures did not increase from %d to %d", before.PlayerContextFailures, after.PlayerContextFailures)
 	}

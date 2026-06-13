@@ -105,8 +105,18 @@ func (s *Server) Warm(ctx context.Context, apiKey string) error {
 	return s.tenants.WarmOne(ctx, apiKey)
 }
 
+// SelfTest mints and caches a GVS token for the selected tenant, then attempts a
+// full-length streaming proof. Pass an empty key in keyless mode.
+func (s *Server) SelfTest(ctx context.Context, apiKey string) error {
+	return s.tenants.SelfTestOne(ctx, apiKey)
+}
+
 // Addr is the configured listen address.
 func (s *Server) Addr() string { return s.srv.Addr }
+
+// BrowserPID returns the process ID of the shared Chromium launcher, or 0 if it
+// is unavailable.
+func (s *Server) BrowserPID() int { return s.tenants.CurrentBrowserPID() }
 
 // ListenAndServe runs the HTTP server until Shutdown.
 func (s *Server) ListenAndServe() error { return s.srv.ListenAndServe() }
@@ -277,17 +287,19 @@ func normalizeScope(raw string) (string, bool) {
 	}
 }
 
+// handlePing probes an existing tenant session without launching Chromium,
+// attesting, or minting. A failed probe may retire the session. After
+// authentication, the handler reports health in an HTTP 200 response body.
 func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
 	m, label, ok := s.tenant(w, r)
 	if !ok {
 		return
 	}
-	id, err := m.Identity(r.Context())
+	id, kind, err := m.Healthy(r.Context())
 	if err != nil {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "tenant": label, "error": err.Error()})
 		return
 	}
-	kind, _ := m.AttestKind(r.Context())
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "tenant": label, "attest": kind, "identity": id})
 }
 
@@ -308,14 +320,13 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	id, err := m.Identity(r.Context())
+	// SessionSnapshot may perform the full-length proof, so apply the same timeout
+	// used by the other browser-backed endpoints.
+	ctx, cancel := context.WithTimeout(r.Context(), requestProcessTimeout)
+	defer cancel()
+	id, raw, err := m.SessionSnapshot(ctx)
 	if err != nil {
 		writeErr(w, http.StatusServiceUnavailable, CodeNoSession, "no session: "+err.Error())
-		return
-	}
-	raw, err := m.Cookies(r.Context())
-	if err != nil {
-		writeErr(w, http.StatusServiceUnavailable, CodeNoSession, "no cookies: "+err.Error())
 		return
 	}
 	cookies := make([]sessionCookie, 0, len(raw))

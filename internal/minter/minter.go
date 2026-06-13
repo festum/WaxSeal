@@ -48,9 +48,11 @@ type Minter struct {
 type minterSession interface {
 	Mint(ctx context.Context, identifier string) (browser.MintResult, error)
 	PlayerContext(ctx context.Context, videoID string) (browser.PlayerContext, error)
+	EnsureEstablished(ctx context.Context) error
+	Ping(ctx context.Context) error
 	AttestKind() string
 	Identity() browser.Identity
-	BrowserCookies() []*http.Cookie
+	BrowserCookies() ([]*http.Cookie, error)
 	Close()
 }
 
@@ -88,7 +90,20 @@ const (
 	minterDefaultMaxAge = 11 * time.Hour  // < the ~12h integrity lifetime
 	minterNegCacheTTL   = 5 * time.Minute // remember an unplayable video_id this long
 	minterNegCacheMax   = 256             // bound the negative cache
+
+	// pingProbeTimeout allows for a busy host without leaving /ping unbounded.
+	pingProbeTimeout = 5 * time.Second
+
+	// A short retry window tolerates transient startup failures without hiding a
+	// persistent minting failure.
+	selfTestMintAttempts = 3
 )
+
+// selfTestMintRetryDelay is variable so tests can shorten the retry interval.
+var selfTestMintRetryDelay = 1 * time.Second
+
+// errNoSession reports that the tenant has no existing attested session.
+var errNoSession = errors.New("waxseal: no attested session")
 
 // NewMinter builds a single-identity minter for video (the landing watch id). It
 // does not launch a browser until the first Warm/Mint/Identity call.
@@ -242,7 +257,7 @@ func (m *Minter) watchCrash(s minterSession, ctx context.Context, gen uint64) {
 // then relaunches and attests before the final attempt. Repeated requests for the
 // same binding continue to use the cached token.
 func (m *Minter) Mint(ctx context.Context, scope, binding string) (res browser.MintResult, cached bool, err error) {
-	key := scope + "|" + binding
+	key := cacheKey(scope, binding)
 	if r, ok := m.cacheGet(key); ok {
 		m.metrics.CacheHits.Add(1)
 		return r, true, nil
@@ -395,6 +410,9 @@ func (m *Minter) negCachePut(videoID string, err error) {
 	m.negCache[videoID] = negEntry{err: err, expiry: now.Add(minterNegCacheTTL)}
 }
 
+// cacheKey returns the shared key format used by request and startup mints.
+func cacheKey(scope, binding string) string { return scope + "|" + binding }
+
 func (m *Minter) cacheGet(key string) (browser.MintResult, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -421,32 +439,107 @@ func (m *Minter) cachePut(key string, res browser.MintResult, gen uint64) {
 	m.cache[key] = cachedToken{res: res, expiry: time.Now().Add(ttl), gen: gen}
 }
 
-// Identity ensures a session and returns its captured identity (for /ping).
-func (m *Minter) Identity(ctx context.Context) (browser.Identity, error) {
-	s, _, err := m.ensure(ctx)
+// SessionSnapshot returns an established session's identity and cookies. The
+// operation holds mintMu so both values come from the same session generation.
+func (m *Minter) SessionSnapshot(ctx context.Context) (browser.Identity, []*http.Cookie, error) {
+	m.mintMu.Lock()
+	defer m.mintMu.Unlock()
+	sess, _, err := m.ensure(ctx)
 	if err != nil {
-		return browser.Identity{}, err
+		return browser.Identity{}, nil, err
 	}
-	return s.Identity(), nil
+	if err := sess.EnsureEstablished(ctx); err != nil {
+		return browser.Identity{}, nil, err
+	}
+	cookies, err := sess.BrowserCookies()
+	if err != nil {
+		return browser.Identity{}, nil, err
+	}
+	return sess.Identity(), cookies, nil
 }
 
-// Cookies ensures a session and returns its live youtube.com cookies (for
-// /session, the coherence handoff).
-func (m *Minter) Cookies(ctx context.Context) ([]*http.Cookie, error) {
-	s, _, err := m.ensure(ctx)
-	if err != nil {
-		return nil, err
+// Healthy probes the existing session and returns its identity and attestation
+// grade. It does not call ensure, so it cannot launch, attest, or recycle an
+// expired session. On probe failure, it retires the session only when mintMu is
+// available, which prevents /ping from closing a session that is in use.
+//
+// If another goroutine replaces the session during the probe, Healthy retries
+// once against the current session.
+func (m *Minter) Healthy(ctx context.Context) (browser.Identity, string, error) {
+	for attempt := 0; attempt < 2; attempt++ {
+		m.mu.Lock()
+		sess, gen := m.sess, m.gen
+		m.mu.Unlock()
+		if sess == nil {
+			return browser.Identity{}, "", errNoSession
+		}
+
+		pctx, cancel := context.WithTimeout(ctx, pingProbeTimeout)
+		err := sess.Ping(pctx)
+		cancel()
+		if err == nil {
+			return sess.Identity(), sess.AttestKind(), nil
+		}
+		// Cancellation does not imply that the browser is dead.
+		if ctx.Err() != nil {
+			return browser.Identity{}, "", ctx.Err()
+		}
+		// Ignore a failure from a session that was replaced during the probe.
+		m.mu.Lock()
+		superseded := m.sess != sess || m.gen != gen
+		m.mu.Unlock()
+		if superseded && attempt == 0 {
+			continue
+		}
+		if m.mintMu.TryLock() {
+			m.retire(gen, "ping probe failed: "+err.Error())
+			m.mintMu.Unlock()
+		}
+		return browser.Identity{}, "", err
 	}
-	return s.BrowserCookies(), nil
+	return browser.Identity{}, "", errNoSession
 }
 
-// AttestKind ensures a session and returns its attestation grade.
-func (m *Minter) AttestKind(ctx context.Context) (string, error) {
-	s, _, err := m.ensure(ctx)
+// SelfTest mints and caches a GVS token for the current identity, then attempts
+// full-length establishment. A persistent mint failure is returned. An
+// establishment failure is logged and retried by the first endpoint that needs
+// it. SelfTest retries minting in place and does not run the relaunch ladder.
+func (m *Minter) SelfTest(ctx context.Context) error {
+	m.mintMu.Lock()
+	defer m.mintMu.Unlock()
+	sess, gen, err := m.ensure(ctx)
 	if err != nil {
-		return "", err
+		return err
 	}
-	return s.AttestKind(), nil
+	vd := sess.Identity().VisitorData
+
+	var res browser.MintResult
+	var mintErr error
+	for attempt := 1; attempt <= selfTestMintAttempts; attempt++ {
+		if res, mintErr = sess.Mint(ctx, vd); mintErr == nil {
+			break
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if attempt < selfTestMintAttempts {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(selfTestMintRetryDelay):
+			}
+		}
+	}
+	if mintErr != nil {
+		return fmt.Errorf("minter: self-test mint failed after %d attempts: %w", selfTestMintAttempts, mintErr)
+	}
+	m.metrics.Mints.Add(1)
+	m.cachePut(cacheKey("gvs", vd), res, gen)
+
+	if err := sess.EnsureEstablished(ctx); err != nil {
+		m.log.Warn("minter: self-test establishment failed; a later /session or /player-context request will retry", "err", err)
+	}
+	return nil
 }
 
 // MetricsSnapshot returns counters and current state for the /metrics endpoint.

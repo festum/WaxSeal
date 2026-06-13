@@ -110,6 +110,25 @@ func (t *Tenants) WarmOne(ctx context.Context, apiKey string) error {
 	return m.Warm(ctx)
 }
 
+// SelfTestOne runs the startup mint and streaming checks for the selected tenant.
+// Other tenants remain lazy.
+func (t *Tenants) SelfTestOne(ctx context.Context, apiKey string) error {
+	m, _, err := t.Minter(apiKey)
+	if err != nil {
+		return err
+	}
+	return m.SelfTest(ctx)
+}
+
+// CurrentBrowserPID returns the process ID of the shared Chromium launcher, or 0
+// when no pool or launcher is available.
+func (t *Tenants) CurrentBrowserPID() int {
+	if t.pool == nil {
+		return 0
+	}
+	return t.pool.CurrentLauncherPID()
+}
+
 // MetricsSnapshot returns per-tenant metrics plus the tenant count.
 func (t *Tenants) MetricsSnapshot() map[string]any {
 	t.mu.Lock()

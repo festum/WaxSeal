@@ -15,10 +15,14 @@ import (
 // fakeSession is an in-memory minterSession for testing the Minter's reliability
 // logic without a browser.
 type fakeSession struct {
-	mint      func(identifier string) (browser.MintResult, error)
-	playerCtx func(videoID string) (browser.PlayerContext, error)
-	id        browser.Identity // zero value reports a default visitor_data
-	closed    atomic.Bool
+	mint         func(identifier string) (browser.MintResult, error)
+	playerCtx    func(videoID string) (browser.PlayerContext, error)
+	ping         func() error // nil reports a healthy browser
+	establishErr error
+	cookies      []*http.Cookie
+	cookiesErr   error
+	id           browser.Identity // zero value reports a default visitor_data
+	closed       atomic.Bool
 }
 
 func (f *fakeSession) Mint(_ context.Context, id string) (browser.MintResult, error) {
@@ -35,6 +39,18 @@ func (f *fakeSession) PlayerContext(ctx context.Context, videoID string) (browse
 	}
 	return f.playerCtx(videoID)
 }
+func (f *fakeSession) EnsureEstablished(context.Context) error { return f.establishErr }
+
+// Ping gives cancellation precedence over the configured result.
+func (f *fakeSession) Ping(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if f.ping == nil {
+		return nil
+	}
+	return f.ping()
+}
 func (f *fakeSession) AttestKind() string { return "integrity" }
 func (f *fakeSession) Identity() browser.Identity {
 	if f.id.VisitorData == "" {
@@ -42,8 +58,8 @@ func (f *fakeSession) Identity() browser.Identity {
 	}
 	return f.id
 }
-func (f *fakeSession) BrowserCookies() []*http.Cookie { return nil }
-func (f *fakeSession) Close()                         { f.closed.Store(true) }
+func (f *fakeSession) BrowserCookies() ([]*http.Cookie, error) { return f.cookies, f.cookiesErr }
+func (f *fakeSession) Close()                                  { f.closed.Store(true) }
 
 // newTestMinter returns a Minter whose launcher records each created session and
 // uses the supplied per-mint behaviour.
@@ -447,5 +463,272 @@ func TestMinterNegCacheBoundedEvicts(t *testing.T) {
 	}
 	if err := m.negCacheGet("newestUnplay"); !errors.Is(err, browser.ErrUnplayable) {
 		t.Errorf("newest terminal result should be cached after eviction, got %v", err)
+	}
+}
+
+// newPingMinter records each session and configures its Ping result.
+func newPingMinter(ping func() error) (*Minter, *[]*fakeSession, *sync.Mutex) {
+	var sessions []*fakeSession
+	var smu sync.Mutex
+	m := NewMinter("v", browser.Options{})
+	m.launch = func(context.Context) (minterSession, error) {
+		fs := &fakeSession{
+			mint: func(string) (browser.MintResult, error) { return browser.MintResult{Lifetime: 3600}, nil },
+			ping: ping,
+		}
+		smu.Lock()
+		sessions = append(sessions, fs)
+		smu.Unlock()
+		return fs, nil
+	}
+	return m, &sessions, &smu
+}
+
+// An unwarmed tenant must report errNoSession without launching a browser.
+func TestMinterHealthyNoSession(t *testing.T) {
+	m, sessions, smu := newPingMinter(nil)
+	if _, _, err := m.Healthy(context.Background()); !errors.Is(err, errNoSession) {
+		t.Errorf("Healthy = %v, want errNoSession", err)
+	}
+	smu.Lock()
+	defer smu.Unlock()
+	if len(*sessions) != 0 {
+		t.Errorf("Healthy launched %d sessions, want 0", len(*sessions))
+	}
+}
+
+// A successful probe returns metadata from the existing session.
+func TestMinterHealthyLivePing(t *testing.T) {
+	m, sessions, smu := newPingMinter(nil)
+	if err := m.Warm(context.Background()); err != nil {
+		t.Fatalf("warm: %v", err)
+	}
+	id, kind, err := m.Healthy(context.Background())
+	if err != nil {
+		t.Errorf("Healthy returned error %v, want nil", err)
+	}
+	if id.VisitorData == "" {
+		t.Error("Healthy returned an empty identity for a live session")
+	}
+	if kind != "integrity" {
+		t.Errorf("attestation grade = %q, want integrity", kind)
+	}
+	smu.Lock()
+	defer smu.Unlock()
+	if (*sessions)[0].closed.Load() {
+		t.Error("a healthy session must not be retired")
+	}
+}
+
+// A failed probe retires the session when no browser operation is in progress.
+func TestMinterHealthyDeadPingRetires(t *testing.T) {
+	m, sessions, smu := newPingMinter(func() error { return errors.New("cdp connection closed") })
+	if err := m.Warm(context.Background()); err != nil {
+		t.Fatalf("warm: %v", err)
+	}
+	if _, _, err := m.Healthy(context.Background()); err == nil {
+		t.Fatal("Healthy = nil, want the probe error")
+	}
+	smu.Lock()
+	defer smu.Unlock()
+	if !(*sessions)[0].closed.Load() {
+		t.Error("failed probe did not retire the idle session")
+	}
+}
+
+// A failed probe must not retire a session while its page is in use.
+func TestMinterHealthyDeadPingHeldMintMuNoRetire(t *testing.T) {
+	m, sessions, smu := newPingMinter(func() error { return errors.New("cdp connection closed") })
+	if err := m.Warm(context.Background()); err != nil {
+		t.Fatalf("warm: %v", err)
+	}
+	m.mintMu.Lock() // Hold the page lock during the probe.
+	_, _, err := m.Healthy(context.Background())
+	m.mintMu.Unlock()
+	if err == nil {
+		t.Fatal("Healthy = nil, want the probe error")
+	}
+	smu.Lock()
+	defer smu.Unlock()
+	if (*sessions)[0].closed.Load() {
+		t.Error("probe retired a session while its page was in use")
+	}
+}
+
+// Canceling the probe must not retire the session.
+func TestMinterHealthyCanceledCtxNoRetire(t *testing.T) {
+	m, sessions, smu := newPingMinter(func() error { return errors.New("cdp connection closed") })
+	if err := m.Warm(context.Background()); err != nil {
+		t.Fatalf("warm: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, err := m.Healthy(ctx); !errors.Is(err, context.Canceled) {
+		t.Errorf("Healthy = %v, want context.Canceled", err)
+	}
+	smu.Lock()
+	defer smu.Unlock()
+	if (*sessions)[0].closed.Load() {
+		t.Error("a canceled health check must not retire the session")
+	}
+}
+
+// Healthy retries when the probed session is replaced concurrently.
+func TestMinterHealthyReprobesAfterRecycle(t *testing.T) {
+	m := NewMinter("v", browser.Options{})
+	sess2 := &fakeSession{
+		id:   browser.Identity{VisitorData: "vd2"},
+		mint: func(string) (browser.MintResult, error) { return browser.MintResult{Lifetime: 3600}, nil },
+	}
+	sess1 := &fakeSession{
+		id:   browser.Identity{VisitorData: "vd1"},
+		mint: func(string) (browser.MintResult, error) { return browser.MintResult{Lifetime: 3600}, nil },
+		ping: func() error {
+			// Replace the session while its probe is in progress.
+			m.mu.Lock()
+			m.sess = sess2
+			m.gen++
+			m.mu.Unlock()
+			return errors.New("probed session was recycled")
+		},
+	}
+	m.mu.Lock()
+	m.sess = sess1
+	m.gen = 1
+	m.attestedAt = time.Now()
+	m.mu.Unlock()
+
+	id, _, err := m.Healthy(context.Background())
+	if err != nil {
+		t.Fatalf("Healthy after session replacement = %v, want nil", err)
+	}
+	if id.VisitorData != "vd2" {
+		t.Errorf("identity = %q, want vd2 from the replacement session", id.VisitorData)
+	}
+	if sess1.closed.Load() {
+		t.Error("Healthy retired the superseded session")
+	}
+}
+
+// SelfTest caches its GVS token under the regular mint key.
+func TestMinterSelfTestCachesGVSMint(t *testing.T) {
+	var mints int64
+	m, _, _, _ := newTestMinter(func(id string) (browser.MintResult, error) {
+		atomic.AddInt64(&mints, 1)
+		return browser.MintResult{Kind: "integrity", Token: "gvs-" + id, TokenLen: 5, Identifier: id, Lifetime: 3600}, nil
+	})
+	ctx := context.Background()
+	if err := m.SelfTest(ctx); err != nil {
+		t.Fatalf("SelfTest: %v", err)
+	}
+	if got := atomic.LoadInt64(&mints); got != 1 {
+		t.Errorf("mints during self-test = %d, want 1", got)
+	}
+	// The default fake identity reports visitor_data "vd".
+	if _, cached, err := m.Mint(ctx, "gvs", "vd"); err != nil || !cached {
+		t.Errorf("gvs/vd after self-test: cached=%v err=%v, want cached=true", cached, err)
+	}
+	if got := atomic.LoadInt64(&mints); got != 1 {
+		t.Errorf("mints after the cache hit = %d, want 1", got)
+	}
+}
+
+// SelfTest returns a persistent mint failure after its bounded retry.
+func TestMinterSelfTestMintFatal(t *testing.T) {
+	defer func(d time.Duration) { selfTestMintRetryDelay = d }(selfTestMintRetryDelay)
+	selfTestMintRetryDelay = time.Millisecond
+	m, _, _, _ := newTestMinter(func(string) (browser.MintResult, error) {
+		return browser.MintResult{}, errors.New("mint broken")
+	})
+	if err := m.SelfTest(context.Background()); err == nil {
+		t.Fatal("SelfTest = nil, want an error after a persistent mint failure")
+	}
+}
+
+// SelfTest retries a transient mint failure without relaunching.
+func TestMinterSelfTestMintRetrySucceeds(t *testing.T) {
+	defer func(d time.Duration) { selfTestMintRetryDelay = d }(selfTestMintRetryDelay)
+	selfTestMintRetryDelay = time.Millisecond
+	var attempt int64
+	m, launches, _, _ := newTestMinter(func(string) (browser.MintResult, error) {
+		if atomic.AddInt64(&attempt, 1) == 1 {
+			return browser.MintResult{}, errors.New("temporary mint failure")
+		}
+		return browser.MintResult{Kind: "integrity", Token: "ok", Lifetime: 3600}, nil
+	})
+	if err := m.SelfTest(context.Background()); err != nil {
+		t.Fatalf("SelfTest: %v", err)
+	}
+	if got := atomic.LoadInt64(launches); got != 1 {
+		t.Errorf("launches = %d, want 1", got)
+	}
+}
+
+// SelfTest logs establishment failures instead of returning them.
+func TestMinterSelfTestEstablishmentWarnOnly(t *testing.T) {
+	m := NewMinter("v", browser.Options{})
+	m.launch = func(context.Context) (minterSession, error) {
+		return &fakeSession{
+			mint: func(string) (browser.MintResult, error) {
+				return browser.MintResult{Kind: "integrity", Token: "t", Lifetime: 3600}, nil
+			},
+			establishErr: errors.New("full-length proof failed"),
+		}, nil
+	}
+	if err := m.SelfTest(context.Background()); err != nil {
+		t.Errorf("SelfTest = %v, want nil after a logged establishment failure", err)
+	}
+}
+
+// SessionSnapshot returns identity and cookies after establishment.
+func TestMinterSessionSnapshot(t *testing.T) {
+	wantCookie := &http.Cookie{Name: "VISITOR_INFO1_LIVE", Value: "abc"}
+	m := NewMinter("v", browser.Options{})
+	m.launch = func(context.Context) (minterSession, error) {
+		return &fakeSession{
+			id:      browser.Identity{VisitorData: "vd-snap"},
+			cookies: []*http.Cookie{wantCookie},
+			mint:    func(string) (browser.MintResult, error) { return browser.MintResult{Lifetime: 3600}, nil },
+		}, nil
+	}
+	id, cookies, err := m.SessionSnapshot(context.Background())
+	if err != nil {
+		t.Fatalf("SessionSnapshot: %v", err)
+	}
+	if id.VisitorData != "vd-snap" {
+		t.Errorf("visitor_data = %q, want vd-snap", id.VisitorData)
+	}
+	if len(cookies) != 1 || cookies[0].Name != "VISITOR_INFO1_LIVE" {
+		t.Errorf("cookies = %+v, want one VISITOR_INFO1_LIVE", cookies)
+	}
+}
+
+// SessionSnapshot must not export a session that failed establishment.
+func TestMinterSessionSnapshotEstablishmentError(t *testing.T) {
+	m := NewMinter("v", browser.Options{})
+	m.launch = func(context.Context) (minterSession, error) {
+		return &fakeSession{
+			id:           browser.Identity{VisitorData: "vd"},
+			establishErr: errors.New("not established"),
+			mint:         func(string) (browser.MintResult, error) { return browser.MintResult{Lifetime: 3600}, nil },
+		}, nil
+	}
+	if _, _, err := m.SessionSnapshot(context.Background()); err == nil {
+		t.Fatal("SessionSnapshot = nil, want the establishment error")
+	}
+}
+
+// SessionSnapshot returns cookie-read failures.
+func TestMinterSessionSnapshotCookieError(t *testing.T) {
+	m := NewMinter("v", browser.Options{})
+	m.launch = func(context.Context) (minterSession, error) {
+		return &fakeSession{
+			id:         browser.Identity{VisitorData: "vd"},
+			cookiesErr: errors.New("cdp cookie read failed"),
+			mint:       func(string) (browser.MintResult, error) { return browser.MintResult{Lifetime: 3600}, nil },
+		}, nil
+	}
+	if _, _, err := m.SessionSnapshot(context.Background()); err == nil {
+		t.Fatal("SessionSnapshot = nil, want the propagated cookie error")
 	}
 }

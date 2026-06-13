@@ -44,12 +44,13 @@ make jsbundle-browser   # regenerate internal/browser/bg_browser_bundle.js
 ## Run
 
 ```
-# HTTP daemon (defaults to loopback 127.0.0.1:4416). Warms a browser at startup.
+# HTTP daemon (defaults to loopback 127.0.0.1:4416). Warms one tenant and runs
+# startup checks before listening.
 go run ./cmd/waxseal server
 curl -s localhost:4416/get_pot -d '{"content_binding":"<videoID>"}'   # returns {"poToken",...}
 curl -s localhost:4416/player-context -d '{"video_id":"<videoID>"}'   # returns a status-1 streaming context
 curl -s localhost:4416/session                                        # returns visitor_data and cookies
-curl -s localhost:4416/ping                                           # health check that never mints
+curl -s localhost:4416/ping                                           # liveness probe of the browser; never mints
 curl -s localhost:4416/metrics                                        # per-tenant counters
 
 # One-shot generation for bgutil script-provider integrations. This launches a
@@ -62,6 +63,14 @@ go run ./cmd/waxseal doctor
 # Check a running daemon. The command exits nonzero when the daemon is unhealthy.
 go run ./cmd/waxseal ping
 ```
+
+At startup, the daemon attests one tenant, mints and caches a GVS token, and
+attempts to prove full-length streaming. A mint failure stops startup. If the
+streaming proof fails, the daemon logs the failure and continues; `/player-context`
+and `/session` retry the proof before returning. The proof usually takes 10-30
+seconds. In multi-tenant mode, other tenants attest on their first `/get_pot`,
+`/player-context`, or `/session` request. Their first `/player-context` or
+`/session` request performs the streaming proof.
 
 The daemon runs Chromium under go-rod's embedded *leakless* process guard. If
 WaxSeal terminates without running normal cleanup, such as after `SIGKILL`, a
@@ -120,13 +129,14 @@ streaming request.
 
 ## Coherence handoff (`/session`)
 
-`GET /session` exports the tenant context's anonymous `visitor_data` and cookies.
-A consumer can adopt that identity and pair it with a `/get_pot` token bound to
-the same `visitor_data`. The consumer must also use the same egress IP.
+`GET /session` proves full-length streaming, then exports the tenant context's
+anonymous `visitor_data` and cookies. A consumer can adopt that identity and pair
+it with a `/get_pot` token bound to the same `visitor_data`. The consumer must
+also use the same egress IP.
 
-A matching token, session, and IP can still receive `STREAM_PROTECTION` status 2,
-which limits playback to about 70 seconds. Use `/player-context` when the consumer
-needs a status-1 context. Exported sessions do not contain a Google login.
+Full-length WEB audio requires the GVS token and the attested identity. Consumers
+can adopt the identity through `/session` or request a status-1 streaming context
+through `/player-context`. Exported sessions do not contain a Google login.
 
 ## Error responses
 
@@ -157,10 +167,15 @@ when an endpoint is called with an unsupported HTTP method:
 | `player-context-failed` | 502 | Other player-context failure |
 | `no-session` | 503 | No attested session or cookies available |
 
-`GET /ping` is the exception to this contract. It always returns 200 and reports
-failures as `{ok:false,error}`. Unsupported methods on `/ping` or `/metrics`
-still return the `405` envelope. Unknown paths use net/http's plain-text 404
-response.
+`GET /ping` is the exception to this contract. It checks the existing browser
+session without minting, establishing, or launching Chromium. After
+authentication, it always returns 200 and reports failures as
+`{ok:false,error}`. An unwarmed tenant reports
+`{ok:false,error:"no attested session"}`. If Chromium has died, `/ping` reports
+the failure and may retire the dead session. A later mint, player-context, or
+session request attempts to relaunch it. Unsupported methods on `/ping` or
+`/metrics` still return the `405` envelope. Unknown paths use net/http's
+plain-text 404 response.
 
 The `waxseal/client` package parses these envelopes into `*client.APIError` and
 provides matching `Code*` constants. It also accepts the older `{error}` format

@@ -75,11 +75,17 @@ func runServer(cmd *cobra.Command, o *serverOpts) error {
 		warmKey = k
 		break
 	}
-	warmCtx, cancel := context.WithTimeout(cmd.Context(), 90*time.Second)
+	warmCtx, cancel := context.WithTimeout(cmd.Context(), 120*time.Second)
 	err = srv.Warm(warmCtx, warmKey)
+	if err == nil {
+		// Verify minting before accepting traffic and attempt the full-length
+		// streaming proof. SelfTest reports mint failures and logs proof failures;
+		// /player-context and /session retry the proof on demand.
+		err = srv.SelfTest(warmCtx, warmKey)
+	}
 	cancel()
 	if err != nil {
-		logger.Error("startup attestation failed", "err", err)
+		logger.Error("startup checks failed", "err", err)
 		_ = srv.Shutdown(context.Background())
 		return err
 	}
