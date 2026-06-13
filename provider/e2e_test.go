@@ -24,15 +24,16 @@ import (
 
 // These manual e2e tests require Chromium and network access. Unless WAXSEAL_URL
 // names an external daemon, each test starts a fresh daemon and browser session.
-// Big Buck Bunny is used under its Creative Commons license; the other IDs are
-// long public videos used only to seek past the status-2 preview cap.
+// All video IDs are freely licensed: Big Buck Bunny and Tears of Steel under
+// Creative Commons (Blender Foundation); the NASA clip is U.S.-government public
+// domain. The long videos exist only to seek past the status-2 preview cap.
 const (
-	bbbVideoID       = "aqz-KE-bpKQ" // Big Buck Bunny, approximately 635 seconds
+	bbbVideoID       = "aqz-KE-bpKQ" // Big Buck Bunny (Blender, CC-BY), approximately 635 seconds
 	bbbURL           = "https://www.youtube.com/watch?v=" + bbbVideoID
 	bbbContentLength = 30767611      // approximate reference size for logs
-	robPikeVideoID   = "rFejpH_tAHM" // different long video, approximately 1,391 seconds
-	robPikeURL       = "https://www.youtube.com/watch?v=" + robPikeVideoID
-	shortVideoID     = "jNQXAC9IVRw" // "Me at the zoo", approximately 19 seconds
+	tearsVideoID     = "R6MlUcmOul8" // Tears of Steel (Blender, CC-BY), approximately 734 seconds
+	tearsURL         = "https://www.youtube.com/watch?v=" + tearsVideoID
+	shortVideoID     = "1UaBgr_sq9A" // NASA: 60 Years in 60 Seconds (public domain), approximately 60 seconds
 	shortURL         = "https://www.youtube.com/watch?v=" + shortVideoID
 	fullLengthFloor  = 8 << 20 // safely beyond a status-2 preview of a long video
 
@@ -260,7 +261,7 @@ func TestPlayerContextCrossVideoFullLengthHTTP(t *testing.T) {
 	defer cancel()
 
 	// The first request targets a different video from the session's landing page.
-	n, info, fellBack := streamWEBContext(t, ctx, p, nil, robPikeURL)
+	n, info, fellBack := streamWEBContext(t, ctx, p, nil, tearsURL)
 	if fellBack {
 		t.Errorf("WEB player-context fell back; establishment did not carry over to another video")
 	}
@@ -268,7 +269,7 @@ func TestPlayerContextCrossVideoFullLengthHTTP(t *testing.T) {
 		t.Errorf("info.Client = %q, want %q", info.Client, clientWebContext)
 	}
 	requireFullLength(t, n, info, "cross-video player-context")
-	t.Logf("cross-video player-context (%s): %d bytes (%s; contentLength=%d)", robPikeVideoID, n, classifyStream(n, info.ContentLength), info.ContentLength)
+	t.Logf("cross-video player-context (%s): %d bytes (%s; contentLength=%d)", tearsVideoID, n, classifyStream(n, info.ContentLength), info.ContentLength)
 }
 
 // A short first request must not prevent a later long video from streaming fully.
@@ -344,7 +345,7 @@ func TestShortLandingVideoEstablishesHTTP(t *testing.T) {
 	p := provider.New(client.New(base, client.WithAPIKey(os.Getenv("WAXSEAL_KEY"))))
 	ctx, cancel2 := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel2()
-	n, info, fellBack := streamWEBContext(t, ctx, p, nil, robPikeURL)
+	n, info, fellBack := streamWEBContext(t, ctx, p, nil, tearsURL)
 	if fellBack {
 		t.Errorf("WEB player-context fell back; the default proof video did not establish the session")
 	}

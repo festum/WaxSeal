@@ -57,6 +57,9 @@ curl -s localhost:4416/metrics                                        # per-tena
 # fresh browser for every call. Prefer the warm server for yt-dlp.
 go run ./cmd/waxseal -c <content_binding>
 
+# Launch a browser, attest, and print the status-1 streaming context for a video.
+go run ./cmd/waxseal player-context <video_id>
+
 # Launch a browser, attest, and report the identity and token grade.
 go run ./cmd/waxseal doctor
 

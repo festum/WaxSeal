@@ -10,7 +10,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -159,8 +158,7 @@ func (s *Server) handleGetPot(w http.ResponseWriter, r *http.Request) {
 		ContentBinding string `json:"content_binding"`
 		Scope          string `json:"scope"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, CodeInvalidRequest, "invalid JSON: "+err.Error())
+	if !decodeJSONBody(w, r, &req, false) {
 		return
 	}
 	if req.ContentBinding == "" {
@@ -239,11 +237,6 @@ func (s *Server) handlePlayerContext(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, pc)
 }
 
-// videoIDPattern rejects malformed IDs before they consume the browser poll
-// budget. Current YouTube IDs are 11 characters, but the wider bound avoids
-// encoding that detail into the API contract.
-var videoIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
-
 // playerContextVideoID reads video_id from the JSON body or query string. An
 // empty body falls through to the query form. The function writes an error
 // response and returns false when the input is missing or malformed.
@@ -251,8 +244,7 @@ func playerContextVideoID(w http.ResponseWriter, r *http.Request) (string, bool)
 	var req struct {
 		VideoID string `json:"video_id"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
-		writeErr(w, http.StatusBadRequest, CodeInvalidRequest, "invalid JSON: "+err.Error())
+	if !decodeJSONBody(w, r, &req, true) {
 		return "", false
 	}
 	if req.VideoID == "" {
@@ -262,10 +254,10 @@ func playerContextVideoID(w http.ResponseWriter, r *http.Request) (string, bool)
 		writeErr(w, http.StatusBadRequest, CodeInvalidRequest, "video_id is required")
 		return "", false
 	}
-	if !videoIDPattern.MatchString(req.VideoID) {
-		msg := "video_id must be 1-64 chars of [A-Za-z0-9_-]"
+	if !browser.ValidVideoID(req.VideoID) {
+		msg := "video_id must contain 1 to 64 letters, digits, underscores, or hyphens"
 		if strings.Contains(req.VideoID, "://") {
-			msg = "video_id must be a bare id, not a URL"
+			msg = "video_id must be a bare ID, not a URL"
 		}
 		writeErr(w, http.StatusBadRequest, CodeInvalidRequest, msg)
 		return "", false
@@ -389,6 +381,59 @@ type errEnvelope struct {
 
 func writeErr(w http.ResponseWriter, status int, code, msg string) {
 	writeJSON(w, status, errEnvelope{Error: msg, Code: code})
+}
+
+// decodeErrMsg returns a stable client-facing message for a JSON decoding error
+// without exposing Go type information.
+func decodeErrMsg(err error) string {
+	var maxErr *http.MaxBytesError
+	if errors.As(err, &maxErr) {
+		return "request body too large (max 1 MiB)"
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return "request body is empty or truncated"
+	}
+	var typeErr *json.UnmarshalTypeError
+	if errors.As(err, &typeErr) {
+		switch {
+		case typeErr.Field == "":
+			return "request body must be a JSON object"
+		case strings.Contains(typeErr.Field, "."):
+			return "request body contains a field with the wrong type"
+		default:
+			return "field \"" + typeErr.Field + "\" has the wrong type"
+		}
+	}
+	return "request body contains invalid JSON"
+}
+
+// decodeJSONBody decodes exactly one JSON object from r.Body and limits the body
+// to 1 MiB. It writes an invalid-request response on failure. When allowEmpty
+// is true, an empty body is accepted so the caller can use another input source.
+func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any, allowEmpty bool) bool {
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	err := dec.Decode(dst)
+	if allowEmpty && errors.Is(err, io.EOF) {
+		return true
+	}
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, CodeInvalidRequest, decodeErrMsg(err))
+		return false
+	}
+	// A second decode rejects non-whitespace data after the first JSON value.
+	err = dec.Decode(&struct{}{})
+	if errors.Is(err, io.EOF) {
+		return true
+	}
+	// MaxBytesReader may not report an oversized body until this second decode,
+	// such as when a valid object is followed by too much whitespace.
+	msg := "request body must be a single JSON object"
+	var maxErr *http.MaxBytesError
+	if errors.As(err, &maxErr) {
+		msg = decodeErrMsg(err)
+	}
+	writeErr(w, http.StatusBadRequest, CodeInvalidRequest, msg)
+	return false
 }
 
 func writeErrDetails(w http.ResponseWriter, status int, code, msg, details string) {

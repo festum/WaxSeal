@@ -64,8 +64,9 @@ func TestExecuteUsageErrors(t *testing.T) {
 		{"unknown flag on ping", []string{"ping", "--port", "4420"}, 2, "waxseal: "},
 		// A stray subcommand reaches the root NoArgs validator because the root has RunE.
 		{"unknown subcommand", []string{"bogussubcmd"}, 2, "waxseal: "},
-		{"missing --video", []string{"player-context"}, 2, "--video"},
-		{"URL where id expected", []string{"player-context", "--video", "https://youtu.be/x"}, 2, "not a URL"},
+		{"missing video id", []string{"player-context"}, 2, "provide a video ID"},
+		{"URL via --video", []string{"player-context", "--video", "https://youtu.be/x"}, 2, "not a URL"},
+		{"URL positional", []string{"player-context", "https://youtu.be/x"}, 2, "not a URL"},
 		// newRootCmd initializes Cobra's completion commands before wrapping validators.
 		{"too many args to completion", []string{"completion", "bash", "extra"}, 2, "waxseal: "},
 	}
@@ -146,7 +147,7 @@ func TestLooksLikeURL(t *testing.T) {
 			t.Errorf("looksLikeURL(%q) = false, want true", s)
 		}
 	}
-	for _, s := range []string{"dQw4w9WgXcQ", "aqz-KE-bpKQ", "", "abc123"} {
+	for _, s := range []string{"exampleVid1", "aqz-KE-bpKQ", "", "abc123"} {
 		if looksLikeURL(s) {
 			t.Errorf("looksLikeURL(%q) = true, want false", s)
 		}
