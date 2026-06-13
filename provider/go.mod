@@ -4,7 +4,7 @@ go 1.26.3
 
 require (
 	github.com/colespringer/waxseal v0.0.0-00010101000000-000000000000
-	github.com/colespringer/waxtap v1.5.1-0.20260612202854-46dd07d44a9a
+	github.com/colespringer/waxtap v0.0.0-20260613024629-3eceed96f545
 )
 
 require (
