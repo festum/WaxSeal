@@ -2,6 +2,11 @@ package browser
 
 import "regexp"
 
+// MaxContentBindingBytes is the maximum content_binding size accepted by
+// token-minting endpoints. The limit rejects accidental oversized inputs without
+// imposing a format on generic bindings.
+const MaxContentBindingBytes = 4096
+
 // videoIDPattern defines the bare video ID format accepted by WaxSeal. YouTube
 // video IDs are currently 11 characters, but the wider bound avoids making
 // that length part of the API contract.

@@ -7,8 +7,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -131,6 +133,9 @@ func (s *Server) BrowserPID() int { return s.tenants.CurrentBrowserPID() }
 // ListenAndServe runs the HTTP server until Shutdown.
 func (s *Server) ListenAndServe() error { return s.srv.ListenAndServe() }
 
+// Serve accepts HTTP requests on ln and closes the listener before returning.
+func (s *Server) Serve(ln net.Listener) error { return s.srv.Serve(ln) }
+
 // Shutdown drains in-flight requests, then tears down the browser.
 func (s *Server) Shutdown(ctx context.Context) error {
 	err := s.srv.Shutdown(ctx)
@@ -174,6 +179,10 @@ func (s *Server) handleGetPot(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.ContentBinding == "" {
 		writeErr(w, http.StatusBadRequest, CodeInvalidRequest, "content_binding is required (the video_id for player, or the visitor_data for gvs)")
+		return
+	}
+	if len(req.ContentBinding) > browser.MaxContentBindingBytes {
+		writeErr(w, http.StatusBadRequest, CodeInvalidRequest, fmt.Sprintf("content_binding too long (max %d bytes)", browser.MaxContentBindingBytes))
 		return
 	}
 	scope, ok := normalizeScope(req.Scope)
@@ -308,13 +317,15 @@ func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Browser proof describes playback in the daemon. A consumer report can still
-	// mark the session suspect after a successful proof.
+	// mark the session suspect after a successful proof. /ping deliberately omits
+	// guest identity data. navigator_webdriver remains because it is a
+	// browser-detection health signal.
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":                         live,
 		"tenant":                     label,
 		"attest":                     snap.AttestKind,
-		"identity":                   snap.Identity,
 		"generation":                 snap.Generation,
+		"navigator_webdriver":        snap.Identity.Webdriver,
 		"browser_proof_established":  snap.BrowserProofEstablished,
 		"last_browser_proof_outcome": snap.LastBrowserProofOutcome,
 		"streaming_suspect":          snap.StreamingSuspect,

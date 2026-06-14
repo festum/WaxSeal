@@ -1266,6 +1266,36 @@ func TestMinterMetricsSnapshotOmitsRecycleWhenDisabled(t *testing.T) {
 	}
 }
 
+func TestMinterMetricsSnapshotStableWhenNotLive(t *testing.T) {
+	m, _, _, _ := newStreamingMinter(time.Hour, nil)
+	if err := m.Warm(context.Background()); err != nil {
+		t.Fatalf("warm: %v", err)
+	}
+	if !m.retire(1, "test") {
+		t.Fatal("retire(1) returned false, want true")
+	}
+	snap := m.MetricsSnapshot()
+	if snap["session_live"] != false {
+		t.Fatalf("session_live = %v, want false", snap["session_live"])
+	}
+	if snap["attest_kind"] != "" {
+		t.Errorf("attest_kind = %v, want empty when not live", snap["attest_kind"])
+	}
+	for _, k := range []string{"browser_proof_established", "streaming_suspect"} {
+		v, present := snap[k]
+		if !present {
+			t.Errorf("%q absent when not live, want present (false)", k)
+		} else if v != false {
+			t.Errorf("%q = %v, want false", k, v)
+		}
+	}
+	for _, k := range []string{"last_browser_proof_outcome", "last_browser_proof_age_secs", "streaming_seconds_until_recycle", "streaming_suspect_video"} {
+		if _, present := snap[k]; present {
+			t.Errorf("%q present when not live, want absent", k)
+		}
+	}
+}
+
 // jitter stays within 10 percent and leaves non-positive inputs disabled.
 func TestJitterWithinBounds(t *testing.T) {
 	d := time.Hour // a var, so the bound conversions truncate at runtime

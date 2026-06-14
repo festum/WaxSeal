@@ -1,8 +1,11 @@
 package browser
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -140,5 +143,129 @@ func TestFullLengthProbeModel(t *testing.T) {
 	}
 	if OutcomeFullLength != "full-length" {
 		t.Errorf("OutcomeFullLength = %q, want full-length", OutcomeFullLength)
+	}
+}
+
+func TestEstablishFromCandidates(t *testing.T) {
+	log := slog.New(slog.DiscardHandler)
+	full := FullLengthProbe{Outcome: OutcomeFullLength, FullLength: true}
+	tooShort := FullLengthProbe{Outcome: OutcomeVideoTooShort, Reason: "too short"}
+	capped := FullLengthProbe{Outcome: OutcomeTargetNotBuffered, Reason: "status-2 cap"}
+	noEstablish := FullLengthProbe{Outcome: OutcomeNotEstablished, Reason: "no context"}
+
+	type res struct {
+		probe FullLengthProbe
+		err   error
+	}
+	// A real proveFullLength reports an unplayable video as OutcomeNotEstablished
+	// with a non-nil ErrUnplayable; the helper keys off the error, not the outcome.
+	unplayable := res{FullLengthProbe{Outcome: OutcomeNotEstablished}, &UnplayableError{Status: "ERROR"}}
+
+	tests := []struct {
+		name        string
+		candidates  []string
+		results     map[string]res
+		wantErr     bool
+		wantErrText []string
+		errIs       error
+		errIsNot    error
+		wantCalls   []string
+	}{
+		{
+			name:       "dead first video falls through to a healthy candidate",
+			candidates: []string{"dead", "good"},
+			results:    map[string]res{"dead": unplayable, "good": {full, nil}},
+			wantCalls:  []string{"dead", "good"},
+		},
+		{
+			name:       "too-short advances to the next candidate",
+			candidates: []string{"short", "good"},
+			results:    map[string]res{"short": {tooShort, nil}, "good": {full, nil}},
+			wantCalls:  []string{"short", "good"},
+		},
+		{
+			name:        "target-not-buffered stops fallback",
+			candidates:  []string{"capped", "good"},
+			results:     map[string]res{"capped": {capped, nil}, "good": {full, nil}},
+			wantErr:     true,
+			wantErrText: []string{OutcomeTargetNotBuffered},
+			wantCalls:   []string{"capped"},
+		},
+		{
+			name:        "not-established stops fallback",
+			candidates:  []string{"noctx", "good"},
+			results:     map[string]res{"noctx": {noEstablish, nil}, "good": {full, nil}},
+			wantErr:     true,
+			wantErrText: []string{OutcomeNotEstablished},
+			wantCalls:   []string{"noctx"},
+		},
+		{
+			name:       "context cancellation propagates without further candidates",
+			candidates: []string{"cancel", "good"},
+			results:    map[string]res{"cancel": {FullLengthProbe{Outcome: OutcomeCanceled}, context.Canceled}, "good": {full, nil}},
+			wantErr:    true,
+			errIs:      context.Canceled,
+			wantCalls:  []string{"cancel"},
+		},
+		{
+			name:        "all unusable candidates return an aggregate error",
+			candidates:  []string{"dead", "short"},
+			results:     map[string]res{"dead": unplayable, "short": {tooShort, nil}},
+			wantErr:     true,
+			wantErrText: []string{"no usable proof video", "dead", "short"},
+			wantCalls:   []string{"dead", "short"},
+		},
+		{
+			// Do not let failures from internal proof videos mark the caller's video
+			// as unavailable.
+			name:        "exhausted candidates do not expose ErrUnplayable",
+			candidates:  []string{"dead1", "dead2"},
+			results:     map[string]res{"dead1": unplayable, "dead2": unplayable},
+			wantErr:     true,
+			wantErrText: []string{"no usable proof video", "dead1", "dead2"},
+			errIsNot:    ErrUnplayable,
+			wantCalls:   []string{"dead1", "dead2"},
+		},
+		{
+			name:       "duplicate and empty candidates are skipped",
+			candidates: []string{"good", "", "good"},
+			results:    map[string]res{"good": {full, nil}},
+			wantCalls:  []string{"good"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var calls []string
+			prove := func(v string) (FullLengthProbe, error) {
+				calls = append(calls, v)
+				r, ok := tt.results[v]
+				if !ok {
+					t.Fatalf("prove called with unexpected video %q", v)
+				}
+				return r.probe, r.err
+			}
+			err := establishFromCandidates(context.Background(), prove, tt.candidates, log)
+			switch {
+			case tt.wantErr && err == nil:
+				t.Fatalf("err = nil, want an error")
+			case !tt.wantErr && err != nil:
+				t.Fatalf("err = %v, want nil (established)", err)
+			}
+			for _, text := range tt.wantErrText {
+				if !strings.Contains(err.Error(), text) {
+					t.Errorf("err = %q, want it to contain %q", err.Error(), text)
+				}
+			}
+			if tt.errIs != nil && !errors.Is(err, tt.errIs) {
+				t.Errorf("err = %v, want errors.Is %v", err, tt.errIs)
+			}
+			if tt.errIsNot != nil && errors.Is(err, tt.errIsNot) {
+				t.Errorf("err = %v, unexpectedly matches errors.Is %v", err, tt.errIsNot)
+			}
+			if !slices.Equal(calls, tt.wantCalls) {
+				t.Errorf("calls = %v, want %v", calls, tt.wantCalls)
+			}
+		})
 	}
 }

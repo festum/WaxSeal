@@ -446,10 +446,84 @@ func TestPingHealthFields(t *testing.T) {
 	if resp["browser_proof_established"] != false {
 		t.Errorf("browser_proof_established = %v, want false", resp["browser_proof_established"])
 	}
-	for _, k := range []string{"browser_proof_established", "last_browser_proof_outcome", "streaming_suspect"} {
+	// /ping reports health without returning the guest identity.
+	if _, ok := resp["identity"]; ok {
+		t.Error("/ping leaks identity; it must report health only (use /session for identity)")
+	}
+	if v, ok := resp["navigator_webdriver"]; !ok || v != false {
+		t.Errorf("navigator_webdriver = %v (present=%v), want present with value false", v, ok)
+	}
+	for _, k := range []string{"ok", "attest", "generation", "navigator_webdriver", "browser_proof_established", "last_browser_proof_outcome", "streaming_suspect"} {
 		if _, ok := resp[k]; !ok {
 			t.Errorf("/ping missing field %q", k)
 		}
+	}
+}
+
+func TestMetricsSchemaStableAfterReport(t *testing.T) {
+	s := liveServer(t, nil, map[string]*fakePlayerSession{"": {abrURL: "https://r/ok", vd: "vd"}})
+
+	rep := httptest.NewRequest(http.MethodPost, "/report", strings.NewReader(`{"session_generation":1,"reason":"e2e"}`))
+	rw := httptest.NewRecorder()
+	s.routes().ServeHTTP(rw, rep)
+	if rw.Code != http.StatusOK {
+		t.Fatalf("/report status = %d, body = %s", rw.Code, rw.Body)
+	}
+
+	mr := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	mw := httptest.NewRecorder()
+	s.routes().ServeHTTP(mw, mr)
+	if mw.Code != http.StatusOK {
+		t.Fatalf("/metrics status = %d", mw.Code)
+	}
+	var resp struct {
+		PerTenant map[string]map[string]any `json:"per_tenant"`
+	}
+	if err := json.Unmarshal(mw.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode /metrics: %v", err)
+	}
+	tenant, ok := resp.PerTenant["default"]
+	if !ok {
+		t.Fatalf("per_tenant missing the keyless \"default\" tenant: %v", resp.PerTenant)
+	}
+	if tenant["session_live"] != false {
+		t.Fatalf("session_live = %v, want false (the report should have retired the session)", tenant["session_live"])
+	}
+	// These fields remain present even when no session is live.
+	for _, k := range []string{"browser_proof_established", "streaming_suspect"} {
+		v, present := tenant[k]
+		if !present {
+			t.Errorf("%q absent after retire, want present (false) for a stable schema", k)
+		} else if v != false {
+			t.Errorf("%q = %v, want false", k, v)
+		}
+	}
+	// Session detail fields are omitted when no session is live.
+	for _, k := range []string{"last_browser_proof_outcome", "last_browser_proof_age_secs", "streaming_seconds_until_recycle", "streaming_suspect_video"} {
+		if _, present := tenant[k]; present {
+			t.Errorf("%q present after retire, want absent (state-dependent field)", k)
+		}
+	}
+}
+
+func TestGetPotContentBindingTooLong(t *testing.T) {
+	body := `{"content_binding":"` + strings.Repeat("a", browser.MaxContentBindingBytes+1) + `"}`
+	w := postGetPot(body)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+	var env struct {
+		Error string `json:"error"`
+		Code  string `json:"code"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("error body is not JSON: %v (%q)", err, w.Body.String())
+	}
+	if env.Code != CodeInvalidRequest {
+		t.Errorf("code = %q, want %q", env.Code, CodeInvalidRequest)
+	}
+	if !strings.Contains(env.Error, "too long") {
+		t.Errorf("message = %q, want it to mention 'too long'", env.Error)
 	}
 }
 

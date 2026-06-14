@@ -789,10 +789,13 @@ func (m *Minter) MetricsSnapshot() map[string]any {
 		"degradation_reports_accepted":       m.metrics.DegradationReportsAccepted.Load(),
 		"degradation_reports_rejected_stale": m.metrics.DegradationReportsRejectedStale.Load(),
 		"degradation_reports_rate_limited":   m.metrics.DegradationReportsRateLimited.Load(),
+		// These fields remain present when no session is live, which keeps the
+		// metrics schema stable across session retirement.
+		"browser_proof_established": live && sess.Established(),
+		"streaming_suspect":         suspect,
 	}
+	// Session detail fields are present only in the states where they apply.
 	if live {
-		out["browser_proof_established"] = sess.Established()
-		out["streaming_suspect"] = suspect
 		if suspectVideo != "" {
 			out["streaming_suspect_video"] = suspectVideo
 		}

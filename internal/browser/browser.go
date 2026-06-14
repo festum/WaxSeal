@@ -1263,11 +1263,66 @@ type FullLengthProbe struct {
 	ContextURLChanged bool    `json:"context_url_changed"` // whether serverAbrStreamingUrl changed during the probe
 }
 
+// proofCandidates lists fallback videos for full-length playback checks.
+// Candidates are ordered by preference.
+var proofCandidates = []string{
+	DefaultVideo,  // Big Buck Bunny
+	"R6MlUcmOul8", // Tears of Steel
+	"1UaBgr_sq9A", // NASA
+}
+
+// establishFromCandidates tries candidates until one proves full-length
+// playback. It retries only when a candidate is unavailable or too short. Any
+// other outcome or error is returned immediately because it reflects session
+// health rather than candidate suitability. Empty and duplicate IDs are ignored.
+//
+// When all candidates are exhausted, the returned error records each retryable
+// failure without wrapping ErrUnplayable. These videos are internal probes, not
+// the video requested by the caller.
+func establishFromCandidates(ctx context.Context, prove func(string) (FullLengthProbe, error), candidates []string, log *slog.Logger) error {
+	var failures []string
+	seen := make(map[string]bool, len(candidates))
+	for _, videoID := range candidates {
+		// Do not start another proof after cancellation.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if videoID == "" || seen[videoID] {
+			continue
+		}
+		seen[videoID] = true
+		probe, err := prove(videoID)
+		switch {
+		case err == nil && probe.Outcome == OutcomeFullLength:
+			return nil
+		case errors.Is(err, ErrUnplayable):
+			failures = append(failures, fmt.Sprintf("%s: %v", videoID, err))
+			log.Info("waxseal: proof video unplayable; trying the next candidate", "video", videoID, "err", err)
+		case err == nil && probe.Outcome == OutcomeVideoTooShort:
+			failures = append(failures, fmt.Sprintf("%s: too short (%s)", videoID, probe.Reason))
+			log.Info("waxseal: proof video too short; trying the next candidate", "video", videoID, "reason", probe.Reason)
+		case err != nil:
+			// Errors other than ErrUnplayable are not candidate-specific.
+			return err
+		default:
+			// A non-retryable outcome reflects session health. Trying another video
+			// could hide it.
+			return fmt.Errorf("waxseal: session not established: full-length proof outcome %q: %s", probe.Outcome, probe.Reason)
+		}
+	}
+	if len(failures) > 0 {
+		// Keep the aggregate text-only so errors.Is does not classify the caller's
+		// requested video as unplayable.
+		return fmt.Errorf("waxseal: session not established: no usable proof video after trying %d candidates: %s", len(seen), strings.Join(failures, "; "))
+	}
+	return fmt.Errorf("waxseal: session not established: no proof candidates")
+}
+
 // EnsureEstablished proves once per session that playback can advance beyond the
 // status-2 preview cap.
 //
-// The proof uses the landing video first and retries with DefaultVideo if the
-// landing video is too short. Successful establishment applies to later videos
+// The proof uses the landing video first, then tries proofCandidates when a video
+// is unavailable or too short. Successful establishment applies to later videos
 // requested through the same session.
 //
 // proveFullLength restores the shared page before returning.
@@ -1275,19 +1330,10 @@ func (s *Session) EnsureEstablished(ctx context.Context) error {
 	if s.Established() {
 		return nil
 	}
-	probe, err := s.proveFullLength(ctx, s.landingVideo)
-	if err != nil {
+	candidates := append([]string{s.landingVideo}, proofCandidates...)
+	prove := func(videoID string) (FullLengthProbe, error) { return s.proveFullLength(ctx, videoID) }
+	if err := establishFromCandidates(ctx, prove, candidates, s.log); err != nil {
 		return err
-	}
-	if probe.Outcome == OutcomeVideoTooShort && s.landingVideo != DefaultVideo {
-		s.log.Info("waxseal: landing video too short to prove establishment; proving on the default video",
-			"landing", s.landingVideo, "proof", DefaultVideo)
-		if probe, err = s.proveFullLength(ctx, DefaultVideo); err != nil {
-			return err
-		}
-	}
-	if probe.Outcome != OutcomeFullLength {
-		return fmt.Errorf("waxseal: session not established: full-length proof outcome %q: %s", probe.Outcome, probe.Reason)
 	}
 	s.probeMu.Lock()
 	s.establishedStreaming = true
@@ -1323,8 +1369,8 @@ func (s *Session) VerifyFullLength(ctx context.Context, videoID string) (FullLen
 //
 // A negative result does not prove that status-2 caused the failure. Reason
 // records the observed establishment failure, player error, stall, or timeout.
-// The returned error is non-nil only when the context is canceled or the hard
-// timeout expires.
+// The returned error is non-nil when the context is canceled, the hard timeout
+// expires, or the video has a terminal playability status.
 //
 // The probe seeks and drives playback, so it should be run on demand rather than
 // as a frequent health check.
@@ -1347,12 +1393,18 @@ func (s *Session) proveFullLength(ctx context.Context, videoID string) (FullLeng
 	raw, err := s.establish(ctx, page, videoID, time.Now().Add(playerContextTimeout))
 	if err != nil {
 		// Establishment failures are reported as probe outcomes unless the caller
-		// canceled the operation.
+		// canceled the operation or the video is terminally unplayable.
 		probe.Outcome = OutcomeNotEstablished
 		probe.Reason = err.Error()
 		finish()
 		if ctx.Err() != nil {
 			return probe, ctx.Err()
+		}
+		// A terminal playability status describes the video, not the session.
+		// Return it so callers can select another proof candidate or report that the
+		// requested video is unavailable.
+		if errors.Is(err, ErrUnplayable) {
+			return probe, err
 		}
 		return probe, nil
 	}

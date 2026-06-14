@@ -146,6 +146,42 @@ func resolveReportDebounce(cmd *cobra.Command, o *serverOpts, logger *slog.Logge
 	return d, nil
 }
 
+// unbracketHost removes one pair of surrounding brackets. This allows --host to
+// accept IPv6 literals in bare or bracketed form before passing them to
+// net.JoinHostPort or net.ParseIP.
+func unbracketHost(host string) string {
+	if len(host) >= 2 && host[0] == '[' && host[len(host)-1] == ']' {
+		return host[1 : len(host)-1]
+	}
+	return host
+}
+
+// bindListener validates the port and binds the listen address. An invalid port
+// is a usage error. Other bind failures retain the error returned by net.Listen.
+// Port 0 asks the operating system to select an available port.
+func bindListener(host string, port int) (net.Listener, error) {
+	if port < 0 || port > 65535 {
+		return nil, &usageError{msg: fmt.Sprintf("invalid --port %d: must be 0-65535", port)}
+	}
+	return net.Listen("tcp", net.JoinHostPort(unbracketHost(host), strconv.Itoa(port)))
+}
+
+// isExposedHost reports whether host may accept connections from outside the
+// local machine. Only "localhost" and literal loopback addresses are considered
+// private. All other values, including wildcard addresses and hostnames, are
+// considered exposed.
+func isExposedHost(host string) bool {
+	host = unbracketHost(host)
+	if host == "localhost" {
+		return false
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return true
+	}
+	return !ip.IsLoopback()
+}
+
 func runServer(cmd *cobra.Command, o *serverOpts) error {
 	level := "info"
 	if o.verbose {
@@ -162,12 +198,33 @@ func runServer(cmd *cobra.Command, o *serverOpts) error {
 		logger.Error("startup: invalid configuration", "err", err)
 		return err
 	}
+	// Bind before launching Chromium so an invalid or unavailable address fails
+	// without running browser startup and attestation.
+	ln, err := bindListener(o.host, o.port)
+	if err != nil {
+		logger.Error("startup: bind listen address failed", "err", err)
+		return err
+	}
+	logger.Info("listening socket bound; launching browser", "addr", ln.Addr().String())
+	// Close the listener on startup failures. Serve owns it after startup succeeds.
+	served := false
+	defer func() {
+		if !served {
+			_ = ln.Close()
+		}
+	}()
+
 	// Remove profiles left by prior daemon instances that could not run normal cleanup.
 	browser.ReapStaleProfiles(logger)
 	keys := server.ParseTenantKeys(o.tenantKeys)
+	// Warn before browser startup when unauthenticated callers can access the guest
+	// identity.
+	if len(keys) == 0 && isExposedHost(o.host) {
+		logger.Warn("keyless daemon exposes the guest identity through /session and /player-context; pass --tenant-keys to require authentication", "host", o.host)
+	}
 
 	srv, err := server.New(server.Config{
-		Addr:            net.JoinHostPort(o.host, strconv.Itoa(o.port)),
+		Addr:            ln.Addr().String(),
 		Video:           o.video,
 		Headful:         o.headful,
 		TenantKeys:      keys,
@@ -208,9 +265,11 @@ func runServer(cmd *cobra.Command, o *serverOpts) error {
 	}
 
 	errCh := make(chan error, 1)
+	// Serve closes the listener before returning.
+	served = true
 	go func() {
-		logger.Info("waxseal server listening (bgutil /get_pot)", "addr", srv.Addr())
-		errCh <- srv.ListenAndServe()
+		logger.Info("waxseal server listening (bgutil /get_pot)", "addr", ln.Addr().String())
+		errCh <- srv.Serve(ln)
 	}()
 
 	ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)

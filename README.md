@@ -44,8 +44,11 @@ make jsbundle-browser   # regenerate internal/browser/bg_browser_bundle.js
 ## Run
 
 ```
-# HTTP daemon (defaults to loopback 127.0.0.1:4416). Warms one tenant and runs
-# startup checks before listening.
+# HTTP daemon (defaults to loopback 127.0.0.1:4416). It validates and binds the
+# listen address before launching the browser, then warms one tenant and runs
+# startup checks before serving. A /ping response with ok:true indicates
+# readiness. A TCP connection alone does not because the socket is bound during
+# startup.
 go run ./cmd/waxseal server
 curl -s localhost:4416/get_pot -d '{"content_binding":"<videoID>"}'   # returns {"poToken",...}
 curl -s localhost:4416/player-context -d '{"video_id":"<videoID>"}'   # returns a status-1 streaming context
@@ -56,6 +59,7 @@ curl -s localhost:4416/metrics                                        # per-tena
 # One-shot generation for bgutil script-provider integrations. This launches a
 # fresh browser for every call. Prefer the warm server for yt-dlp.
 go run ./cmd/waxseal -c <content_binding>
+# (max 4096-byte content_binding; oversized input exits 2 before browser startup)
 
 # Launch a browser, attest, and print the status-1 streaming context for a video.
 go run ./cmd/waxseal player-context <video_id>
@@ -67,13 +71,23 @@ go run ./cmd/waxseal doctor
 go run ./cmd/waxseal ping
 ```
 
+In each `/metrics` `per_tenant` object, the base counters plus
+`browser_proof_established` and `streaming_suspect` remain present after a
+`/report` retires the session. The state-dependent fields
+`last_browser_proof_outcome`, `last_browser_proof_age_secs`,
+`streaming_seconds_until_recycle`, and `streaming_suspect_video` appear only in
+the session states where they apply. Clients must check for these fields before
+reading them.
+
 At startup, the daemon attests one tenant, mints and caches a GVS token, and
-attempts to prove full-length streaming. A mint failure stops startup. If the
-streaming proof fails, the daemon logs the failure and continues; `/player-context`
-and `/session` retry the proof before returning. The proof usually takes 10-30
-seconds. In multi-tenant mode, other tenants attest on their first `/get_pot`,
-`/player-context`, or `/session` request. Their first `/player-context` or
-`/session` request performs the streaming proof.
+attempts to prove full-length streaming. The proof uses the landing video first,
+then tries a small list of fallback videos if the landing video is unavailable or
+too short. A mint failure stops startup. If the streaming proof fails, the daemon
+logs the failure and continues. `/player-context` and `/session` retry the proof
+before returning. The proof usually takes 10-30 seconds. In multi-tenant mode,
+other tenants attest on their first `/get_pot`, `/player-context`, or `/session`
+request. Their first `/player-context` or `/session` request performs the
+streaming proof.
 
 The daemon runs Chromium under go-rod's embedded *leakless* process guard. If
 WaxSeal terminates without running normal cleanup, such as after `SIGKILL`, a
@@ -94,7 +108,8 @@ location on a filesystem that permits execution:
 `TMPDIR=$HOME/tmp waxseal server`.
 
 `content_binding` identifies what the token is bound to. Use a **video_id** for a
-player token or **visitor_data** for a GVS token. The token is also bound to the
+player token or **visitor_data** for a GVS token. The value is limited to **4096
+bytes** to reject accidental oversized inputs. The token is also bound to the
 minting host's egress IP. The consumer must use the **same IP** for the SABR media
 request.
 
@@ -117,6 +132,11 @@ Without `--tenant-keys`, the daemon is **keyless single-tenant** so generic
 yt-dlp integrations can use the bgutil protocol without authentication. Send a
 tenant key as `X-API-Key`, `Authorization: Bearer <key>`, or `?key=<key>`. All
 tenant contexts currently use the host's egress IP.
+
+A keyless daemon bound to a **non-loopback host**, for example with `--host
+0.0.0.0`, serves the guest identity to any caller through `/session` and
+`/player-context`. The daemon logs an exposure warning at startup in that mode.
+Pass `--tenant-keys` to require a key.
 
 ## Player context (`/player-context`)
 
@@ -176,13 +196,28 @@ authentication, it always returns 200 and reports failures as
 `{ok:false,error}`. An unwarmed tenant reports
 `{ok:false,error:"no attested session"}`. If Chromium has died, `/ping` reports
 the failure and may retire the dead session. A later mint, player-context, or
-session request attempts to relaunch it. Unsupported methods on `/ping` or
-`/metrics` still return the `405` envelope. Unknown paths use net/http's
-plain-text 404 response.
+session request attempts to relaunch it. `/ping` reports **health only** and does
+not return guest identity data such as `visitor_data` or `api_key`. It keeps
+`navigator_webdriver` as a browser-detection signal. Use `/session` for identity.
+Unsupported methods on `/ping` or `/metrics` still return the `405` envelope.
+Unknown paths use net/http's plain-text 404 response.
 
 The `waxseal/client` package parses these envelopes into `*client.APIError` and
 provides matching `Code*` constants. It also accepts the older `{error}` format
 and non-JSON proxy responses.
+
+## Exit codes
+
+The CLI returns a stable process exit code so scripts can distinguish usage
+mistakes from runtime failures:
+
+| Code | Meaning |
+|---|---|
+| `0` | Success |
+| `1` | Runtime error (mint, browser, or I/O failure) |
+| `2` | Usage error (bad flag, missing or invalid argument) |
+| `3` | Video unavailable (terminal `playabilityStatus`) |
+| `130` | Interrupted (`SIGINT`/`SIGTERM`) |
 
 ## License
 

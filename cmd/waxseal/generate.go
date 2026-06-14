@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"time"
 
@@ -49,7 +48,12 @@ func runGenerate(cmd *cobra.Command, g *genOpts) error {
 	stdout, stderr := cmd.OutOrStdout(), cmd.ErrOrStderr()
 	if g.contentBinding == "" {
 		fmt.Fprintln(stdout, "{}")
-		return errors.New("content-binding (-c) is required")
+		return &usageError{msg: "content-binding (-c) is required"}
+	}
+	if len(g.contentBinding) > browser.MaxContentBindingBytes {
+		// The bgutil script-provider contract requires {} on stdout for failures.
+		fmt.Fprintln(stdout, "{}")
+		return &usageError{msg: fmt.Sprintf("content-binding too long (max %d bytes)", browser.MaxContentBindingBytes)}
 	}
 	level := "error"
 	if g.verbose {

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"strings"
 	"testing"
@@ -88,18 +89,102 @@ func TestExecuteUsageErrors(t *testing.T) {
 	}
 }
 
-// TestExecuteMissingBinding verifies the bgutil failure response without launching
-// a browser.
+// A missing -c argument must preserve the bgutil failure response.
 func TestExecuteMissingBinding(t *testing.T) {
 	code, stdout, stderr := runCLI()
-	if code != 1 {
-		t.Errorf("exit = %d, want 1", code)
+	if code != 2 {
+		t.Errorf("exit = %d, want 2", code)
 	}
 	if stdout != "{}\n" {
 		t.Errorf("stdout = %q, want %q", stdout, "{}\n")
 	}
 	if !strings.Contains(stderr, "content-binding (-c) is required") {
 		t.Errorf("stderr = %q, want the content-binding message", stderr)
+	}
+}
+
+func TestGetPotContentBindingTooLong(t *testing.T) {
+	over := strings.Repeat("a", browser.MaxContentBindingBytes+1)
+	code, stdout, stderr := runCLI("get-pot", "-c", over)
+	if code != 2 {
+		t.Errorf("exit = %d, want 2 (stderr=%q)", code, stderr)
+	}
+	if stdout != "{}\n" {
+		t.Errorf("stdout = %q, want %q (bgutil contract)", stdout, "{}\n")
+	}
+	if !strings.Contains(stderr, "too long") {
+		t.Errorf("stderr = %q, want it to mention the over-length binding", stderr)
+	}
+}
+
+func TestBindListener(t *testing.T) {
+	// Port 0 asks the operating system to assign an available port.
+	ln, err := bindListener("127.0.0.1", 0)
+	if err != nil {
+		t.Fatalf("bindListener(0) error = %v, want nil", err)
+	}
+	defer ln.Close()
+	if port := ln.Addr().(*net.TCPAddr).Port; port == 0 {
+		t.Error("bindListener(0) returned port 0, want an OS-assigned port")
+	}
+
+	// Out-of-range ports are usage errors and do not bind a socket.
+	for _, port := range []int{-1, 99999999} {
+		l, err := bindListener("127.0.0.1", port)
+		if l != nil {
+			l.Close()
+			t.Errorf("bindListener(%d) returned a listener, want nil", port)
+		}
+		if _, ok := errors.AsType[*usageError](err); !ok {
+			t.Errorf("bindListener(%d) error = %v (%T), want *usageError", port, err, err)
+		}
+	}
+
+	// An unavailable port is a runtime error, not a usage error.
+	taken := ln.Addr().(*net.TCPAddr).Port
+	if l, err := bindListener("127.0.0.1", taken); err == nil {
+		l.Close()
+		t.Fatal("bindListener on an in-use port = nil error, want an address-in-use error")
+	} else if _, ok := errors.AsType[*usageError](err); ok {
+		t.Errorf("in-use bind error is *usageError, want a runtime error (exit 1)")
+	}
+}
+
+func TestBindListenerBracketedIPv6(t *testing.T) {
+	l, err := bindListener("[::1]", 0)
+	if err != nil {
+		t.Skipf("IPv6 loopback unavailable: %v", err)
+	}
+	defer l.Close()
+	if ip := l.Addr().(*net.TCPAddr).IP; !ip.IsLoopback() {
+		t.Errorf("bindListener(\"[::1]\") bound %v, want an IPv6 loopback address", ip)
+	}
+}
+
+func TestIsExposedHost(t *testing.T) {
+	for _, h := range []string{"localhost", "127.0.0.1", "::1", "[::1]"} {
+		if isExposedHost(h) {
+			t.Errorf("isExposedHost(%q) = true, want false (loopback)", h)
+		}
+	}
+	for _, h := range []string{"0.0.0.0", "::", "[::]", "192.168.1.5", "example.com", ""} {
+		if !isExposedHost(h) {
+			t.Errorf("isExposedHost(%q) = false, want true (exposed)", h)
+		}
+	}
+}
+
+func TestServerInvalidPortUsageError(t *testing.T) {
+	// Ensure configuration parsing reaches bindListener regardless of the caller's
+	// environment.
+	t.Setenv("WAXSEAL_STREAMING_MAX_AGE", "")
+	t.Setenv("WAXSEAL_REPORT_DEBOUNCE", "")
+	code, _, stderr := runCLI("server", "--port", "99999999")
+	if code != 2 {
+		t.Errorf("exit = %d, want 2 (stderr=%q)", code, stderr)
+	}
+	if !strings.Contains(stderr, "invalid --port") {
+		t.Errorf("stderr = %q, want it to mention the invalid port", stderr)
 	}
 }
 
