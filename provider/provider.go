@@ -13,8 +13,8 @@ import (
 	"github.com/colespringer/waxtap/potoken"
 )
 
-// ErrUnsupportedScope is returned for scopes WaxSeal does not serve. At present,
-// only ScopeSubtitles is unsupported.
+// ErrUnsupportedScope is returned for a scope WaxSeal does not serve, such as
+// ScopeSubtitles.
 var ErrUnsupportedScope = errors.New("waxseal/provider: unsupported PO-token scope")
 
 // Provider adapts a *client.Client to potoken.Provider.
