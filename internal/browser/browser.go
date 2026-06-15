@@ -129,6 +129,9 @@ type Session struct {
 // watch page, captures the identity, injects the bundle, and builds the Go HTTP
 // client. The caller must Close the returned Session. For multiple isolated
 // identities on one browser (multi-tenant), use LaunchPool and Pool.NewSession.
+//
+// Launch does not validate videoID. Callers that accept user input should check it
+// with ValidVideoID before calling Launch.
 func Launch(ctx context.Context, videoID string, opts Options) (*Session, error) {
 	opts = withDefaults(opts)
 	browser, l, profile, err := launchChromium(opts)
@@ -877,7 +880,10 @@ func (s *Session) Mint(ctx context.Context, identifier string) (MintResult, erro
 // client.PlayerContext mirrors this wire format without importing the browser
 // package. Keep the JSON tags in sync.
 type PlayerContext struct {
-	Status                       string        `json:"status"`     // playabilityStatus.status; "OK" when streamable
+	// PlayabilityStatus is playabilityStatus.status, which is "OK" when the video
+	// is streamable. It is distinct from the SABR status-1 protection code embedded
+	// in ServerAbrStreamingURL.
+	PlayabilityStatus            string        `json:"playability_status"`
 	PlayerURL                    string        `json:"player_url"` // base.js URL used to descramble the SABR URL's n parameter
 	ServerAbrStreamingURL        string        `json:"server_abr_streaming_url"`
 	VideoPlaybackUstreamerConfig string        `json:"video_playback_ustreamer_config"`
@@ -971,7 +977,7 @@ const playerContextExtractJS = `(videoId) => {
 		const errMark = window.__wsErr;
 		const status = (j && j.playabilityStatus && j.playabilityStatus.status) || '';
 		const evidence = {
-			status: status,
+			playability_status: status,
 			reason: (j && j.playabilityStatus && j.playabilityStatus.reason) || '',
 			error_code: (errMark && typeof errMark.code === 'number') ? errMark.code : 0,
 			err_gen_match: !!(errMark && errMark.gen === window.__wsGen),
@@ -1005,7 +1011,7 @@ const playerContextExtractJS = `(videoId) => {
 			return '';
 		})();
 		return JSON.stringify({
-			status: status,
+			playability_status: status,
 			player_url: playerJs ? new URL(playerJs, location.origin).href : '',
 			server_abr_streaming_url: sd.serverAbrStreamingUrl,
 			video_playback_ustreamer_config: urc.videoPlaybackUstreamerConfig || '',
@@ -1055,8 +1061,8 @@ func confirmTerminal(raw playerContextRaw, videoID string) (*UnplayableError, bo
 	if raw.ErrGenMatch && raw.ErrVideoID == videoID && isUnavailableCode(raw.ErrCode) {
 		return &UnplayableError{Status: "ERROR", Detail: fmt.Sprintf("player onError %d", raw.ErrCode)}, true
 	}
-	if raw.Status != "" && raw.Status != "OK" && raw.VideoIDMatch {
-		return &UnplayableError{Status: raw.Status, Detail: raw.Reason}, true
+	if raw.PlayabilityStatus != "" && raw.PlayabilityStatus != "OK" && raw.VideoIDMatch {
+		return &UnplayableError{Status: raw.PlayabilityStatus, Detail: raw.Reason}, true
 	}
 	return nil, false
 }
@@ -1096,7 +1102,7 @@ func (s *Session) PlayerContext(ctx context.Context, videoID string) (PlayerCont
 		return PlayerContext{}, err
 	}
 	if raw.ServerAbrStreamingURL == "" {
-		return PlayerContext{}, fmt.Errorf("waxseal: player-context: no serverAbrStreamingUrl (playabilityStatus %q)", raw.Status)
+		return PlayerContext{}, fmt.Errorf("waxseal: player-context: no serverAbrStreamingUrl (playabilityStatus %q)", raw.PlayabilityStatus)
 	}
 	if raw.PlayerURL == "" {
 		return PlayerContext{}, fmt.Errorf("waxseal: player-context: no player_url (PLAYER_JS_URL missing); consumer cannot descramble n")

@@ -217,6 +217,9 @@ func TestMinterEscalationLadder(t *testing.T) {
 	if got := m.metrics.Escalations.Load(); got != 1 {
 		t.Errorf("escalations = %d, want 1", got)
 	}
+	if got := m.metrics.Crashes.Load(); got != 0 {
+		t.Errorf("crashes = %d, want 0 (a mint failure relaunch is not a browser loss)", got)
+	}
 	smu.Lock()
 	defer smu.Unlock()
 	if len(*sessions) != 2 {
@@ -250,7 +253,7 @@ func TestMinterCrashKeepsCacheThenRelaunchInvalidates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ensure: %v", err)
 	}
-	m.retire(gen, "simulated crash") // browser dies; generation unchanged
+	m.retire(gen, "simulated crash", true) // Browser loss does not advance the generation.
 
 	smu.Lock()
 	firstClosed := (*sessions)[0].closed.Load()
@@ -291,7 +294,7 @@ func TestMinterPlayerContextReusesWarmSession(t *testing.T) {
 		func(videoID string) (browser.PlayerContext, error) {
 			atomic.AddInt64(&calls, 1)
 			return browser.PlayerContext{
-				Status:                "OK",
+				PlayabilityStatus:     "OK",
 				ServerAbrStreamingURL: "https://r1.googlevideo.com/videoplayback?n=scram-" + videoID,
 				VisitorData:           "vd",
 				ClientVersion:         "2.20260606.02.00",
@@ -329,7 +332,7 @@ func TestMinterPlayerContextEscalation(t *testing.T) {
 			if n := atomic.AddInt64(&attempt, 1); n <= 2 {
 				return browser.PlayerContext{}, fmt.Errorf("transient failure %d", n)
 			}
-			return browser.PlayerContext{Status: "OK", ServerAbrStreamingURL: "https://r/ok", VisitorData: "vd"}, nil
+			return browser.PlayerContext{PlayabilityStatus: "OK", ServerAbrStreamingURL: "https://r/ok", VisitorData: "vd"}, nil
 		},
 	)
 	ctx := context.Background()
@@ -529,7 +532,7 @@ func TestMinterHealthLivePing(t *testing.T) {
 	}
 }
 
-// A failed probe retires the session when no browser operation is in progress.
+// A failed health probe retires the idle session and counts the browser loss.
 func TestMinterHealthDeadPingRetires(t *testing.T) {
 	m, sessions, smu := newPingMinter(func() error { return errors.New("cdp connection closed") })
 	if err := m.Warm(context.Background()); err != nil {
@@ -538,10 +541,34 @@ func TestMinterHealthDeadPingRetires(t *testing.T) {
 	if _, _, err := m.Health(context.Background()); err == nil {
 		t.Fatal("Health = nil, want the probe error")
 	}
+	if got := m.metrics.Crashes.Load(); got != 1 {
+		t.Errorf("crashes = %d, want 1 (an unresponsive /ping counts as browser loss)", got)
+	}
 	smu.Lock()
 	defer smu.Unlock()
 	if !(*sessions)[0].closed.Load() {
 		t.Error("failed probe did not retire the idle session")
+	}
+}
+
+// retire counts a crash once for the current generation and ignores stale ones.
+func TestMinterRetireCrashCount(t *testing.T) {
+	m, _, _, _ := newTestMinter(okMint)
+	if err := m.Warm(context.Background()); err != nil {
+		t.Fatalf("warm: %v", err)
+	}
+	gen := m.Generation()
+	if m.retire(gen+1, "stale", true) {
+		t.Error("retire(staleGen, crash) = true, want false")
+	}
+	if got := m.metrics.Crashes.Load(); got != 0 {
+		t.Errorf("crashes after a stale retire = %d, want 0", got)
+	}
+	if !m.retire(gen, "browser connection lost", true) {
+		t.Fatal("retire(gen, crash) = false, want true")
+	}
+	if got := m.metrics.Crashes.Load(); got != 1 {
+		t.Errorf("crashes = %d, want 1", got)
 	}
 }
 
@@ -793,6 +820,9 @@ func TestMinterStreamingFreshnessRecycleOnPlayerContext(t *testing.T) {
 	if got := m.metrics.ReportDrivenRecycles.Load(); got != 0 {
 		t.Errorf("report_driven_recycles = %d, want 0 (staleness is not a report)", got)
 	}
+	if got := m.metrics.Crashes.Load(); got != 0 {
+		t.Errorf("crashes = %d, want 0 (an age-driven streaming recycle is not browser loss)", got)
+	}
 	smu.Lock()
 	defer smu.Unlock()
 	if !(*sessions)[0].closed.Load() {
@@ -891,6 +921,9 @@ func TestMinterReportDegradedImmediateRetire(t *testing.T) {
 	}
 	if got := m.metrics.StreamingRecycles.Load(); got != 0 {
 		t.Errorf("streaming_recycles = %d, want 0 (a report is not a staleness recycle)", got)
+	}
+	if got := m.metrics.Crashes.Load(); got != 0 {
+		t.Errorf("crashes = %d, want 0 (a consumer report is an intentional recycle)", got)
 	}
 	smu.Lock()
 	if !(*sessions)[0].closed.Load() {
@@ -1124,7 +1157,7 @@ func TestMinterRetireClearsSuspect(t *testing.T) {
 	m.reportSuspectVideoID = "vid"
 	m.mu.Unlock()
 
-	if !m.retire(1, "browser target crashed") {
+	if !m.retire(1, "browser target crashed", true) {
 		t.Fatal("retire(1) = false, want true for the current generation")
 	}
 	m.mu.Lock()
@@ -1134,7 +1167,7 @@ func TestMinterRetireClearsSuspect(t *testing.T) {
 		t.Errorf("suspect after retire = (gen=%d, vid=%q), want cleared", gen, vid)
 	}
 	// A retire of a non-current generation is a no-op returning false.
-	if m.retire(99, "stale") {
+	if m.retire(99, "stale", false) {
 		t.Error("retire(99) = true, want false for a non-current generation")
 	}
 }
@@ -1189,7 +1222,7 @@ func TestMinterHealthSnapshotSingleGeneration(t *testing.T) {
 	if err != nil || !live || snap.Generation != 1 || !snap.BrowserProofEstablished {
 		t.Fatalf("gen-1 snapshot = %+v (live=%v err=%v), want Generation 1 established", snap, live, err)
 	}
-	if !m.retire(1, "recycle") {
+	if !m.retire(1, "recycle", false) {
 		t.Fatal("retire(1) failed")
 	}
 	if err := m.Warm(ctx); err != nil { // gen 2 (not established)
@@ -1271,7 +1304,7 @@ func TestMinterMetricsSnapshotStableWhenNotLive(t *testing.T) {
 	if err := m.Warm(context.Background()); err != nil {
 		t.Fatalf("warm: %v", err)
 	}
-	if !m.retire(1, "test") {
+	if !m.retire(1, "test", false) {
 		t.Fatal("retire(1) returned false, want true")
 	}
 	snap := m.MetricsSnapshot()

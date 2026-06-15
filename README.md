@@ -1,225 +1,186 @@
 # WaxSeal
 
-A YouTube **PO Token (POT)** provider that runs Google's **BotGuard** in a real
-headless Chromium through [go-rod](https://github.com/go-rod/rod). WaxSeal
-handles attestation, token binding, caching, multi-tenancy, and its HTTP and CLI
-interfaces in Go.
+WaxSeal is a YouTube **PO Token (POT)** provider that runs Google's BotGuard in
+a real headless Chromium through [go-rod](https://github.com/go-rod/rod). It
+provides a bgutil-compatible HTTP daemon, a CLI, and reusable Go clients.
 
-BotGuard can inspect the browser's real navigator instead of an emulated
-JavaScript environment. This reliably earns the **integrity** token grade.
-WaxSeal runs as a bgutil-compatible HTTP daemon or a CLI.
+Using a real browser lets BotGuard inspect the actual navigator and reliably
+produce tokens with the **integrity** grade.
 
-> **Requires a system Chromium at runtime** (auto-detected, or set
-> `WAXSEAL_CHROME_BIN`). The Go binary cross-compiles normally, but it is not
-> self-contained because it drives an external browser.
+> WaxSeal requires a system Chromium at runtime. WaxSeal auto-detects the
+> executable. Set `WAXSEAL_CHROME_BIN` to override it. The Go binary
+> cross-compiles normally but is not self-contained.
 
-## Layout
+## Quick start
 
+```sh
+go build ./...
+go test ./...
+
+# Start the daemon on 127.0.0.1:4416.
+go run ./cmd/waxseal server
+
+# Mint a token, export an attested identity, or get a streaming context.
+curl -s localhost:4416/get_pot -d '{"content_binding":"<video_id>"}'
+curl -s localhost:4416/session
+curl -s localhost:4416/player-context -d '{"video_id":"<video_id>"}'
+
+# Health and metrics.
+curl -s localhost:4416/ping
+curl -s localhost:4416/metrics
 ```
-client/              Reusable, WaxTap-free Go client for the HTTP API
-cmd/waxseal/         CLI commands
-server/              HTTP daemon and wire protocol
-internal/browser/    Chromium sessions, contexts, and embedded browser bundle
-internal/minter/     Token caching, retries, recovery, and tenant routing
-internal/botguard/   Challenge parsing, GenerateIT, and token validation
-internal/innertube/  InnerTube challenge and guest identity requests
-internal/httpx/      Shared HTTP retries, backoff, and response limits
-build/js/            Source and build script for the embedded browser bundle
-provider/            WaxTap provider adapter in a separate Go module
+
+The daemon binds its socket before browser startup, but it is ready only when
+`/ping` returns `{"ok":true,...}`. Startup attests the first tenant, caches a
+GVS token, and attempts a full-length streaming proof, which usually takes
+10-30 seconds. A mint failure stops startup. A failed streaming proof is logged
+and retried by `/player-context` or `/session`.
+
+Other CLI commands:
+
+```sh
+go run ./cmd/waxseal -c <content_binding>       # one-shot token generation
+go run ./cmd/waxseal player-context <video_id> # one-shot streaming context
+go run ./cmd/waxseal doctor                    # report identity and token grade
+go run ./cmd/waxseal ping                      # check a running daemon
 ```
 
-Any Go application can use the `client` package to call a WaxSeal daemon:
-`client.New(url).POToken(ctx, contentBinding, scope)` and `.Session(ctx)`. The
-`provider/` module maps that client to WaxTap's `potoken.Provider` interface.
+One-shot generation launches a fresh browser each time. Prefer the warm daemon
+for repeated requests. Commands that accept `--video` require a bare video ID,
+not a URL.
 
-## Build and test
+## HTTP API
 
+| Method | Endpoint | Purpose |
+|---|---|---|
+| `POST` | `/get_pot` | Mint or retrieve a cached PO token |
+| `GET`, `POST` | `/player-context` | Return an attested streaming context |
+| `GET` | `/session` | Export the attested guest identity and cookies |
+| `POST` | `/report` | Report a degraded stream and recycle its session |
+| `GET` | `/ping` | Check the current browser session without minting |
+| `GET` | `/metrics` | Return per-tenant counters |
+
+### Tokens and identity
+
+For `/get_pot`, `content_binding` is a **video ID** for a player token or
+**visitor data** for a GVS token. It is limited to 4096 bytes. The optional
+`scope` may be `player` or `gvs`. It only separates cache entries.
+
+Tokens and exported identities are bound to the minting host's egress IP. The
+consumer must use that same IP for SABR media requests.
+
+`/session` proves full-length streaming, then returns the tenant's anonymous
+`visitor_data`, cookies, and `session_generation`. Exported sessions do not
+contain a Google login.
+
+### Player context
+
+`POST /player-context {"video_id":"<id>"}` or
+`GET /player-context?video_id=<id>` returns the browser's streaming context and
+`session_generation`. The response includes the signed SABR URL, ustreamer
+config, visitor data, client version, player URL, and audio formats. Consumers
+use the player URL to descramble the SABR URL's throttling nonce.
+
+`playability_status` is YouTube's string status, such as `"OK"`. It is not the
+SABR status-1 protection code, which is embedded in the signed SABR URL.
+
+### Session reports
+
+When a stream is degraded, report the generation returned by `/session` or
+`/player-context`:
+
+```sh
+curl -s localhost:4416/report -d '{
+  "session_generation": 1,
+  "video_id": "<video_id>",
+  "reason": "truncated"
+}'
 ```
-go build ./...          # no Node toolchain needed; the browser bundle is committed
+
+`session_generation` is required. Optional `video_id` and `reason` values must
+be 1-64 characters from `[A-Za-z0-9_-]`. The response includes the current
+`generation` and the boolean fields `accepted`, `retired`, and
+`retirement_pending`.
+
+Reports are scoped and rate-limited per tenant. After a report-driven recycle,
+another report within `--report-debounce` (default `5m`) is rejected and returns
+`retry_after_seconds`. Stale or future generations are ignored.
+
+### Authentication and tenants
+
+By default the daemon is keyless and single-tenant. Configure isolated browser
+contexts with API keys:
+
+```sh
+go run ./cmd/waxseal server --tenant-keys "alice=KEYA,bob=KEYB"
+curl -s localhost:4416/get_pot \
+  -H "X-API-Key: KEYA" \
+  -d '{"content_binding":"<id>"}'
+```
+
+Keys may be sent with `X-API-Key`, `Authorization: Bearer <key>`, or
+`?key=<key>`. A keyless daemon bound to a non-loopback host exposes its guest
+identity through `/session` and `/player-context`. Use `--tenant-keys` when
+exposing the service.
+
+`--tenant-keys` accepts comma-separated `label=key` entries or bare keys, which
+receive generated labels. Labels and keys must be non-empty and unique. Invalid
+configurations stop startup before Chromium launches.
+
+### Errors
+
+Recognized endpoints return errors as
+`{"error":"human-readable message","code":"machine-readable-code"}`. For
+`video-unavailable`, the optional `details` field contains the playability
+status.
+
+| Code | HTTP | Meaning |
+|---|---:|---|
+| `invalid-request` | 400 | Malformed or invalid input |
+| `unauthorized` | 401 | Missing or invalid API key |
+| `method-not-allowed` | 405 | Unsupported HTTP method |
+| `video-unavailable` | 422 | Terminal playability status |
+| `mint-failed`, `player-context-failed` | 502 | Upstream operation failed |
+| `no-session` | 503 | No attested session is available |
+| `timeout` | 504 | Player-context deadline elapsed |
+
+`/ping` is the exception: after authentication it returns HTTP 200 with either
+`ok:true` or `ok:false`. The `client` package parses API errors into
+`*client.APIError` and provides matching code constants.
+
+## Operations
+
+One Chromium process hosts an isolated incognito context per tenant. Additional
+tenants attest on their first token, player-context, or session request.
+
+WaxSeal runs Chromium under go-rod's leakless process guard and cleans up
+abandoned WaxSeal profiles that it can identify on Unix startup. On shared
+hosts, set `TMPDIR` to a private directory. If `/tmp` is mounted `noexec`, set
+`TMPDIR` to a writable filesystem that permits execution.
+
+The `crashes` metric counts unexpected browser loss detected by Chromium events
+or a failed health probe. Session retirement caused by age, a consumer report,
+or operation retries does not increment it.
+
+Use `go run ./cmd/waxseal server --help` for configuration options, including
+session recycling, report debounce, bind address, and headful mode.
+
+## Development
+
+```sh
 go test ./...           # offline unit tests
-make deps               # install dependencies used to rebuild the browser bundle
+make deps               # install browser-bundle build dependencies
 make jsbundle-browser   # regenerate internal/browser/bg_browser_bundle.js
 ```
 
-## Run
+The committed browser bundle means normal Go builds do not require Node. The
+`client` package is a reusable, WaxTap-free HTTP client. The separate
+`provider/` module adapts it to WaxTap's `potoken.Provider` interface.
 
-```
-# HTTP daemon (defaults to loopback 127.0.0.1:4416). It validates and binds the
-# listen address before launching the browser, then warms one tenant and runs
-# startup checks before serving. A /ping response with ok:true indicates
-# readiness. A TCP connection alone does not because the socket is bound during
-# startup.
-go run ./cmd/waxseal server
-curl -s localhost:4416/get_pot -d '{"content_binding":"<videoID>"}'   # returns {"poToken",...}
-curl -s localhost:4416/player-context -d '{"video_id":"<videoID>"}'   # returns a status-1 streaming context
-curl -s localhost:4416/session                                        # returns visitor_data and cookies
-curl -s localhost:4416/ping                                           # liveness probe of the browser; never mints
-curl -s localhost:4416/metrics                                        # per-tenant counters
-
-# One-shot generation for bgutil script-provider integrations. This launches a
-# fresh browser for every call. Prefer the warm server for yt-dlp.
-go run ./cmd/waxseal -c <content_binding>
-# (max 4096-byte content_binding; oversized input exits 2 before browser startup)
-
-# Launch a browser, attest, and print the status-1 streaming context for a video.
-go run ./cmd/waxseal player-context <video_id>
-
-# Launch a browser, attest, and report the identity and token grade.
-go run ./cmd/waxseal doctor
-
-# Check a running daemon. The command exits nonzero when the daemon is unhealthy.
-go run ./cmd/waxseal ping
-```
-
-In each `/metrics` `per_tenant` object, the base counters plus
-`browser_proof_established` and `streaming_suspect` remain present after a
-`/report` retires the session. The state-dependent fields
-`last_browser_proof_outcome`, `last_browser_proof_age_secs`,
-`streaming_seconds_until_recycle`, and `streaming_suspect_video` appear only in
-the session states where they apply. Clients must check for these fields before
-reading them.
-
-At startup, the daemon attests one tenant, mints and caches a GVS token, and
-attempts to prove full-length streaming. The proof uses the landing video first,
-then tries a small list of fallback videos if the landing video is unavailable or
-too short. A mint failure stops startup. If the streaming proof fails, the daemon
-logs the failure and continues. `/player-context` and `/session` retry the proof
-before returning. The proof usually takes 10-30 seconds. In multi-tenant mode,
-other tenants attest on their first `/get_pot`, `/player-context`, or `/session`
-request. Their first `/player-context` or `/session` request performs the
-streaming proof.
-
-The daemon runs Chromium under go-rod's embedded *leakless* process guard. If
-WaxSeal terminates without running normal cleanup, such as after `SIGKILL`, a
-crash, or an OOM kill, leakless terminates Chromium's process group. On the next
-startup, WaxSeal removes abandoned profile directories that it can identify
-safely. A directory must match `~/.waxseal-<digits>`, contain WaxSeal's marker,
-and have an unlocked marker file. Locked, unmarked, and unrelated paths are left
-in place. This startup cleanup is disabled on Windows because it relies on
-advisory file locks. Normal `SIGTERM`, `SIGINT`, and `docker stop` shutdowns
-remove profile directories during shutdown.
-
-Leakless stores its guard in `os.TempDir()/leakless-<arch>-<version>/` and
-executes it from there. On Unix, WaxSeal creates the directory with mode `0700`
-when it does not exist, then rejects symlinks, paths owned by another user, and
-paths writable by a group or other users. On a **shared multi-user host**, set
-`TMPDIR` to a private directory. If `/tmp` is mounted `noexec`, use a writable
-location on a filesystem that permits execution:
-`TMPDIR=$HOME/tmp waxseal server`.
-
-`content_binding` identifies what the token is bound to. Use a **video_id** for a
-player token or **visitor_data** for a GVS token. The value is limited to **4096
-bytes** to reject accidental oversized inputs. The token is also bound to the
-minting host's egress IP. The consumer must use the **same IP** for the SABR media
-request.
-
-The optional `scope` may be **`player`** or **`gvs`**. If omitted, WaxSeal uses
-the generic, bgutil-compatible cache key. The `content_binding` determines the
-token type; `scope` only distinguishes cache entries. An unknown scope returns
-`400 invalid-request`.
-
-## Multi-tenant
-
-One Chromium hosts an isolated incognito **browser context** for each tenant.
-Each context has its own guest identity and cookies. API keys select the tenant:
-
-```
-go run ./cmd/waxseal server --tenant-keys "alice=KEYA,bob=KEYB"
-curl -s localhost:4416/get_pot -H "X-API-Key: KEYA" -d '{"content_binding":"<id>"}'
-```
-
-Without `--tenant-keys`, the daemon is **keyless single-tenant** so generic
-yt-dlp integrations can use the bgutil protocol without authentication. Send a
-tenant key as `X-API-Key`, `Authorization: Bearer <key>`, or `?key=<key>`. All
-tenant contexts currently use the host's egress IP.
-
-A keyless daemon bound to a **non-loopback host**, for example with `--host
-0.0.0.0`, serves the guest identity to any caller through `/session` and
-`/player-context`. The daemon logs an exposure warning at startup in that mode.
-Pass `--tenant-keys` to require a key.
-
-## Player context (`/player-context`)
-
-`POST /player-context {"video_id":"<id>"}` (or `?video_id=<id>`) returns the
-attested browser's **status-1** streaming context for a video. The response
-includes the `server_abr_streaming_url`, ustreamer config, visitor data, client
-version, player URL, and audio formats. The consumer must use `player_url` to
-descramble the throttling nonce in the SABR URL. Each audio format includes the
-`itag`, `lmt`, and `xtags` values needed to select that exact format.
-
-WaxSeal obtains the context from the browser. The consumer performs the SABR
-streaming request.
-
-## Coherence handoff (`/session`)
-
-`GET /session` proves full-length streaming, then exports the tenant context's
-anonymous `visitor_data` and cookies. A consumer can adopt that identity and pair
-it with a `/get_pot` token bound to the same `visitor_data`. The consumer must
-also use the same egress IP.
-
-Full-length WEB audio requires the GVS token and the attested identity. Consumers
-can adopt the identity through `/session` or request a status-1 streaming context
-through `/player-context`. Exported sessions do not contain a Google login.
-
-## Error responses
-
-Every error response from a recognized endpoint uses a JSON envelope with a
-stable machine-readable `code` and a human-readable `error`, so consumers can
-branch on the code without parsing the message. This includes the `405` returned
-when an endpoint is called with an unsupported HTTP method:
-
-```json
-{
-  "error": "waxseal: video unplayable (playabilityStatus \"LOGIN_REQUIRED\")",
-  "code": "video-unavailable",
-  "details": "LOGIN_REQUIRED"
-}
-```
-
-`details` is optional. For `video-unavailable`, it contains the bare
-`playabilityStatus`.
-
-| `code` | HTTP | Meaning |
-|---|---|---|
-| `unauthorized` | 401 | Missing or invalid API key |
-| `method-not-allowed` | 405 | Unsupported HTTP method for the endpoint |
-| `invalid-request` | 400 | Malformed JSON or a missing or invalid field |
-| `mint-failed` | 502 | Token mint failed |
-| `video-unavailable` | 422 | Terminal `playabilityStatus`; `details` contains the status |
-| `timeout` | 504 | Player-context deadline elapsed |
-| `player-context-failed` | 502 | Other player-context failure |
-| `no-session` | 503 | No attested session or cookies available |
-
-`GET /ping` is the exception to this contract. It checks the existing browser
-session without minting, establishing, or launching Chromium. After
-authentication, it always returns 200 and reports failures as
-`{ok:false,error}`. An unwarmed tenant reports
-`{ok:false,error:"no attested session"}`. If Chromium has died, `/ping` reports
-the failure and may retire the dead session. A later mint, player-context, or
-session request attempts to relaunch it. `/ping` reports **health only** and does
-not return guest identity data such as `visitor_data` or `api_key`. It keeps
-`navigator_webdriver` as a browser-detection signal. Use `/session` for identity.
-Unsupported methods on `/ping` or `/metrics` still return the `405` envelope.
-Unknown paths use net/http's plain-text 404 response.
-
-The `waxseal/client` package parses these envelopes into `*client.APIError` and
-provides matching `Code*` constants. It also accepts the older `{error}` format
-and non-JSON proxy responses.
-
-## Exit codes
-
-The CLI returns a stable process exit code so scripts can distinguish usage
-mistakes from runtime failures:
-
-| Code | Meaning |
-|---|---|
-| `0` | Success |
-| `1` | Runtime error (mint, browser, or I/O failure) |
-| `2` | Usage error (bad flag, missing or invalid argument) |
-| `3` | Video unavailable (terminal `playabilityStatus`) |
-| `130` | Interrupted (`SIGINT`/`SIGTERM`) |
+CLI exit codes are `0` for success, `1` for runtime failure, `2` for usage
+errors, `3` for unavailable videos, and `130` for interruption.
 
 ## License
 
-MIT. Implemented independently; the GPL-3.0 bgutil project is a behavioral/wire
-reference only (no code copied). See [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
+MIT. Implemented independently. The GPL-3.0 bgutil project is a behavioral and
+wire reference only. See [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).

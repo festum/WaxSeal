@@ -99,7 +99,7 @@ func TestPlayerContext(t *testing.T) {
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		gotVideoID = req.VideoID
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"status":                   "OK",
+			"playability_status":       "OK",
 			"player_url":               "https://www.youtube.com/s/player/abc/base.js",
 			"server_abr_streaming_url": "https://r1.googlevideo.com/videoplayback?n=scram",
 			"visitor_data":             "VD",
@@ -125,6 +125,9 @@ func TestPlayerContext(t *testing.T) {
 	}
 	if pc.SessionGeneration != 3 {
 		t.Errorf("session_generation = %d, want 3", pc.SessionGeneration)
+	}
+	if pc.PlayabilityStatus != "OK" {
+		t.Errorf("playability_status = %q, want OK", pc.PlayabilityStatus)
 	}
 	if len(pc.AudioFormats) != 1 || pc.AudioFormats[0].Itag != 251 || pc.AudioFormats[0].MimeType != "audio/webm" {
 		t.Errorf("audio formats = %+v", pc.AudioFormats)

@@ -253,7 +253,7 @@ func (s *Server) handlePlayerContext(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.log.Info("player-context handed out", "tenant", label, "video_id_len", len(videoID), "generation", gen,
-		"status", pc.Status, "abr_url_len", len(pc.ServerAbrStreamingURL), "audio_formats", len(pc.AudioFormats))
+		"playability_status", pc.PlayabilityStatus, "abr_url_len", len(pc.ServerAbrStreamingURL), "audio_formats", len(pc.AudioFormats))
 	// Keep the embedded context fields at the top level for wire compatibility.
 	writeJSON(w, http.StatusOK, struct {
 		browser.PlayerContext
@@ -538,28 +538,62 @@ func writeErrDetails(w http.ResponseWriter, status int, code, msg, details strin
 	writeJSON(w, status, errEnvelope{Error: msg, Code: code, Details: details})
 }
 
-// ParseTenantKeys parses "label1=key1,label2=key2" or a bare key into a map from
-// API key to tenant label. Empty input selects keyless single-tenant mode.
-func ParseTenantKeys(s string) map[string]string {
+// ParseTenantKeys parses comma-separated label=key entries and bare API keys into
+// a map from API key to tenant label. Bare keys receive generated labels. Empty
+// input selects keyless single-tenant mode.
+//
+// Empty or duplicate keys and labels are rejected. Generated labels do not
+// collide with explicit labels, and errors never include API keys.
+func ParseTenantKeys(s string) (map[string]string, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
-		return nil
+		return nil, nil
 	}
-	out := map[string]string{}
-	for i, pair := range strings.Split(s, ",") {
+	out := map[string]string{} // API key -> tenant label
+	labels := map[string]bool{}
+	var bareKeys []string
+	for _, pair := range strings.Split(s, ",") {
 		if pair = strings.TrimSpace(pair); pair == "" {
-			continue
+			continue // tolerate a stray or trailing comma
 		}
 		before, after, found := strings.Cut(pair, "=")
-		key, label := strings.TrimSpace(before), ""
-		if found {
-			label, key = strings.TrimSpace(before), strings.TrimSpace(after)
-		} else {
-			label = "t" + strconv.Itoa(i+1) // don't echo the key as a label
+		if !found {
+			if _, dup := out[pair]; dup {
+				return nil, errors.New("duplicate API key")
+			}
+			out[pair] = "" // placeholder; filled in the second pass
+			bareKeys = append(bareKeys, pair)
+			continue
 		}
-		if key != "" {
-			out[key] = label
+		label, key := strings.TrimSpace(before), strings.TrimSpace(after)
+		if label == "" {
+			return nil, errors.New(`tenant entry has an empty label (use "label=key")`)
 		}
+		if key == "" {
+			return nil, fmt.Errorf("tenant label %q has an empty key", label)
+		}
+		if _, dup := out[key]; dup {
+			return nil, errors.New("duplicate API key")
+		}
+		if labels[label] {
+			return nil, fmt.Errorf("duplicate tenant label %q", label)
+		}
+		out[key] = label
+		labels[label] = true
 	}
-	return out
+	// Give each bare key the next unused t<N> label.
+	n := 1
+	for _, key := range bareKeys {
+		for labels["t"+strconv.Itoa(n)] {
+			n++
+		}
+		label := "t" + strconv.Itoa(n)
+		out[key] = label
+		labels[label] = true
+		n++
+	}
+	if len(out) == 0 {
+		return nil, errors.New("--tenant-keys contains no API keys")
+	}
+	return out, nil
 }

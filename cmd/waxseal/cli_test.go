@@ -188,6 +188,78 @@ func TestServerInvalidPortUsageError(t *testing.T) {
 	}
 }
 
+// Invalid tenant-key configurations are usage errors. Error messages must not
+// reveal API keys.
+func TestServerInvalidTenantKeysUsageError(t *testing.T) {
+	t.Setenv("WAXSEAL_STREAMING_MAX_AGE", "")
+	t.Setenv("WAXSEAL_REPORT_DEBOUNCE", "")
+	for _, tc := range []struct {
+		name, keys, wantMsg string
+	}{
+		{"all empty keys", "alice=,bob=", "empty key"},
+		{"dropped pair", "alice=KEYA, bob=", "empty key"},
+		{"duplicate key", "alice=KEYA, bob=KEYA", "duplicate API key"},
+		{"duplicate label", "alice=KEYA, alice=KEYB", "duplicate tenant label"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			code, _, stderr := runCLI("server", "--tenant-keys", tc.keys)
+			if code != 2 {
+				t.Errorf("exit = %d, want 2 (stderr=%q)", code, stderr)
+			}
+			if !strings.Contains(stderr, tc.wantMsg) {
+				t.Errorf("stderr = %q, want it to contain %q", stderr, tc.wantMsg)
+			}
+			if strings.Contains(stderr, "KEYA") || strings.Contains(stderr, "KEYB") {
+				t.Errorf("stderr leaks key material: %q", stderr)
+			}
+		})
+	}
+}
+
+func TestValidateLandingVideo(t *testing.T) {
+	for _, ok := range []string{browser.DefaultVideo, "aqz-KE-bpKQ", "abc123"} {
+		if err := validateLandingVideo(ok); err != nil {
+			t.Errorf("validateLandingVideo(%q) = %v, want nil", ok, err)
+		}
+	}
+	for _, bad := range []string{"https://youtu.be/x", "@@invalid@@", ""} {
+		err := validateLandingVideo(bad)
+		if err == nil {
+			t.Errorf("validateLandingVideo(%q) = nil, want a usage error", bad)
+		}
+		if got := exitCodeFor(err); got != 2 {
+			t.Errorf("validateLandingVideo(%q) exitCodeFor = %d, want 2", bad, got)
+		}
+	}
+}
+
+// Every command validates its landing video before launching Chromium.
+func TestCommandsRejectInvalidLandingVideo(t *testing.T) {
+	t.Setenv("WAXSEAL_STREAMING_MAX_AGE", "")
+	t.Setenv("WAXSEAL_REPORT_DEBOUNCE", "")
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{"server", []string{"server", "--video", "@@invalid@@"}},
+		{"doctor", []string{"doctor", "--video", "@@invalid@@"}},
+		{"generate", []string{"get-pot", "-c", "vd", "--video", "@@invalid@@"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			code, stdout, stderr := runCLI(tc.args...)
+			if code != 2 {
+				t.Errorf("exit = %d, want 2 (stderr=%q)", code, stderr)
+			}
+			if !strings.Contains(stderr, "video ID must contain") {
+				t.Errorf("stderr = %q, want the invalid-video message", stderr)
+			}
+			if tc.name == "generate" && stdout != "{}\n" {
+				t.Errorf("stdout = %q, want %q (bgutil contract)", stdout, "{}\n")
+			}
+		})
+	}
+}
+
 func TestExitCodeFor(t *testing.T) {
 	cases := []struct {
 		err  error
@@ -306,8 +378,12 @@ func TestResolveStreamingMaxAge(t *testing.T) {
 	for _, bad := range []string{"abc", "-5m", "30s", "59s"} {
 		t.Run("reject "+bad, func(t *testing.T) {
 			os.Unsetenv("WAXSEAL_STREAMING_MAX_AGE")
-			if d, err := resolveSMA(t, "--streaming-max-age", bad); err == nil {
+			d, err := resolveSMA(t, "--streaming-max-age", bad)
+			if err == nil {
 				t.Fatalf("%q = (%v, nil), want an error", bad, d)
+			}
+			if got := exitCodeFor(err); got != 2 {
+				t.Errorf("%q exitCodeFor = %d, want 2", bad, got)
 			}
 		})
 	}
@@ -363,8 +439,12 @@ func TestResolveReportDebounce(t *testing.T) {
 	for _, bad := range []string{"abc", "0", "-5s", "1s", "4s"} {
 		t.Run("reject "+bad, func(t *testing.T) {
 			os.Unsetenv("WAXSEAL_REPORT_DEBOUNCE")
-			if d, err := resolveRD(t, "--report-debounce", bad); err == nil {
+			d, err := resolveRD(t, "--report-debounce", bad)
+			if err == nil {
 				t.Fatalf("%q = (%v, nil), want an error below the minimum debounce", bad, d)
+			}
+			if got := exitCodeFor(err); got != 2 {
+				t.Errorf("%q exitCodeFor = %d, want 2", bad, got)
 			}
 		})
 	}

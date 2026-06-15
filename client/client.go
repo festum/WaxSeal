@@ -41,14 +41,18 @@ type Session struct {
 	SessionGeneration uint64
 }
 
-// PlayerContext contains the status-1 streaming context for one video. The SABR
-// URL includes a throttling nonce that the consumer must descramble with
-// PlayerURL before starting the stream.
+// PlayerContext contains the streaming context for one video. The SABR URL
+// includes a throttling nonce that the consumer must descramble with PlayerURL
+// before starting the stream.
+//
+// PlayabilityStatus is YouTube's playabilityStatus.status value, which is "OK"
+// when the video is streamable. It is distinct from the SABR status-1 protection
+// code embedded in ServerAbrStreamingURL.
 //
 // This type mirrors browser.PlayerContext without importing the browser package
 // and its Chromium dependencies. Keep the JSON tags in sync.
 type PlayerContext struct {
-	Status                       string        `json:"status"`
+	PlayabilityStatus            string        `json:"playability_status"`
 	PlayerURL                    string        `json:"player_url"`
 	ServerAbrStreamingURL        string        `json:"server_abr_streaming_url"`
 	VideoPlaybackUstreamerConfig string        `json:"video_playback_ustreamer_config"`

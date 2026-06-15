@@ -68,7 +68,7 @@ func TestProvidePlayerContextMapping(t *testing.T) {
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		gotVideoID = req.VideoID
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"status":                          "OK",
+			"playability_status":              "OK",
 			"player_url":                      "https://www.youtube.com/s/player/abc/base.js",
 			"server_abr_streaming_url":        "https://r1.googlevideo.com/videoplayback?n=scram",
 			"video_playback_ustreamer_config": "USTREAMER",
@@ -123,7 +123,7 @@ func TestProvidePlayerContextMapping(t *testing.T) {
 func TestProvidePlayerContextRejects(t *testing.T) {
 	full := func() map[string]any {
 		return map[string]any{
-			"status":                          "OK",
+			"playability_status":              "OK",
 			"player_url":                      "https://www.youtube.com/s/player/abc/base.js",
 			"server_abr_streaming_url":        "https://r1.googlevideo.com/videoplayback?n=s",
 			"video_playback_ustreamer_config": "U",
@@ -135,7 +135,7 @@ func TestProvidePlayerContextRejects(t *testing.T) {
 		name   string
 		mutate func(m map[string]any)
 	}{
-		{"non-ok status", func(m map[string]any) { m["status"] = "LOGIN_REQUIRED" }},
+		{"non-ok status", func(m map[string]any) { m["playability_status"] = "LOGIN_REQUIRED" }},
 		{"missing player_url", func(m map[string]any) { delete(m, "player_url") }},
 		{"missing visitor_data", func(m map[string]any) { delete(m, "visitor_data") }},
 		{"missing ustreamer config", func(m map[string]any) { delete(m, "video_playback_ustreamer_config") }},

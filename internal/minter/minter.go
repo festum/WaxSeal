@@ -84,13 +84,15 @@ type negEntry struct {
 // minterMetrics contains process-lifetime counters. Failure counters count
 // attempts, not requests. PlayerContextFailures also counts negative-cache hits.
 type minterMetrics struct {
-	Attestations          atomic.Int64
-	LaunchFailures        atomic.Int64
-	Mints                 atomic.Int64
-	MintFailures          atomic.Int64 // per attempt (see minterMetrics doc)
-	Escalations           atomic.Int64
-	CacheHits             atomic.Int64
-	CacheMisses           atomic.Int64
+	Attestations   atomic.Int64
+	LaunchFailures atomic.Int64
+	Mints          atomic.Int64
+	MintFailures   atomic.Int64 // per attempt (see minterMetrics doc)
+	Escalations    atomic.Int64
+	CacheHits      atomic.Int64
+	CacheMisses    atomic.Int64
+	// Crashes counts unexpected browser loss detected by CDP or a health probe.
+	// Intentional session retirement does not count.
 	Crashes               atomic.Int64
 	PlayerContexts        atomic.Int64
 	PlayerContextFailures atomic.Int64 // failed attempts and negative-cache hits
@@ -257,8 +259,10 @@ func (m *Minter) ensure(ctx context.Context) (minterSession, uint64, error) {
 }
 
 // retire closes generation gen if it is current and reports whether it closed a
-// session. It also clears any degradation report for that generation.
-func (m *Minter) retire(gen uint64, reason string) bool {
+// session. It also clears any degradation report for that generation. If isCrash
+// is true, it increments Crashes. The generation check makes concurrent
+// retirement attempts idempotent.
+func (m *Minter) retire(gen uint64, reason string, isCrash bool) bool {
 	m.mu.Lock()
 	if m.sess == nil || m.gen != gen {
 		m.mu.Unlock()
@@ -270,6 +274,9 @@ func (m *Minter) retire(gen uint64, reason string) bool {
 	m.watchCancel = nil
 	m.reportSuspectGen = 0
 	m.reportSuspectVideoID = ""
+	if isCrash {
+		m.metrics.Crashes.Add(1)
+	}
 	m.mu.Unlock()
 	if cancel != nil {
 		cancel()
@@ -287,20 +294,26 @@ func (m *Minter) watchCrash(s minterSession, ctx context.Context, gen uint64) {
 	if !ok || real.Page() == nil {
 		return
 	}
+	// A lost connection ends the event loop without a CDP crash or detach event.
+	reason := "browser connection lost"
 	// Use a session-scoped context so the watcher survives the launch request and
 	// exits when the session is torn down.
 	wait := real.Page().Context(ctx).EachEvent(
 		func(*proto.InspectorTargetCrashed) (stop bool) {
-			m.metrics.Crashes.Add(1)
-			m.retire(gen, "browser target crashed")
+			reason = "browser target crashed"
 			return true
 		},
 		func(e *proto.InspectorDetached) (stop bool) {
-			m.retire(gen, "browser detached: "+e.Reason)
+			reason = "browser detached: " + e.Reason
 			return true
 		},
 	)
 	wait()
+	// Intentional retirement cancels the watcher before closing the session.
+	if ctx.Err() != nil {
+		return
+	}
+	m.retire(gen, reason, true)
 }
 
 // refreshStreamingSession replaces a stale or reported-degraded session before a
@@ -320,7 +333,7 @@ func (m *Minter) refreshStreamingSession(ctx context.Context) (minterSession, ui
 		if suspect {
 			reason = "consumer reported degradation; relaunching"
 		}
-		if m.retire(cur, reason) {
+		if m.retire(cur, reason, false) {
 			if suspect {
 				m.metrics.ReportDrivenRecycles.Add(1)
 				// Deferred and immediate report-driven recycles share one debounce.
@@ -390,7 +403,7 @@ func (m *Minter) ReportDegraded(gen uint64, videoID, reason string) ReportResult
 
 	// Only the first report for this generation attempts immediate retirement.
 	if m.mintMu.TryLock() {
-		acted := m.retire(gen, "consumer report: "+reason)
+		acted := m.retire(gen, "consumer report: "+reason, false)
 		m.mu.Lock()
 		m.lastReportRetireAt = time.Now()
 		m.mu.Unlock()
@@ -445,7 +458,7 @@ func (m *Minter) Mint(ctx context.Context, scope, binding string) (res browser.M
 	if err != nil { // level 2: escalate to a relaunch and re-attest on a fresh session.
 		m.metrics.MintFailures.Add(1)
 		m.metrics.Escalations.Add(1)
-		m.retire(gen, "mint failed twice; relaunching")
+		m.retire(gen, "mint failed twice; relaunching", false)
 		sess, gen, err = m.ensure(ctx)
 		if err != nil {
 			return browser.MintResult{}, false, err
@@ -502,7 +515,7 @@ func (m *Minter) PlayerContext(ctx context.Context, videoID string) (browser.Pla
 
 	// level 2: escalate to a relaunch and re-attest on a fresh session.
 	m.metrics.Escalations.Add(1)
-	m.retire(gen, "player-context failed twice; relaunching")
+	m.retire(gen, "player-context failed twice; relaunching", false)
 	sess, gen, err = m.ensure(ctx)
 	if err != nil {
 		return browser.PlayerContext{}, 0, err
@@ -668,7 +681,7 @@ func (m *Minter) Health(ctx context.Context) (HealthSnapshot, bool, error) {
 			continue
 		}
 		if m.mintMu.TryLock() {
-			m.retire(gen, "ping probe failed: "+err.Error())
+			m.retire(gen, "ping probe failed: "+err.Error(), true)
 			m.mintMu.Unlock()
 		}
 		return HealthSnapshot{}, false, err

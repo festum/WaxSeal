@@ -71,8 +71,8 @@ func (p *Provider) ProvidePlayerContext(ctx context.Context, videoID string) (po
 	if err != nil {
 		return potoken.PlayerContext{}, err
 	}
-	if pc.Status != "" && !strings.EqualFold(pc.Status, "OK") {
-		return potoken.PlayerContext{}, fmt.Errorf("waxseal/provider: player-context returned status %q", pc.Status)
+	if pc.PlayabilityStatus != "" && !strings.EqualFold(pc.PlayabilityStatus, "OK") {
+		return potoken.PlayerContext{}, fmt.Errorf("waxseal/provider: player-context returned playability status %q", pc.PlayabilityStatus)
 	}
 	if pc.ServerAbrStreamingURL == "" || pc.PlayerURL == "" || pc.VisitorData == "" || pc.VideoPlaybackUstreamerConfig == "" || len(pc.AudioFormats) == 0 {
 		return potoken.PlayerContext{}, fmt.Errorf("waxseal/provider: player-context missing server_abr_streaming_url, player_url, visitor_data, video_playback_ustreamer_config, or audio_formats")

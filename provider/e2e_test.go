@@ -466,7 +466,7 @@ func TestPlayerContextUnavailableFastHTTP(t *testing.T) {
 	if err3 != nil {
 		t.Fatalf("good id after dead id: %v", err3)
 	}
-	if pc.Status != "OK" {
-		t.Errorf("good id status = %q, want OK", pc.Status)
+	if pc.PlayabilityStatus != "OK" {
+		t.Errorf("good id playability_status = %q, want OK", pc.PlayabilityStatus)
 	}
 }

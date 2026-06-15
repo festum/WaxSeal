@@ -93,13 +93,14 @@ func resolveStreamingMaxAge(cmd *cobra.Command, o *serverOpts, logger *slog.Logg
 	}
 	d, err := time.ParseDuration(raw)
 	if err != nil {
-		return 0, fmt.Errorf("invalid --streaming-max-age %q: %w (use a Go duration like 45m, or 0 to disable)", raw, err)
+		// Preserve usageError as the top-level type so this maps to exit code 2.
+		return 0, &usageError{msg: fmt.Sprintf("invalid --streaming-max-age %q: %v (use a Go duration like 45m, or 0 to disable)", raw, err)}
 	}
 	if d < 0 {
-		return 0, fmt.Errorf("invalid --streaming-max-age %q: must not be negative (use 0 to disable)", raw)
+		return 0, &usageError{msg: fmt.Sprintf("invalid --streaming-max-age %q: must not be negative (use 0 to disable)", raw)}
 	}
 	if d > 0 && d < streamingMaxAgeFloor {
-		return 0, fmt.Errorf("invalid --streaming-max-age %q: must be at least %s to prevent excessive re-attestation", raw, streamingMaxAgeFloor)
+		return 0, &usageError{msg: fmt.Sprintf("invalid --streaming-max-age %q: must be at least %s to prevent excessive re-attestation", raw, streamingMaxAgeFloor)}
 	}
 	logStreamingMaxAge(logger, d)
 	return d, nil
@@ -133,10 +134,10 @@ func resolveReportDebounce(cmd *cobra.Command, o *serverOpts, logger *slog.Logge
 	}
 	d, err := time.ParseDuration(raw)
 	if err != nil {
-		return 0, fmt.Errorf("invalid --report-debounce %q: %w (use a Go duration like 5m)", raw, err)
+		return 0, &usageError{msg: fmt.Sprintf("invalid --report-debounce %q: %v (use a Go duration like 5m)", raw, err)}
 	}
 	if d < reportDebounceFloor {
-		return 0, fmt.Errorf("invalid --report-debounce %q: must be at least %s to prevent excessive re-attestation", raw, reportDebounceFloor)
+		return 0, &usageError{msg: fmt.Sprintf("invalid --report-debounce %q: must be at least %s to prevent excessive re-attestation", raw, reportDebounceFloor)}
 	}
 	if d > reportDebounceWarn {
 		logger.Warn("report-debounce is large; report-driven recycling will be infrequent", "value", d)
@@ -182,22 +183,36 @@ func isExposedHost(host string) bool {
 	return !ip.IsLoopback()
 }
 
+// failStartup logs a configuration error once and preserves its exit-code type.
+func failStartup(logger *slog.Logger, err error) error {
+	logger.Error("startup: invalid configuration", "err", err)
+	return err
+}
+
 func runServer(cmd *cobra.Command, o *serverOpts) error {
 	level := "info"
 	if o.verbose {
 		level = "debug"
 	}
 	logger := buildLogger(level, os.Stdout) // daemon logs to stdout
+
+	// Validate configuration before binding a socket or launching Chromium.
+	if err := validateLandingVideo(o.video); err != nil {
+		return failStartup(logger, err)
+	}
 	streamingMaxAge, err := resolveStreamingMaxAge(cmd, o, logger)
 	if err != nil {
-		logger.Error("startup: invalid configuration", "err", err)
-		return err
+		return failStartup(logger, err)
 	}
 	reportDebounce, err := resolveReportDebounce(cmd, o, logger)
 	if err != nil {
-		logger.Error("startup: invalid configuration", "err", err)
-		return err
+		return failStartup(logger, err)
 	}
+	keys, err := server.ParseTenantKeys(o.tenantKeys)
+	if err != nil {
+		return failStartup(logger, &usageError{msg: err.Error()})
+	}
+
 	// Bind before launching Chromium so an invalid or unavailable address fails
 	// without running browser startup and attestation.
 	ln, err := bindListener(o.host, o.port)
@@ -216,7 +231,6 @@ func runServer(cmd *cobra.Command, o *serverOpts) error {
 
 	// Remove profiles left by prior daemon instances that could not run normal cleanup.
 	browser.ReapStaleProfiles(logger)
-	keys := server.ParseTenantKeys(o.tenantKeys)
 	// Warn before browser startup when unauthenticated callers can access the guest
 	// identity.
 	if len(keys) == 0 && isExposedHost(o.host) {

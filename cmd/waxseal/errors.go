@@ -70,3 +70,15 @@ func wrapUsageErrors(cmd *cobra.Command) {
 func looksLikeURL(s string) bool {
 	return strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://") || strings.Contains(s, "://")
 }
+
+// validateLandingVideo requires a bare video ID and returns a usage error for
+// invalid input.
+func validateLandingVideo(video string) error {
+	switch {
+	case looksLikeURL(video):
+		return &usageError{msg: "provide a bare video ID (for example, aqz-KE-bpKQ), not a URL"}
+	case !browser.ValidVideoID(video):
+		return &usageError{msg: "video ID must contain 1 to 64 letters, digits, underscores, or hyphens"}
+	}
+	return nil
+}

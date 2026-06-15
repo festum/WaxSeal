@@ -73,8 +73,8 @@ func TestBrowserProcessSelfHealHTTP(t *testing.T) {
 	if err != nil {
 		t.Fatalf("player-context did not recover after the browser died: %v", err)
 	}
-	if pc.Status != "OK" {
-		t.Errorf("recovered player-context status = %q, want OK", pc.Status)
+	if pc.PlayabilityStatus != "OK" {
+		t.Errorf("recovered player-context playability_status = %q, want OK", pc.PlayabilityStatus)
 	}
 
 	// Recovery creates a new session generation.

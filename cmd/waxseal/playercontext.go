@@ -22,12 +22,11 @@ func newPlayerContextCmd() *cobra.Command {
 	var o playerContextOpts
 	c := &cobra.Command{
 		Use:   "player-context [video_id]",
-		Short: "Launch a browser, attest, and print the status-1 streaming context for a video",
+		Short: "Launch a browser, attest, and print a video's streaming context",
 		Long: "Launch a real Chromium browser, attest, load the given video, and print its\n" +
-			"status-1 streaming context as JSON. Pass the video ID as the positional\n" +
-			"argument or with --video. The response includes the SABR URL, player\n" +
-			"URL, visitor data, and audio formats. For a warm daemon, POST to\n" +
-			"/player-context instead.",
+			"streaming context as JSON. Pass the video ID as the positional argument or\n" +
+			"with --video. The response includes the SABR URL, player URL, visitor data,\n" +
+			"and audio formats. For a warm daemon, POST to /player-context instead.",
 		Example: "  waxseal player-context aqz-KE-bpKQ\n" +
 			"  waxseal player-context --video aqz-KE-bpKQ --headful",
 		Args: cobra.MaximumNArgs(1),
@@ -50,13 +49,11 @@ func resolvePlayerContextVideoID(flag string, args []string) (string, error) {
 		}
 		video = args[0]
 	}
-	switch {
-	case video == "":
+	if video == "" {
 		return "", &usageError{msg: "provide a video ID as the positional argument or with --video"}
-	case looksLikeURL(video):
-		return "", &usageError{msg: "provide a bare video ID (for example, aqz-KE-bpKQ), not a URL"}
-	case !browser.ValidVideoID(video):
-		return "", &usageError{msg: "video ID must contain 1 to 64 letters, digits, underscores, or hyphens"}
+	}
+	if err := validateLandingVideo(video); err != nil {
+		return "", err
 	}
 	return video, nil
 }
@@ -77,8 +74,10 @@ func runPlayerContext(cmd *cobra.Command, o *playerContextOpts, args []string) e
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	// Load the target video before reading its status-1 context.
-	sess, err := browser.Launch(ctx, video, browser.Options{Headful: o.headful, NormalizeUA: !o.headful, Logger: logger})
+	// Establish the session on the stable default video before querying the target.
+	// This lets an unavailable target return ErrUnplayable instead of timing out
+	// during the streaming proof.
+	sess, err := browser.Launch(ctx, browser.DefaultVideo, browser.Options{Headful: o.headful, NormalizeUA: !o.headful, Logger: logger})
 	if err != nil {
 		return fmt.Errorf("browser launch/identity: %w", err)
 	}

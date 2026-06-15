@@ -55,6 +55,11 @@ func runGenerate(cmd *cobra.Command, g *genOpts) error {
 		fmt.Fprintln(stdout, "{}")
 		return &usageError{msg: fmt.Sprintf("content-binding too long (max %d bytes)", browser.MaxContentBindingBytes)}
 	}
+	// Preserve bgutil's empty-object failure response for invalid input.
+	if err := validateLandingVideo(g.video); err != nil {
+		fmt.Fprintln(stdout, "{}")
+		return err
+	}
 	level := "error"
 	if g.verbose {
 		level = "info"

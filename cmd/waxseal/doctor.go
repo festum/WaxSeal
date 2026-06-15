@@ -41,6 +41,9 @@ func newDoctorCmd() *cobra.Command {
 
 func runDoctor(cmd *cobra.Command, o *doctorOpts) error {
 	stdout, stderr := cmd.OutOrStdout(), cmd.ErrOrStderr()
+	if err := validateLandingVideo(o.video); err != nil {
+		return err
+	}
 	level := "warn"
 	if o.verbose {
 		level = "info"

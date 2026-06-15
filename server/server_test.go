@@ -20,16 +20,55 @@ import (
 )
 
 func TestParseTenantKeys(t *testing.T) {
-	if got := ParseTenantKeys("  "); got != nil {
-		t.Errorf("empty input = %v, want nil (keyless)", got)
+	for _, in := range []string{"", "  "} {
+		if got, err := ParseTenantKeys(in); got != nil || err != nil {
+			t.Errorf("ParseTenantKeys(%q) = (%v, %v), want (nil, nil)", in, got, err)
+		}
 	}
-	m := ParseTenantKeys("alice=KEYA, bob=KEYB")
-	if len(m) != 2 || m["KEYA"] != "alice" || m["KEYB"] != "bob" {
-		t.Errorf("labelled keys = %v", m)
+
+	for _, in := range []string{
+		"alice=,bob=",            // every key empty
+		"=,=",                    // every label and key empty
+		" = ",                    // whitespace label and key
+		"alice=KEYA, bob=",       // one dropped pair
+		"=KEYA",                  // empty label
+		"alice=KEYA, bob=KEYA",   // duplicate key
+		"alice=KEYA, alice=KEYB", // duplicate label collapses two identities
+	} {
+		got, err := ParseTenantKeys(in)
+		if err == nil {
+			t.Errorf("ParseTenantKeys(%q) = (%v, nil), want a usage error", in, got)
+		}
+		if err != nil && strings.Contains(err.Error(), "KEY") {
+			t.Errorf("ParseTenantKeys(%q) error leaks key material: %q", in, err)
+		}
 	}
-	bare := ParseTenantKeys("RAWKEY")
+
+	m, err := ParseTenantKeys("alice=KEYA, bob=KEYB")
+	if err != nil || len(m) != 2 || m["KEYA"] != "alice" || m["KEYB"] != "bob" {
+		t.Errorf("labelled keys = (%v, %v)", m, err)
+	}
+	if tc, err := ParseTenantKeys("alice=KEYA,"); err != nil || len(tc) != 1 || tc["KEYA"] != "alice" {
+		t.Errorf("trailing comma = (%v, %v), want one tenant", tc, err)
+	}
+	bare, err := ParseTenantKeys("RAWKEY")
+	if err != nil {
+		t.Fatalf("bare key: %v", err)
+	}
 	if lbl := bare["RAWKEY"]; lbl == "" || lbl == "RAWKEY" {
 		t.Errorf("bare key label = %q, want a generated label that is not the key", lbl)
+	}
+
+	// Generated labels must not collide with explicit labels.
+	for _, in := range []string{"t2=KEYA, KEYB", "KEYB, t1=KEYA"} {
+		mix, err := ParseTenantKeys(in)
+		if err != nil {
+			t.Errorf("ParseTenantKeys(%q) = error %v, want two distinct tenants", in, err)
+			continue
+		}
+		if len(mix) != 2 || mix["KEYA"] == "" || mix["KEYB"] == "" || mix["KEYA"] == mix["KEYB"] {
+			t.Errorf("ParseTenantKeys(%q) = %v, want two distinct non-empty labels", in, mix)
+		}
 	}
 }
 
@@ -353,7 +392,7 @@ func (f *fakePlayerSession) Mint(context.Context, string) (browser.MintResult, e
 	return browser.MintResult{Kind: "integrity", Lifetime: 3600}, nil
 }
 func (f *fakePlayerSession) PlayerContext(context.Context, string) (browser.PlayerContext, error) {
-	return browser.PlayerContext{Status: "OK", ServerAbrStreamingURL: f.abrURL, VisitorData: f.vd}, nil
+	return browser.PlayerContext{PlayabilityStatus: "OK", ServerAbrStreamingURL: f.abrURL, VisitorData: f.vd}, nil
 }
 func (f *fakePlayerSession) EnsureEstablished(context.Context) error { return nil }
 func (f *fakePlayerSession) Ping(context.Context) error              { return nil }
