@@ -252,6 +252,9 @@ func TestRoutesMethodMatching(t *testing.T) {
 		{http.MethodGet, "/report", "/report"},
 		{http.MethodGet, "/metrics", "GET /metrics"},
 		{http.MethodPost, "/metrics", "/metrics"},
+		// Registered routes and their method fallbacks must beat the catch-all.
+		{http.MethodGet, "/nope", "/"},
+		{http.MethodPost, "/get_pot/", "/"},
 	}
 	for _, tt := range tests {
 		r := httptest.NewRequest(tt.method, tt.path, nil)
@@ -284,6 +287,85 @@ func TestMethodNotAllowedBeforeAuth(t *testing.T) {
 	}
 	if env.Code != CodeMethodNotAllowed {
 		t.Errorf("code = %q, want %q (got 401 unauthorized instead?)", env.Code, CodeMethodNotAllowed)
+	}
+}
+
+// TestNotFoundJSONEnvelope verifies that unknown canonical paths use the
+// structured 404 while method enforcement, auth, and ServeMux path cleaning keep
+// their existing behavior.
+func TestNotFoundJSONEnvelope(t *testing.T) {
+	mux := (&Server{}).routes()
+
+	// Unknown paths and trailing-slash mismatches both return the JSON 404.
+	for _, tt := range []struct{ name, method, path string }{
+		{"unknown path", http.MethodGet, "/nope"},
+		{"trailing slash", http.MethodPost, "/get_pot/"},
+	} {
+		r := httptest.NewRequest(tt.method, tt.path, nil)
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, r)
+		if w.Code != http.StatusNotFound {
+			t.Errorf("%s: status = %d, want 404 (no redirect)", tt.name, w.Code)
+		}
+		if ct := w.Header().Get("Content-Type"); ct != "application/json" {
+			t.Errorf("%s: Content-Type = %q, want application/json", tt.name, ct)
+		}
+		var env struct {
+			Error string `json:"error"`
+			Code  string `json:"code"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+			t.Fatalf("%s: error body is not JSON: %v (%q)", tt.name, err, w.Body.String())
+		}
+		if env.Code != CodeNotFound {
+			t.Errorf("%s: code = %q, want %q", tt.name, env.Code, CodeNotFound)
+		}
+		if env.Error == "" {
+			t.Errorf("%s: error message is empty", tt.name)
+		}
+	}
+
+	// Known paths with bad methods still use the method handler.
+	r := httptest.NewRequest(http.MethodGet, "/get_pot", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, r)
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Errorf("GET /get_pot: status = %d, want 405 from method handler", w.Code)
+	}
+
+	// Unknown paths on keyed daemons return 404 without an auth challenge.
+	keyed := &Server{
+		tenants: minter.NewTenants(nil, "", map[string]string{"GOODKEY": "alice"}, browser.Options{}, 0, 0),
+		log:     slog.New(slog.DiscardHandler),
+	}
+	r = httptest.NewRequest(http.MethodGet, "/nope", nil) // no API key
+	w = httptest.NewRecorder()
+	keyed.routes().ServeHTTP(w, r)
+	if w.Code != http.StatusNotFound {
+		t.Errorf("unknown path on keyed daemon: status = %d, want 404 before auth", w.Code)
+	}
+	var env struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("keyed 404 body is not JSON: %v (%q)", err, w.Body.String())
+	}
+	if env.Code != CodeNotFound {
+		t.Errorf("keyed unknown path code = %q, want %q", env.Code, CodeNotFound)
+	}
+
+	// ServeMux redirects non-canonical paths before dispatch, so those requests do
+	// not receive the JSON envelope.
+	for _, p := range []string{"/foo/../bar", "//get_pot", "/get_pot/."} {
+		r := httptest.NewRequest(http.MethodGet, p, nil)
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, r)
+		if w.Code != http.StatusTemporaryRedirect {
+			t.Errorf("%s: status = %d, want 307 from ServeMux path cleaning", p, w.Code)
+		}
+		if loc := w.Header().Get("Location"); loc == "" {
+			t.Errorf("%s: redirect has no Location header", p)
+		}
 	}
 }
 

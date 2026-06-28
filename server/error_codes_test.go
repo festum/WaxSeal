@@ -23,6 +23,7 @@ func TestErrorCodeContract(t *testing.T) {
 		{"timeout", server.CodeTimeout, client.CodeTimeout, "timeout"},
 		{"player-context-failed", server.CodePlayerContextFailed, client.CodePlayerContextFailed, "player-context-failed"},
 		{"no-session", server.CodeNoSession, client.CodeNoSession, "no-session"},
+		{"not-found", server.CodeNotFound, client.CodeNotFound, "not-found"},
 	}
 	for _, c := range codes {
 		if c.server != c.want {

@@ -62,9 +62,11 @@ not a URL.
 
 ### Tokens and identity
 
-For `/get_pot`, `content_binding` is a **video ID** for a player token or
-**visitor data** for a GVS token. It is limited to 4096 bytes. The optional
-`scope` may be `player` or `gvs`. It only separates cache entries.
+For `/get_pot`, `content_binding` is the value the token is bound to: a
+**video ID** for a player token or **visitor data** for a GVS token. It is
+limited to 4096 bytes. The optional `scope` may be `player`, `gvs`, `pot`, or
+omitted. Scope only namespaces cache entries; `content_binding` selects the
+token type.
 
 Tokens and exported identities are bound to the minting host's egress IP. The
 consumer must use that same IP for SABR media requests.
@@ -156,15 +158,18 @@ The two response shapes are the full
 
 ### Errors
 
-Recognized endpoints return errors as
-`{"error":"human-readable message","code":"machine-readable-code"}`. For
-`video-unavailable`, the optional `details` field contains the playability
-status.
+Errors from recognized endpoints and unknown paths use the JSON envelope
+`{"error":"human-readable message","code":"machine-readable-code"}`. Unknown
+paths return `not-found`. Non-canonical paths, including paths with `.`, `..`,
+or repeated slashes, are 307-redirected to their cleaned form before a handler
+runs. For `video-unavailable`, the optional `details` field contains the
+playability status.
 
 | Code | HTTP | Meaning |
 |---|---:|---|
 | `invalid-request` | 400 | Malformed or invalid input |
 | `unauthorized` | 401 | Missing or invalid API key |
+| `not-found` | 404 | Unknown path or endpoint |
 | `method-not-allowed` | 405 | Unsupported HTTP method |
 | `video-unavailable` | 422 | Terminal playability status |
 | `mint-failed`, `player-context-failed` | 502 | Upstream operation failed |
@@ -244,6 +249,11 @@ or operation retries does not increment it.
 Use `go run ./cmd/waxseal server --help` for configuration options, including
 session recycling, report debounce, bind address, headful mode, and metrics
 access (`--metrics-key`, `--metrics-public`).
+
+WaxSeal is intended for loopback or a trusted network and intentionally does not
+implement CORS. Because it mints tokens, browser-origin access is out of scope.
+An `OPTIONS` request to a recognized endpoint returns a structured 405; an
+unknown path returns the structured 404 (see [Errors](#errors)).
 
 ## Development
 

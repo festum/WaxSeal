@@ -104,9 +104,10 @@ func New(baseURL string, opts ...Option) *Client {
 	return c
 }
 
-// POToken mints a token bound to contentBinding. Use a video_id for a player
-// token or visitor_data for a GVS token. Scope distinguishes cache entries. An
-// empty scope uses the daemon's generic cache key.
+// POToken mints a token bound to contentBinding. A video_id binding mints a
+// player token; visitor_data mints a GVS token. Scope only namespaces cache
+// entries. It may be "player", "gvs", "pot", or empty; "pot" and empty use the
+// daemon's generic cache key.
 func (c *Client) POToken(ctx context.Context, contentBinding, scope string) (Token, error) {
 	if contentBinding == "" {
 		return Token{}, errors.New("waxseal/client: content_binding is required")
@@ -306,6 +307,8 @@ const (
 	CodePlayerContextFailed = "player-context-failed"
 	// CodeNoSession indicates that no attested session or cookies are available.
 	CodeNoSession = "no-session"
+	// CodeNotFound indicates an unknown path or endpoint.
+	CodeNotFound = "not-found"
 )
 
 // APIError describes a non-2xx response from the WaxSeal daemon. Callers can

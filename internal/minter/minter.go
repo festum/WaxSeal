@@ -91,6 +91,7 @@ type minterMetrics struct {
 	Escalations    atomic.Int64
 	CacheHits      atomic.Int64
 	CacheMisses    atomic.Int64
+	CacheEvictions atomic.Int64 // positive-cache entries evicted at capacity
 	// Crashes counts unexpected browser loss detected by CDP or a health probe.
 	// Intentional session retirement does not count.
 	Crashes               atomic.Int64
@@ -113,6 +114,11 @@ const (
 	minterDefaultMaxAge = 11 * time.Hour  // < the ~12h integrity lifetime
 	minterNegCacheTTL   = 5 * time.Minute // remember an unplayable video_id this long
 	minterNegCacheMax   = 256             // bound the negative cache
+	// minterCacheMax bounds the positive token cache. Positive entries are keyed by
+	// distinct video or visitor identities, so this cache is intentionally larger
+	// than the negative cache. The bound keeps per-tenant memory predictable, about
+	// 0.8 MB for typical entries and about 10 MB for unusually large tokens.
+	minterCacheMax = 1024
 
 	// DefaultReportDebounce limits report-driven re-attestation to 12 times per
 	// hour.
@@ -242,6 +248,11 @@ func (m *Minter) ensure(ctx context.Context) (minterSession, uint64, error) {
 		}
 		m.sess = sess
 		m.gen++
+		// A generation bump invalidates every cached token. Under m.mu, no
+		// new-generation cachePut can interleave before the clear, so every existing
+		// entry belongs to the old session. Clear only the positive cache: an
+		// unplayable video remains unplayable across a relaunch.
+		clear(m.cache)
 		m.attestedAt = time.Now()
 		// Arm the streaming deadline for this generation.
 		if m.streamingMaxAge > 0 {
@@ -593,6 +604,13 @@ func (m *Minter) cacheGet(key string) (browser.MintResult, bool) {
 	defer m.mu.Unlock()
 	c, ok := m.cache[key]
 	if !ok || c.gen != m.gen || time.Now().After(c.expiry) {
+		if ok {
+			// Generation mismatches should be rare because ensure clears the cache and
+			// cachePut rejects stale writes. Keep the guard, and delete any unusable
+			// entry reached here so expired tokens do not sit in the map until the next
+			// generation.
+			delete(m.cache, key)
+		}
 		return browser.MintResult{}, false
 	}
 	return c.res, true
@@ -611,7 +629,31 @@ func (m *Minter) cachePut(key string, res browser.MintResult, gen uint64) {
 	if gen != m.gen { // session was recycled mid-mint; don't cache a stale-gen token.
 		return
 	}
-	m.cache[key] = cachedToken{res: res, expiry: time.Now().Add(ttl), gen: gen}
+	now := time.Now() // one clock read, matching negCachePut
+	// Only a new key can force eviction; refreshing a cached key must not remove
+	// another token. First discard expired entries and track the live entry with the
+	// earliest expiry. If the cache is still full, remove that entry so the new token
+	// is retained and entries with more remaining lifetime stay available. The size
+	// invariant means one eviction is enough.
+	if _, exists := m.cache[key]; !exists && len(m.cache) >= minterCacheMax {
+		var evictKey string
+		var evictExp time.Time
+		haveEvict := false
+		for k, c := range m.cache {
+			if now.After(c.expiry) {
+				delete(m.cache, k)
+				continue
+			}
+			if !haveEvict || c.expiry.Before(evictExp) {
+				evictKey, evictExp, haveEvict = k, c.expiry, true
+			}
+		}
+		if len(m.cache) >= minterCacheMax && haveEvict {
+			delete(m.cache, evictKey)
+			m.metrics.CacheEvictions.Add(1)
+		}
+	}
+	m.cache[key] = cachedToken{res: res, expiry: now.Add(ttl), gen: gen}
 }
 
 // SessionSnapshot returns an established session's identity, cookies, and the
@@ -767,6 +809,7 @@ var lifetimeCounterKeys = []string{
 	"crashes",
 	"cache_hits",
 	"cache_misses",
+	"cache_evictions",
 	"launch_failures",
 	"streaming_recycles",
 	"report_driven_recycles",
@@ -788,6 +831,7 @@ func (m *Minter) counterValues() map[string]int64 {
 		"crashes":                            m.metrics.Crashes.Load(),
 		"cache_hits":                         m.metrics.CacheHits.Load(),
 		"cache_misses":                       m.metrics.CacheMisses.Load(),
+		"cache_evictions":                    m.metrics.CacheEvictions.Load(),
 		"launch_failures":                    m.metrics.LaunchFailures.Load(),
 		"streaming_recycles":                 m.metrics.StreamingRecycles.Load(),
 		"report_driven_recycles":             m.metrics.ReportDrivenRecycles.Load(),
@@ -883,6 +927,11 @@ func (m *Minter) Close() {
 	m.watchCancel = nil
 	m.reportSuspectGen = 0
 	m.reportSuspectVideoID = ""
+	// Replace the maps rather than clearing them so their backing storage can be
+	// reclaimed even if a closed Minter is retained. Tenant shutdown normally
+	// releases the whole Minter, but Close should leave both caches empty on its own.
+	m.cache = make(map[string]cachedToken)
+	m.negCache = make(map[string]negEntry)
 	m.mu.Unlock()
 	if cancel != nil {
 		cancel()

@@ -124,6 +124,13 @@ func (s *Server) routes() *http.ServeMux {
 	mux.HandleFunc("/report", methodNotAllowed(http.MethodPost))
 	mux.HandleFunc("GET /metrics", s.handleMetrics)
 	mux.HandleFunc("/metrics", methodNotAllowed(http.MethodGet))
+	// ServeMux would otherwise answer unknown paths with plaintext 404s. The "/"
+	// fallback gives canonical unknown paths and trailing-slash mismatches the same
+	// JSON envelope as the rest of the API. More specific patterns, including method
+	// fallbacks, still win. ServeMux cleans non-canonical paths with a 307 redirect
+	// before dispatch. The handler is intentionally pre-auth, so keyed daemons
+	// return 404 for unknown paths.
+	mux.HandleFunc("/", s.handleNotFound)
 	return mux
 }
 
@@ -135,6 +142,13 @@ func methodNotAllowed(allowed ...string) http.HandlerFunc {
 		w.Header().Set("Allow", allow)
 		writeErr(w, http.StatusMethodNotAllowed, CodeMethodNotAllowed, "method not allowed")
 	}
+}
+
+// handleNotFound writes the API error envelope for paths that fall through to
+// the "/" catch-all. It does not authenticate, so an unknown path on a keyed
+// daemon returns 404 instead of an auth challenge.
+func (s *Server) handleNotFound(w http.ResponseWriter, _ *http.Request) {
+	writeErr(w, http.StatusNotFound, CodeNotFound, "not found")
 }
 
 // Warm attests the tenant selected by apiKey. Pass an empty key in keyless mode.
@@ -549,6 +563,8 @@ const (
 	CodePlayerContextFailed = "player-context-failed"
 	// CodeNoSession indicates that no attested session or cookies are available.
 	CodeNoSession = "no-session"
+	// CodeNotFound indicates an unknown path or endpoint.
+	CodeNotFound = "not-found"
 )
 
 // errEnvelope is the JSON error response shared by the API endpoints.

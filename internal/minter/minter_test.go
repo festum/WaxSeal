@@ -279,6 +279,15 @@ func TestMinterCrashKeepsCacheThenRelaunchInvalidates(t *testing.T) {
 		t.Errorf("launches = %d, want 2 (cache miss after crash relaunches)", got)
 	}
 
+	// The generation bump clears older entries from the cache, so only the token
+	// minted after the relaunch remains.
+	m.mu.Lock()
+	cacheLen := len(m.cache)
+	m.mu.Unlock()
+	if cacheLen != 1 {
+		t.Errorf("cache size after relaunch = %d, want 1 (old entries cleared)", cacheLen)
+	}
+
 	// The generation-1 gvs/vd entry is stale after the relaunch.
 	if _, cached, _ := m.Mint(ctx, "gvs", "vd"); cached {
 		t.Errorf("old-generation cache entry should be invalidated by the relaunch")
@@ -473,6 +482,141 @@ func TestMinterNegCacheBoundedEvicts(t *testing.T) {
 	}
 	if err := m.negCacheGet("newestUnplay"); !errors.Is(err, browser.ErrUnplayable) {
 		t.Errorf("newest terminal result should be cached after eviction, got %v", err)
+	}
+}
+
+// TestMinterCacheBoundedEvicts: at capacity, inserting a live token evicts one
+// existing token rather than dropping the new one. The positive cache stays
+// bounded and retains the latest insert.
+func TestMinterCacheBoundedEvicts(t *testing.T) {
+	m := NewMinter("v", browser.Options{}, 0, 0)
+	m.gen = 1 // production never caches at gen 0
+	for i := 0; i < minterCacheMax; i++ {
+		m.cachePut(fmt.Sprintf("gvs|vd%05d", i), browser.MintResult{Lifetime: 3600}, m.gen)
+	}
+	if got := len(m.cache); got != minterCacheMax {
+		t.Fatalf("cache size = %d, want %d (filled to capacity)", got, minterCacheMax)
+	}
+	if got := m.metrics.CacheEvictions.Load(); got != 0 {
+		t.Fatalf("cache_evictions = %d, want 0 before exceeding capacity", got)
+	}
+	m.cachePut("gvs|newest", browser.MintResult{Token: "new", Lifetime: 3600}, m.gen) // one past capacity, all live
+	if got := len(m.cache); got != minterCacheMax {
+		t.Errorf("cache size = %d, want %d (stays bounded after eviction)", got, minterCacheMax)
+	}
+	if got := m.metrics.CacheEvictions.Load(); got != 1 {
+		t.Errorf("cache_evictions = %d, want exactly 1 (an over-count would double here)", got)
+	}
+	if _, ok := m.cacheGet("gvs|newest"); !ok {
+		t.Error("newest token should be cached after eviction")
+	}
+}
+
+// TestMinterCacheEvictsNearestExpiry: at capacity with all entries live,
+// inserting a token evicts the entry with the earliest expiry. This keeps a
+// freshly minted token from replacing a longer-lived token by map iteration
+// order.
+func TestMinterCacheEvictsNearestExpiry(t *testing.T) {
+	m := NewMinter("v", browser.Options{}, 0, 0)
+	m.gen = 1
+	now := time.Now()
+	m.cache["gvs|soonest"] = cachedToken{gen: m.gen, expiry: now.Add(time.Minute)} // least remaining life
+	for i := 0; i < minterCacheMax-1; i++ {
+		m.cache[fmt.Sprintf("gvs|live%05d", i)] = cachedToken{gen: m.gen, expiry: now.Add(time.Hour)}
+	}
+	if got := len(m.cache); got != minterCacheMax {
+		t.Fatalf("setup: cache size = %d, want %d", got, minterCacheMax)
+	}
+	m.cachePut("gvs|new", browser.MintResult{Lifetime: 3600}, m.gen) // forces exactly one eviction
+	if got := m.metrics.CacheEvictions.Load(); got != 1 {
+		t.Errorf("cache_evictions = %d, want 1", got)
+	}
+	if _, ok := m.cacheGet("gvs|soonest"); ok {
+		t.Error("the soonest-to-expire entry should have been evicted")
+	}
+	if _, ok := m.cacheGet("gvs|new"); !ok {
+		t.Error("the freshly inserted entry should survive")
+	}
+}
+
+// TestMinterCachePutReclaimsExpired: when the cache is full of expired entries
+// from the current generation, a new insert reclaims them during pruning. It
+// should not count as a live-token eviction.
+func TestMinterCachePutReclaimsExpired(t *testing.T) {
+	m := NewMinter("v", browser.Options{}, 0, 0)
+	m.gen = 1
+	past := time.Now().Add(-time.Hour)
+	for i := 0; i < minterCacheMax; i++ {
+		m.cache[fmt.Sprintf("gvs|expired%05d", i)] = cachedToken{gen: m.gen, expiry: past} // current gen, expired
+	}
+	if got := len(m.cache); got != minterCacheMax {
+		t.Fatalf("setup: cache size = %d, want %d", got, minterCacheMax)
+	}
+	m.cachePut("gvs|fresh", browser.MintResult{Lifetime: 3600}, m.gen)
+	if got := m.metrics.CacheEvictions.Load(); got != 0 {
+		t.Errorf("cache_evictions = %d, want 0 (expired entries reclaimed, no live eviction)", got)
+	}
+	if _, ok := m.cacheGet("gvs|fresh"); !ok {
+		t.Error("freshly cached token should be present")
+	}
+	if got := len(m.cache); got != 1 {
+		t.Errorf("cache size = %d, want 1 (expired entries reclaimed, fresh entry remains)", got)
+	}
+}
+
+// TestMinterCacheGetEvictsExpired: cacheGet deletes an expired entry from the
+// current generation on access, reclaiming it before the next session recycle.
+func TestMinterCacheGetEvictsExpired(t *testing.T) {
+	m := NewMinter("v", browser.Options{}, 0, 0)
+	m.gen = 1
+	m.cache["gvs|vd"] = cachedToken{gen: m.gen, expiry: time.Now().Add(-time.Minute)} // current gen, expired
+	if _, ok := m.cacheGet("gvs|vd"); ok {
+		t.Fatal("cacheGet returned a hit for an expired entry")
+	}
+	if got := len(m.cache); got != 0 {
+		t.Errorf("cache size = %d, want 0 (expired entry deleted on access)", got)
+	}
+}
+
+// TestMinterCloseClearsCaches: Close releases both cache maps so a retained
+// reference to a closed Minter does not hold token entries.
+func TestMinterCloseClearsCaches(t *testing.T) {
+	m := NewMinter("v", browser.Options{}, 0, 0)
+	m.cache["gvs|vd"] = cachedToken{gen: 1, expiry: time.Now().Add(time.Hour)}
+	m.negCache["vid"] = negEntry{err: browser.ErrUnplayable, expiry: time.Now().Add(time.Hour)}
+	m.Close() // session-less: no browser to tear down
+	if got := len(m.cache); got != 0 {
+		t.Errorf("cache size after Close = %d, want 0", got)
+	}
+	if got := len(m.negCache); got != 0 {
+		t.Errorf("negCache size after Close = %d, want 0", got)
+	}
+}
+
+// TestMinterNegCacheSurvivesRecycle: a generation bump clears only the positive
+// cache. The negative cache is keyed by generation-independent unplayability, so
+// a recycle must not probe the same unplayable video again. This guards the
+// choice to leave m.negCache intact in ensure.
+func TestMinterNegCacheSurvivesRecycle(t *testing.T) {
+	m, _, _, _ := newTestMinter(okMint)
+	ctx := context.Background()
+	if err := m.Warm(ctx); err != nil { // gen 1
+		t.Fatalf("warm: %v", err)
+	}
+	m.negCachePut("deadvid", browser.ErrUnplayable)
+
+	gen := m.Generation()
+	if !m.retire(gen, "test recycle", false) {
+		t.Fatalf("retire(%d) = false, want true", gen)
+	}
+	if err := m.Warm(ctx); err != nil { // gen 2; clear(m.cache) runs here
+		t.Fatalf("warm 2: %v", err)
+	}
+	if m.Generation() == gen {
+		t.Fatalf("generation did not advance past %d", gen)
+	}
+	if err := m.negCacheGet("deadvid"); !errors.Is(err, browser.ErrUnplayable) {
+		t.Errorf("negCacheGet after recycle = %v, want the cached ErrUnplayable (neg cache must survive a gen bump)", err)
 	}
 }
 
