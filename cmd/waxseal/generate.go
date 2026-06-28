@@ -55,6 +55,12 @@ func runGenerate(cmd *cobra.Command, g *genOpts) error {
 		fmt.Fprintln(stdout, "{}")
 		return &usageError{msg: fmt.Sprintf("content-binding too long (max %d bytes)", browser.MaxContentBindingBytes)}
 	}
+	if browser.HasControlChars(g.contentBinding) {
+		// Keep CLI validation aligned with /get_pot and preserve bgutil's
+		// empty-object response for invalid input.
+		fmt.Fprintln(stdout, "{}")
+		return &usageError{msg: "content-binding must not contain control characters"}
+	}
 	// Preserve bgutil's empty-object failure response for invalid input.
 	if err := validateLandingVideo(g.video); err != nil {
 		fmt.Fprintln(stdout, "{}")

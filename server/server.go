@@ -210,9 +210,16 @@ func (s *Server) handleGetPot(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, CodeInvalidRequest, fmt.Sprintf("content_binding too long (max %d bytes)", browser.MaxContentBindingBytes))
 		return
 	}
+	// content_binding is opaque, so it does not get the video_id or reason
+	// charset checks. The JSON decoder rejects raw C0 bytes; this rejects escaped
+	// controls and DEL after decoding.
+	if browser.HasControlChars(req.ContentBinding) {
+		writeErr(w, http.StatusBadRequest, CodeInvalidRequest, "content_binding must not contain control characters")
+		return
+	}
 	scope, ok := normalizeScope(req.Scope)
 	if !ok {
-		writeErr(w, http.StatusBadRequest, CodeInvalidRequest, `scope must be "player", "gvs", or omitted`)
+		writeErr(w, http.StatusBadRequest, CodeInvalidRequest, `scope must be "player", "gvs", "pot", or omitted`)
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), requestProcessTimeout)

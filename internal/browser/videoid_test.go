@@ -40,3 +40,30 @@ func TestValidVideoID(t *testing.T) {
 		t.Errorf("ValidVideoID(DefaultVideo=%q) = false, want true", DefaultVideo)
 	}
 }
+
+func TestHasControlChars(t *testing.T) {
+	withControl := []string{
+		"abc\n",    // newline
+		"a\tb",     // tab
+		"a\rb",     // carriage return
+		"a\x00b",   // NUL
+		"a\x7fb",   // DEL
+		"a\u0085b", // C1 NEL, covering cases a byte scan would miss
+	}
+	for _, s := range withControl {
+		if !HasControlChars(s) {
+			t.Errorf("HasControlChars(%q) = false, want true", s)
+		}
+	}
+
+	clean := []string{
+		"aqz-KE-bpKQ", // a bare video_id (player binding)
+		"CgtHQVZQX1lEMUJ3ayiIyLtBjIKCgJVUxIEGgAgVw", // representative base64url visitor_data (gvs binding)
+		"aqz-KE-bpKQ-中文-😊",                          // printable UTF-8 text
+	}
+	for _, s := range clean {
+		if HasControlChars(s) {
+			t.Errorf("HasControlChars(%q) = true, want false", s)
+		}
+	}
+}

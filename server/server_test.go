@@ -881,6 +881,79 @@ func TestGetPotContentBindingTooLong(t *testing.T) {
 	}
 }
 
+// TestGetPotRejectsControlChars covers decoded control characters that are valid
+// JSON but invalid content_binding values.
+func TestGetPotRejectsControlChars(t *testing.T) {
+	for _, body := range []string{
+		`{"content_binding":"a\nb"}`,       // raw Go string: \n reaches the server as two bytes
+		"{\"content_binding\":\"a\x7fb\"}", // a literal DEL byte the decoder accepts
+	} {
+		w := postGetPot(body)
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("body %q: status = %d, want %d", body, w.Code, http.StatusBadRequest)
+			continue
+		}
+		var env struct {
+			Error string `json:"error"`
+			Code  string `json:"code"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+			t.Fatalf("body %q: error body is not JSON: %v (%q)", body, err, w.Body.String())
+		}
+		if env.Code != CodeInvalidRequest {
+			t.Errorf("body %q: code = %q, want %q", body, env.Code, CodeInvalidRequest)
+		}
+		if !strings.Contains(env.Error, "control characters") {
+			t.Errorf("body %q: message = %q, want it to mention 'control characters'", body, env.Error)
+		}
+	}
+}
+
+// TestGetPotRawControlRejectedByDecoder checks that raw C0 bytes fail JSON
+// decoding before content_binding validation runs.
+func TestGetPotRawControlRejectedByDecoder(t *testing.T) {
+	w := postGetPot("{\"content_binding\":\"a\nb\"}") // real newline byte, json.SyntaxError
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+	var env struct {
+		Error string `json:"error"`
+		Code  string `json:"code"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("error body is not JSON: %v (%q)", err, w.Body.String())
+	}
+	if !strings.Contains(env.Error, "malformed JSON") {
+		t.Errorf("message = %q, want it to mention 'malformed JSON'", env.Error)
+	}
+	if strings.Contains(env.Error, "control characters") {
+		t.Errorf("message = %q, raw C0 bytes must be rejected before content_binding validation", env.Error)
+	}
+}
+
+// TestGetPotInvalidScopeMessage keeps the invalid-scope response in sync with
+// the values accepted by normalizeScope.
+func TestGetPotInvalidScopeMessage(t *testing.T) {
+	w := postGetPot(`{"content_binding":"x","scope":"bogus"}`)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+	var env struct {
+		Error string `json:"error"`
+		Code  string `json:"code"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("error body is not JSON: %v (%q)", err, w.Body.String())
+	}
+	if env.Code != CodeInvalidRequest {
+		t.Errorf("code = %q, want %q", env.Code, CodeInvalidRequest)
+	}
+	want := `scope must be "player", "gvs", "pot", or omitted`
+	if env.Error != want {
+		t.Errorf("message = %q, want exactly %q", env.Error, want)
+	}
+}
+
 func TestHandleReportLive(t *testing.T) {
 	sess := &fakePlayerSession{abrURL: "https://r/ok", vd: "vd"}
 	s := liveServer(t, map[string]string{"K": "alice"}, map[string]*fakePlayerSession{"K": sess})

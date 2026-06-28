@@ -103,6 +103,21 @@ func TestExecuteMissingBinding(t *testing.T) {
 	}
 }
 
+// Control characters in -c are rejected before the browser starts, and failures
+// still return the bgutil empty-object response.
+func TestGenerateRejectsControlChars(t *testing.T) {
+	code, stdout, stderr := runCLI("-c", "a\x7fb") // a literal DEL byte
+	if code != 2 {
+		t.Errorf("exit = %d, want 2 (stderr=%q)", code, stderr)
+	}
+	if stdout != "{}\n" {
+		t.Errorf("stdout = %q, want %q", stdout, "{}\n")
+	}
+	if !strings.Contains(stderr, "control characters") {
+		t.Errorf("stderr = %q, want the control-characters message", stderr)
+	}
+}
+
 func TestGetPotContentBindingTooLong(t *testing.T) {
 	over := strings.Repeat("a", browser.MaxContentBindingBytes+1)
 	code, stdout, stderr := runCLI("get-pot", "-c", over)
@@ -170,6 +185,31 @@ func TestIsExposedHost(t *testing.T) {
 	for _, h := range []string{"0.0.0.0", "::", "[::]", "192.168.1.5", "example.com", ""} {
 		if !isExposedHost(h) {
 			t.Errorf("isExposedHost(%q) = false, want true (exposed)", h)
+		}
+	}
+}
+
+// TestWarnKeylessExposure checks that the guest-identity warning is emitted only
+// for keyless daemons bound to an exposed address.
+func TestWarnKeylessExposure(t *testing.T) {
+	cases := []struct {
+		keyed    bool
+		host     string
+		wantWarn bool
+	}{
+		{false, "0.0.0.0", true},    // keyless and exposed
+		{false, "::", true},         // keyless and exposed through IPv6 any
+		{false, "127.0.0.1", false}, // loopback stays local
+		{false, "localhost", false}, // loopback name stays local
+		{true, "0.0.0.0", false},    // keys protect exposed hosts
+	}
+	for _, tt := range cases {
+		var buf bytes.Buffer
+		warnKeylessExposure(slog.New(slog.NewTextHandler(&buf, nil)), tt.keyed, tt.host)
+		warned := strings.Contains(buf.String(), "keyless daemon exposes")
+		if warned != tt.wantWarn {
+			t.Errorf("warnKeylessExposure(keyed=%v, host=%q): warned=%v, want %v (log=%q)",
+				tt.keyed, tt.host, warned, tt.wantWarn, buf.String())
 		}
 	}
 }

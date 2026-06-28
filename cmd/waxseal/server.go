@@ -216,6 +216,14 @@ func logMetricsAccess(logger *slog.Logger, keyed, metricsPublic, metricsKeySet b
 	}
 }
 
+// warnKeylessExposure reports a configuration that exposes guest identity data
+// from an unauthenticated daemon.
+func warnKeylessExposure(logger *slog.Logger, keyed bool, host string) {
+	if !keyed && isExposedHost(host) {
+		logger.Warn("keyless daemon exposes the guest identity through /session and /player-context; pass --tenant-keys to require authentication", "host", host)
+	}
+}
+
 // failStartup logs a configuration error once and preserves its exit-code type.
 func failStartup(logger *slog.Logger, err error) error {
 	logger.Error("startup: invalid configuration", "err", err)
@@ -273,9 +281,7 @@ func runServer(cmd *cobra.Command, o *serverOpts) error {
 	browser.ReapStaleProfiles(logger)
 	// Warn before browser startup when unauthenticated callers can access the guest
 	// identity.
-	if len(keys) == 0 && isExposedHost(o.host) {
-		logger.Warn("keyless daemon exposes the guest identity through /session and /player-context; pass --tenant-keys to require authentication", "host", o.host)
-	}
+	warnKeylessExposure(logger, len(keys) > 0, o.host)
 	logMetricsAccess(logger, len(keys) > 0, o.metricsPublic, o.metricsKey != "")
 
 	srv, err := server.New(server.Config{
