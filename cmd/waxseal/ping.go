@@ -13,8 +13,9 @@ import (
 
 // pingOpts holds ping-subcommand flags.
 type pingOpts struct {
-	addr string
-	key  string
+	addr   string
+	key    string
+	strict bool
 }
 
 // newPingCmd checks a running server with GET /ping and exits nonzero on failure.
@@ -30,13 +31,24 @@ func newPingCmd() *cobra.Command {
 	f := c.Flags()
 	f.StringVar(&p.addr, "addr", "127.0.0.1:4416", "server address to connect to")
 	f.StringVar(&p.key, "key", "", "tenant API key (required if the server is multi-tenant)")
+	f.BoolVar(&p.strict, "strict", false,
+		"treat the no-session window as healthy and fail only on probe failure\n"+
+			"(sends ?strict=true). Use this for container or systemd liveness\n"+
+			"checks while sessions are re-established lazily.")
 	return c
 }
 
 func runPing(cmd *cobra.Command, p *pingOpts) error {
-	u := "http://" + p.addr + "/ping"
+	q := url.Values{}
 	if p.key != "" {
-		u += "?key=" + url.QueryEscape(p.key)
+		q.Set("key", p.key)
+	}
+	if p.strict {
+		q.Set("strict", "true")
+	}
+	u := "http://" + p.addr + "/ping"
+	if len(q) > 0 {
+		u += "?" + q.Encode()
 	}
 	ctx, cancel := context.WithTimeout(cmd.Context(), 100*time.Second)
 	defer cancel()
@@ -49,10 +61,30 @@ func runPing(cmd *cobra.Command, p *pingOpts) error {
 	var body struct {
 		OK     bool   `json:"ok"`
 		Attest string `json:"attest"`
+		Reason string `json:"reason"`
 	}
 	_ = json.NewDecoder(resp.Body).Decode(&body)
-	if resp.StatusCode != http.StatusOK || !body.OK {
+	// Health semantics:
+	//   default: require a live session (ok:true), so no-session means not ready.
+	//   strict: accept no-session as healthy, but still fail on probe-failed.
+	//
+	// Do not trust HTTP 200 alone in strict mode. Older daemons ignore ?strict and
+	// can return 200 with {"ok":false}; non-WaxSeal endpoints can do the same.
+	healthy := body.OK
+	if p.strict {
+		healthy = body.OK || body.Reason == "no-session"
+	}
+	if resp.StatusCode != http.StatusOK || !healthy {
+		// reason distinguishes the benign no-session window from a real probe
+		// failure; older servers omit it.
+		if body.Reason != "" {
+			return fmt.Errorf("unhealthy: status=%d ok=%v reason=%s", resp.StatusCode, body.OK, body.Reason)
+		}
 		return fmt.Errorf("unhealthy: status=%d ok=%v", resp.StatusCode, body.OK)
+	}
+	if !body.OK { // strict mode, benign no-session: healthy but no live attestation
+		fmt.Fprintf(cmd.OutOrStdout(), "ok (reason=%s)\n", body.Reason)
+		return nil
 	}
 	fmt.Fprintf(cmd.OutOrStdout(), "ok (attest=%s)\n", body.Attest)
 	return nil

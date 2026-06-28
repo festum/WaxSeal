@@ -2,9 +2,11 @@ package minter
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/colespringer/waxseal/internal/browser"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -87,6 +89,78 @@ func TestTenantsMultiTenantIsolation(t *testing.T) {
 	}
 	if got := atomic.LoadInt64(calls); got != 2 {
 		t.Errorf("session creations = %d after repeat, want 2 (cache, no re-attest)", got)
+	}
+}
+
+// TestAggregateMetricsSnapshot covers the redacted aggregate shape, zero-seeded
+// counters, and Keyed() for keyless and keyed registries.
+func TestAggregateMetricsSnapshot(t *testing.T) {
+	// Keyless: Keyed() is false; the aggregate still emits all counter keys at zero.
+	keyless, _ := newTestTenants(nil)
+	if keyless.Keyed() {
+		t.Error("Keyed() = true for a keyless registry, want false")
+	}
+	emptyAgg := keyless.AggregateMetricsSnapshot()
+	if emptyAgg["redacted"] != true {
+		t.Errorf("redacted = %v, want true", emptyAgg["redacted"])
+	}
+	sums, ok := emptyAgg["aggregate"].(map[string]int64)
+	if !ok {
+		t.Fatalf("aggregate type = %T, want map[string]int64", emptyAgg["aggregate"])
+	}
+	if len(sums) != len(lifetimeCounterKeys) {
+		t.Errorf("aggregate has %d keys with no minters, want %d (zero-seeded)", len(sums), len(lifetimeCounterKeys))
+	}
+	for _, k := range lifetimeCounterKeys {
+		if v, present := sums[k]; !present || v != 0 {
+			t.Errorf("aggregate[%q] = %v (present=%v), want 0", k, v, present)
+		}
+	}
+
+	// Keyed with two tenants: Keyed() is true and counters sum across both.
+	tn, _ := newTestTenants(map[string]string{"KA": "alice", "KB": "bob"})
+	if !tn.Keyed() {
+		t.Error("Keyed() = false for a keyed registry, want true")
+	}
+	ma, _, err := tn.Minter("KA")
+	if err != nil {
+		t.Fatalf("alice minter: %v", err)
+	}
+	mb, _, err := tn.Minter("KB")
+	if err != nil {
+		t.Fatalf("bob minter: %v", err)
+	}
+	ma.metrics.Mints.Add(3)
+	ma.metrics.Crashes.Add(1)
+	mb.metrics.Mints.Add(4)
+	mb.metrics.PlayerContexts.Add(2)
+
+	agg := tn.AggregateMetricsSnapshot()
+	sums, _ = agg["aggregate"].(map[string]int64)
+	if sums["mints"] != 7 {
+		t.Errorf("aggregate mints = %d, want 7 (3+4)", sums["mints"])
+	}
+	if sums["crashes"] != 1 {
+		t.Errorf("aggregate crashes = %d, want 1", sums["crashes"])
+	}
+	if sums["player_contexts"] != 2 {
+		t.Errorf("aggregate player_contexts = %d, want 2", sums["player_contexts"])
+	}
+
+	// The redacted view leaks neither tenant identity, count, nor per-tenant data.
+	for _, leak := range []string{"per_tenant", "tenants", "alice", "bob"} {
+		if _, present := agg[leak]; present {
+			t.Errorf("aggregate leaks top-level key %q", leak)
+		}
+	}
+	raw, err := json.Marshal(agg)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	for _, leak := range []string{"alice", "bob", "per_tenant", "tenants"} {
+		if strings.Contains(string(raw), leak) {
+			t.Errorf("aggregate JSON leaks %q: %s", leak, raw)
+		}
 	}
 }
 

@@ -135,6 +135,10 @@ func (t *Tenants) CurrentBrowserPID() int {
 	return t.pool.CurrentLauncherPID()
 }
 
+// Keyed reports whether the registry runs in multi-tenant (keyed) mode. The key
+// set is fixed in NewTenants and never mutated, so this needs no lock.
+func (t *Tenants) Keyed() bool { return len(t.keys) > 0 }
+
 // MetricsSnapshot returns per-tenant metrics plus the tenant count.
 func (t *Tenants) MetricsSnapshot() map[string]any {
 	t.mu.Lock()
@@ -146,6 +150,30 @@ func (t *Tenants) MetricsSnapshot() map[string]any {
 	return map[string]any{
 		"tenants":    len(t.minters),
 		"per_tenant": per,
+	}
+}
+
+// AggregateMetricsSnapshot returns the redacted /metrics body for keyed daemons
+// when the request lacks the operator metrics key. It sums lifetime counters and
+// omits labels, tenant count, and per-tenant state. The map is seeded from
+// lifetimeCounterKeys so every counter is present even before any tenant has
+// been used. It only iterates existing minters; a scrape never creates tenant
+// state.
+func (t *Tenants) AggregateMetricsSnapshot() map[string]any {
+	sums := make(map[string]int64, len(lifetimeCounterKeys))
+	for _, k := range lifetimeCounterKeys {
+		sums[k] = 0
+	}
+	t.mu.Lock()
+	for _, m := range t.minters {
+		for k, v := range m.counterValues() {
+			sums[k] += v
+		}
+	}
+	t.mu.Unlock()
+	return map[string]any{
+		"redacted":  true,
+		"aggregate": sums,
 	}
 }
 

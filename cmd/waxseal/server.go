@@ -27,6 +27,8 @@ type serverOpts struct {
 	tenantKeys      string
 	streamingMaxAge string
 	reportDebounce  string
+	metricsPublic   bool
+	metricsKey      string
 	verbose         bool
 }
 
@@ -73,6 +75,15 @@ func newServerCmd() *cobra.Command {
 			"(flag > WAXSEAL_REPORT_DEBOUNCE env > 5m default). This limits\n"+
 			"re-attestation caused by reports and applies separately to each tenant.\n"+
 			"Minimum 5s; report rate-limiting cannot be disabled.")
+	f.BoolVar(&o.metricsPublic, "metrics-public", false,
+		"serve full per-tenant /metrics detail (tenant labels + activity) to\n"+
+			"unauthenticated scrapes on a keyed daemon. Ignored without\n"+
+			"--tenant-keys because keyless daemons already serve full detail.")
+	f.StringVar(&o.metricsKey, "metrics-key", "",
+		"operator key that unlocks full per-tenant /metrics detail on a keyed daemon.\n"+
+			"Without it (or --metrics-public), a keyed daemon serves unauthenticated\n"+
+			"scrapes a redacted, label-free aggregate. Must differ from every tenant\n"+
+			"key. Ignored without --tenant-keys.")
 	f.BoolVarP(&o.verbose, "verbose", "v", false, "enable debug logging")
 	return c
 }
@@ -183,6 +194,28 @@ func isExposedHost(host string) bool {
 	return !ip.IsLoopback()
 }
 
+// logMetricsAccess reports the effective /metrics access mode. Metrics flags
+// apply only to keyed daemons; keyless daemons already serve full detail. When
+// both flags are set, --metrics-public wins.
+func logMetricsAccess(logger *slog.Logger, keyed, metricsPublic, metricsKeySet bool) {
+	switch {
+	case !keyed:
+		if metricsPublic || metricsKeySet {
+			logger.Warn("--metrics-public/--metrics-key are ignored without --tenant-keys; a keyless daemon already serves full /metrics detail")
+		}
+	case metricsPublic:
+		if metricsKeySet {
+			logger.Warn("both --metrics-public and --metrics-key set; --metrics-public wins: /metrics serves full per-tenant detail unauthenticated")
+		} else {
+			logger.Warn("--metrics-public: /metrics serves full per-tenant detail (tenant labels + activity) to unauthenticated scrapes")
+		}
+	case metricsKeySet:
+		logger.Info("/metrics serves a redacted aggregate to unauthenticated scrapes; --metrics-key unlocks full per-tenant detail")
+	default:
+		logger.Info("/metrics serves a redacted aggregate on this keyed daemon; pass --metrics-key (authenticated) or --metrics-public (trusted network) for full per-tenant detail")
+	}
+}
+
 // failStartup logs a configuration error once and preserves its exit-code type.
 func failStartup(logger *slog.Logger, err error) error {
 	logger.Error("startup: invalid configuration", "err", err)
@@ -212,6 +245,13 @@ func runServer(cmd *cobra.Command, o *serverOpts) error {
 	if err != nil {
 		return failStartup(logger, &usageError{msg: err.Error()})
 	}
+	// Reject a metrics key that is also a tenant key before launching the browser.
+	// Name the tenant label, never the key material. server.New enforces the same
+	// rule for programmatic callers.
+	if label, collides := server.MetricsKeyCollision(keys, o.metricsKey); collides {
+		return failStartup(logger, &usageError{
+			msg: fmt.Sprintf("metrics key collides with API key for tenant %q", label)})
+	}
 
 	// Bind before launching Chromium so an invalid or unavailable address fails
 	// without running browser startup and attestation.
@@ -236,6 +276,7 @@ func runServer(cmd *cobra.Command, o *serverOpts) error {
 	if len(keys) == 0 && isExposedHost(o.host) {
 		logger.Warn("keyless daemon exposes the guest identity through /session and /player-context; pass --tenant-keys to require authentication", "host", o.host)
 	}
+	logMetricsAccess(logger, len(keys) > 0, o.metricsPublic, o.metricsKey != "")
 
 	srv, err := server.New(server.Config{
 		Addr:            ln.Addr().String(),
@@ -245,6 +286,8 @@ func runServer(cmd *cobra.Command, o *serverOpts) error {
 		Logger:          logger,
 		StreamingMaxAge: streamingMaxAge,
 		ReportDebounce:  reportDebounce,
+		MetricsPublic:   o.metricsPublic,
+		MetricsKey:      o.metricsKey,
 	})
 	if err != nil {
 		logger.Error("startup: launch browser failed", "err", err)

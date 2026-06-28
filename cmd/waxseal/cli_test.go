@@ -216,6 +216,40 @@ func TestServerInvalidTenantKeysUsageError(t *testing.T) {
 	}
 }
 
+// The metrics access flags parse on the server command.
+func TestServerMetricsFlagsParse(t *testing.T) {
+	c := newServerCmd()
+	if err := c.ParseFlags([]string{"--metrics-public", "--metrics-key", "OPSKEY"}); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if pub, _ := c.Flags().GetBool("metrics-public"); !pub {
+		t.Error("--metrics-public did not parse to true")
+	}
+	if mk, _ := c.Flags().GetString("metrics-key"); mk != "OPSKEY" {
+		t.Errorf("--metrics-key = %q, want OPSKEY", mk)
+	}
+}
+
+// A --metrics-key equal to a tenant key is a usage error (exit 2). The message
+// names the colliding tenant label and never leaks key material.
+func TestServerMetricsKeyCollisionUsageError(t *testing.T) {
+	t.Setenv("WAXSEAL_STREAMING_MAX_AGE", "")
+	t.Setenv("WAXSEAL_REPORT_DEBOUNCE", "")
+	code, _, stderr := runCLI("server", "--tenant-keys", "alice=KEYA,bob=KEYB", "--metrics-key", "KEYA")
+	if code != 2 {
+		t.Errorf("exit = %d, want 2 (stderr=%q)", code, stderr)
+	}
+	if !strings.Contains(stderr, "metrics key collides") {
+		t.Errorf("stderr = %q, want it to mention the collision", stderr)
+	}
+	if !strings.Contains(stderr, "alice") {
+		t.Errorf("stderr = %q, want it to name the colliding tenant label", stderr)
+	}
+	if strings.Contains(stderr, "KEYA") || strings.Contains(stderr, "KEYB") {
+		t.Errorf("stderr leaks key material: %q", stderr)
+	}
+}
+
 func TestValidateLandingVideo(t *testing.T) {
 	for _, ok := range []string{browser.DefaultVideo, "aqz-KE-bpKQ", "abc123"} {
 		if err := validateLandingVideo(ok); err != nil {

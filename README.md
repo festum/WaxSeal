@@ -58,7 +58,7 @@ not a URL.
 | `GET` | `/session` | Export the attested guest identity and cookies |
 | `POST` | `/report` | Report a degraded stream and recycle its session |
 | `GET` | `/ping` | Check the current browser session without minting |
-| `GET` | `/metrics` | Return per-tenant counters |
+| `GET` | `/metrics` | Return operational counters; keyed daemons redact tenant detail unless `--metrics-key` or `--metrics-public` is set |
 
 ### Tokens and identity
 
@@ -127,6 +127,33 @@ exposing the service.
 receive generated labels. Labels and keys must be non-empty and unique. Invalid
 configurations stop startup before Chromium launches.
 
+#### Metrics access
+
+`/metrics` exposes tenant labels and per-tenant activity. On a keyed daemon it is
+**redacted by default**: unauthenticated scrapes, tenant-key scrapes, and
+requests with the wrong key receive a label-free aggregate. Full tenant detail
+requires the operator metrics key or an explicit public configuration. A keyless
+daemon still serves full detail. All variants return HTTP 200; redaction is a
+successful response, not a `401`.
+
+| Daemon / request | `/metrics` returns |
+|---|---|
+| keyless (default) | **full** per-tenant detail (unchanged) |
+| keyed, no key / tenant key / wrong key | **redacted aggregate**: daemon-wide summed counters, no labels, no tenant count |
+| keyed, correct `--metrics-key` | **full** per-tenant detail |
+| keyed, `--metrics-public` | **full** per-tenant detail, unauthenticated |
+
+Tenant keys never unlock detail. Only the dedicated `--metrics-key` (operator
+key) or `--metrics-public` does. This keeps minting keys separate from metrics
+access and prevents one tenant from reading another tenant's counters.
+`--metrics-key` must differ from every tenant key; a collision stops startup.
+When both flags are set, `--metrics-public` wins. Both flags are ignored on a
+keyless daemon, which already serves full detail.
+
+The two response shapes are the full
+`{"tenants":N,"per_tenant":{"<label>":{...}}}` and the redacted
+`{"redacted":true,"aggregate":{...}}`; see [The `/metrics` schema](#the-metrics-schema).
+
 ### Errors
 
 Recognized endpoints return errors as
@@ -144,9 +171,61 @@ status.
 | `no-session` | 503 | No attested session is available |
 | `timeout` | 504 | Player-context deadline elapsed |
 
-`/ping` is the exception: after authentication it returns HTTP 200 with either
-`ok:true` or `ok:false`. The `client` package parses API errors into
-`*client.APIError` and provides matching code constants.
+`/ping` is the exception: after authentication it returns HTTP 200 by default,
+with either `ok:true` or `ok:false`. An always-present `reason` field
+distinguishes the two `ok:false` cases:
+
+- `reason:"ok"`: healthy (`ok:true`).
+- `reason:"no-session"`: benign. A `POST /report` retires the session and
+  re-establishment is lazy, so `ok` briefly reads `false` until the next
+  streaming call. This is expected, not a fault.
+- `reason:"probe-failed"`: a live session's health probe failed. The server logs
+  this at `warn`.
+
+Alert only on `reason:"probe-failed"`. Status-code-only health checks
+(k8s liveness/readiness, `curl -f`, HAProxy) can pass
+`?strict=true` to map a `probe-failed` to **HTTP 503** while `no-session` and
+healthy stay **200**. This avoids liveness failures during the benign
+re-establishment window. In the `ok:false` branch the other fields, such as
+`navigator_webdriver` and `attest`, reflect a zero or last-known state rather
+than a fresh reading; a human-readable `error` is also included.
+
+The `waxseal ping` CLI mirrors this: by default it exits non-zero unless a live
+session is present (a readiness check), and `waxseal ping --strict` sends
+`?strict=true` and exits non-zero only on `probe-failed`, treating the benign
+`no-session` window as healthy. Use `--strict` for container or systemd liveness
+probes so they do not fail while a session re-establishes.
+
+The `client` package parses API errors into `*client.APIError` and provides
+matching code constants.
+
+### The `/metrics` schema
+
+`/metrics` returns one of two shapes (see [Metrics access](#metrics-access) for
+which, and the HTTP 200 guarantee).
+
+**Full per-tenant view**: `{"tenants":N,"per_tenant":{"<label>":{...}}}`. Each
+per-tenant object carries lifetime counters (`mints`, `crashes`,
+`player_contexts`, and so on) plus current state. Detail fields are **always
+present** so the schema stays stable across session retirement, crash, and
+recycle. WaxSeal uses sentinel values when a field does not apply:
+
+- `last_browser_proof_outcome`: `""` when no proof has run or no session is live.
+- `last_browser_proof_age_secs`: JSON `null` when no proof has run or no session
+  is live, otherwise an integer. This keeps `0` reserved for "just proved."
+- `streaming_suspect_video`: `""` when the session is not suspect.
+- `streaming_seconds_until_recycle`: present **only** when time-based recycling
+  is enabled (`--streaming-max-age` > 0). The value is an integer when a live
+  session has an armed deadline and `null` when recycling is enabled but no live
+  session has a deadline. If the field is absent, recycling is disabled.
+
+When a detail field does not apply, WaxSeal emits `null` or `""` rather than
+omitting the field.
+
+**Redacted aggregate view**: `{"redacted":true,"aggregate":{...}}`. The
+`aggregate` object holds each lifetime counter summed across all tenants. It has
+no tenant labels, no per-tenant breakdown, and no tenant count. Counter keys are
+always present and have value zero when there are no tenants.
 
 ## Operations
 
@@ -163,7 +242,8 @@ or a failed health probe. Session retirement caused by age, a consumer report,
 or operation retries does not increment it.
 
 Use `go run ./cmd/waxseal server --help` for configuration options, including
-session recycling, report debounce, bind address, and headful mode.
+session recycling, report debounce, bind address, headful mode, and metrics
+access (`--metrics-key`, `--metrics-public`).
 
 ## Development
 

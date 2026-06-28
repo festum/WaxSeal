@@ -129,8 +129,10 @@ const (
 // selfTestMintRetryDelay is variable so tests can shorten the retry interval.
 var selfTestMintRetryDelay = 1 * time.Second
 
-// errNoSession reports that the tenant has no existing attested session.
-var errNoSession = errors.New("waxseal: no attested session")
+// ErrNoSession reports that the tenant has no existing attested session. It is
+// exported so callers (e.g. server /ping) can distinguish the benign no-session
+// state from a real probe failure.
+var ErrNoSession = errors.New("waxseal: no attested session")
 
 // NewMinter builds a single-identity minter for video (the landing watch id). It
 // launches a browser only when an operation first needs a session.
@@ -660,7 +662,7 @@ func (m *Minter) Health(ctx context.Context) (HealthSnapshot, bool, error) {
 		sess, gen := m.sess, m.gen
 		m.mu.Unlock()
 		if sess == nil {
-			return HealthSnapshot{}, false, errNoSession
+			return HealthSnapshot{}, false, ErrNoSession
 		}
 
 		pctx, cancel := context.WithTimeout(ctx, pingProbeTimeout)
@@ -686,7 +688,7 @@ func (m *Minter) Health(ctx context.Context) (HealthSnapshot, bool, error) {
 		}
 		return HealthSnapshot{}, false, err
 	}
-	return HealthSnapshot{}, false, errNoSession
+	return HealthSnapshot{}, false, ErrNoSession
 }
 
 // healthSnapshot builds a HealthSnapshot for the probed (sess, gen). It reads the
@@ -752,41 +754,31 @@ func (m *Minter) SelfTest(ctx context.Context) error {
 	return nil
 }
 
-// MetricsSnapshot returns counters and current state for the /metrics endpoint.
-func (m *Minter) MetricsSnapshot() map[string]any {
-	m.mu.Lock()
-	gen := m.gen
-	sess := m.sess
-	live := sess != nil
-	kind := ""
-	var ageSecs, streamingSecsLeft int
-	var hasStreamingDeadline, suspect bool
-	suspectVideo := ""
-	if sess != nil {
-		kind = sess.AttestKind()
-		ageSecs = int(time.Since(m.attestedAt).Seconds())
-		if m.streamingMaxAge > 0 && !m.streamingDeadline.IsZero() {
-			hasStreamingDeadline = true
-			// Recycling waits for the next streaming handoff, so clamp overdue
-			// deadlines to zero.
-			if secs := int(time.Until(m.streamingDeadline).Seconds()); secs > 0 {
-				streamingSecsLeft = secs
-			}
-		}
-		suspect = m.reportSuspectGen == gen && m.reportSuspectGen != 0
-		if suspect {
-			suspectVideo = m.reportSuspectVideoID
-		}
-	}
-	cacheN := len(m.cache)
-	m.mu.Unlock()
+// lifetimeCounterKeys is the ordered set of process-lifetime counters returned
+// by counterValues. Per-tenant metrics and the redacted aggregate both use this
+// list, so their counter sets stay aligned.
+var lifetimeCounterKeys = []string{
+	"attestations",
+	"mints",
+	"mint_failures",
+	"escalations",
+	"player_contexts",
+	"player_context_failures",
+	"crashes",
+	"cache_hits",
+	"cache_misses",
+	"launch_failures",
+	"streaming_recycles",
+	"report_driven_recycles",
+	"degradation_reports_accepted",
+	"degradation_reports_rejected_stale",
+	"degradation_reports_rate_limited",
+}
 
-	out := map[string]any{
-		"generation":                         gen,
-		"session_live":                       live,
-		"attest_kind":                        kind,
-		"session_age_secs":                   ageSecs,
-		"cache_entries":                      cacheN,
+// counterValues returns each process-lifetime counter keyed by its metrics name.
+// Its key set must match lifetimeCounterKeys.
+func (m *Minter) counterValues() map[string]int64 {
+	return map[string]int64{
 		"attestations":                       m.metrics.Attestations.Load(),
 		"mints":                              m.metrics.Mints.Load(),
 		"mint_failures":                      m.metrics.MintFailures.Load(),
@@ -802,24 +794,82 @@ func (m *Minter) MetricsSnapshot() map[string]any {
 		"degradation_reports_accepted":       m.metrics.DegradationReportsAccepted.Load(),
 		"degradation_reports_rejected_stale": m.metrics.DegradationReportsRejectedStale.Load(),
 		"degradation_reports_rate_limited":   m.metrics.DegradationReportsRateLimited.Load(),
-		// These fields remain present when no session is live, which keeps the
-		// metrics schema stable across session retirement.
-		"browser_proof_established": live && sess.Established(),
-		"streaming_suspect":         suspect,
 	}
-	// Session detail fields are present only in the states where they apply.
+}
+
+// MetricsSnapshot returns counters and current state for the /metrics endpoint.
+//
+// Session detail fields remain present after retirement so consumers can use one
+// schema for live and not-live states. Fields that do not apply use sentinels:
+// "" for string fields and nil map values, encoded as JSON null, for nullable
+// numeric fields. streaming_seconds_until_recycle is present only when
+// time-based recycling is enabled; absence means recycling is disabled.
+func (m *Minter) MetricsSnapshot() map[string]any {
+	m.mu.Lock()
+	gen := m.gen
+	sess := m.sess
+	live := sess != nil
+	kind := ""
+	var ageSecs int
+	suspect := live && m.reportSuspectGen == gen && m.reportSuspectGen != 0
+	suspectVideo := ""
 	if live {
-		if suspectVideo != "" {
-			out["streaming_suspect_video"] = suspectVideo
+		kind = sess.AttestKind()
+		ageSecs = int(time.Since(m.attestedAt).Seconds())
+		if suspect {
+			suspectVideo = m.reportSuspectVideoID
 		}
-		if hasStreamingDeadline {
-			out["streaming_seconds_until_recycle"] = streamingSecsLeft
+	}
+	// The recycle field is controlled by static config. Its value comes from the
+	// live session's armed deadline, read under m.mu. Ignore streamingDeadline
+	// when no session is live because it may belong to an older generation.
+	recycleEnabled := m.streamingMaxAge > 0
+	var recycleSecs any // nil encodes as JSON null
+	if recycleEnabled && live && !m.streamingDeadline.IsZero() {
+		// Recycling waits for the next streaming handoff, so clamp an overdue
+		// deadline to zero rather than reporting a negative remaining time.
+		if secs := int(time.Until(m.streamingDeadline).Seconds()); secs > 0 {
+			recycleSecs = secs
+		} else {
+			recycleSecs = 0
 		}
-		// Report an outcome only when its completion time is known.
+	}
+	cacheN := len(m.cache)
+	m.mu.Unlock()
+
+	// Read the session's proof state outside m.mu, as healthSnapshot does. The
+	// session guards these fields with probeMu, and Close does not mutate them.
+	var established bool
+	var proofOutcome string
+	var proofAge any // nil encodes as JSON null; int means an outcome time is known
+	if live {
+		established = sess.Established()
 		if proof, proofAt := sess.LastProof(); !proofAt.IsZero() {
-			out["last_browser_proof_outcome"] = proof.Outcome
-			out["last_browser_proof_age_secs"] = int(time.Since(proofAt).Seconds())
+			proofOutcome, proofAge = proof.Outcome, int(time.Since(proofAt).Seconds())
 		}
+	}
+
+	out := map[string]any{
+		"generation":       gen,
+		"session_live":     live,
+		"attest_kind":      kind,
+		"session_age_secs": ageSecs,
+		"cache_entries":    cacheN,
+		// Keep these detail fields present in every state. Use "" or null when the
+		// field does not apply.
+		"browser_proof_established":   established,
+		"streaming_suspect":           suspect,
+		"streaming_suspect_video":     suspectVideo,
+		"last_browser_proof_outcome":  proofOutcome,
+		"last_browser_proof_age_secs": proofAge,
+	}
+	for name, v := range m.counterValues() {
+		out[name] = v
+	}
+	// Emit only when time-based recycling is enabled. A null value means recycling
+	// is enabled but no live session has an armed deadline.
+	if recycleEnabled {
+		out["streaming_seconds_until_recycle"] = recycleSecs
 	}
 	return out
 }

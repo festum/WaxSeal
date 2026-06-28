@@ -5,6 +5,8 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -37,13 +39,26 @@ type Config struct {
 	// ReportDebounce is the minimum interval between session recycles caused by
 	// consumer reports. A non-positive value uses minter.DefaultReportDebounce.
 	ReportDebounce time.Duration
+
+	// MetricsPublic makes keyed daemons serve full per-tenant /metrics detail
+	// without a metrics key. It is ignored for keyless daemons, which already
+	// serve full detail.
+	MetricsPublic bool
+
+	// MetricsKey is the operator key that unlocks full per-tenant /metrics detail
+	// on keyed daemons. Tenant keys never unlock detail. It is ignored for
+	// keyless daemons.
+	MetricsKey string
 }
 
 // Server is the running HTTP service over a real-browser minter.
 type Server struct {
-	tenants *minter.Tenants
-	log     *slog.Logger
-	srv     *http.Server
+	tenants        *minter.Tenants
+	log            *slog.Logger
+	srv            *http.Server
+	metricsPublic  bool     // serve full /metrics detail unauthenticated on a keyed daemon
+	metricsKeyed   bool     // an operator metrics key is configured
+	metricsKeyHash [32]byte // SHA-256 of the operator key, precomputed at startup
 }
 
 // requestProcessTimeout bounds how long one request can hold the per-tenant page
@@ -64,6 +79,11 @@ func New(cfg Config) (*Server, error) {
 	if cfg.Video == "" {
 		cfg.Video = browser.DefaultVideo
 	}
+	// Reject a metrics key that is also a tenant key before launching the browser.
+	// The CLI performs the same check so it can return a usage exit code.
+	if label, collides := MetricsKeyCollision(cfg.TenantKeys, cfg.MetricsKey); collides {
+		return nil, fmt.Errorf("waxseal: metrics key collides with API key for tenant %q", label)
+	}
 	opts := browser.Options{
 		Headful:     cfg.Headful,
 		NormalizeUA: !cfg.Headful, // remove the HeadlessChrome marker in headless mode
@@ -74,8 +94,13 @@ func New(cfg Config) (*Server, error) {
 		return nil, err
 	}
 	s := &Server{
-		tenants: minter.NewTenants(pool, cfg.Video, cfg.TenantKeys, opts, cfg.StreamingMaxAge, cfg.ReportDebounce),
-		log:     log,
+		tenants:       minter.NewTenants(pool, cfg.Video, cfg.TenantKeys, opts, cfg.StreamingMaxAge, cfg.ReportDebounce),
+		log:           log,
+		metricsPublic: cfg.MetricsPublic,
+		// Hash once at startup. Request handling hashes the presented key and
+		// compares fixed-length digests.
+		metricsKeyed:   cfg.MetricsKey != "",
+		metricsKeyHash: sha256.Sum256([]byte(cfg.MetricsKey)),
 	}
 	s.srv = &http.Server{Addr: cfg.Addr, Handler: s.routes(), ReadHeaderTimeout: 10 * time.Second}
 	return s, nil
@@ -303,33 +328,70 @@ func normalizeScope(raw string) (string, bool) {
 	}
 }
 
+// strictPing reports whether ?strict asks /ping to map probe failures to HTTP
+// 503. Healthy sessions and no-session responses stay 200. A bare ?strict
+// enables it; explicit false values disable it.
+func strictPing(r *http.Request) bool {
+	q := r.URL.Query()
+	if !q.Has("strict") {
+		return false
+	}
+	v := q.Get("strict")
+	if v == "" { // bare ?strict or ?strict=: presence means enabled
+		return true
+	}
+	b, err := strconv.ParseBool(v)
+	return err == nil && b
+}
+
 // handlePing probes an existing tenant session without launching Chromium,
 // attesting, or minting. A failed probe may retire the session. After
-// authentication, the handler reports health in an HTTP 200 response body.
+// authentication, the handler reports health in a stable body. The reason field
+// distinguishes no-session from probe-failed; ?strict=true maps only probe
+// failures to HTTP 503.
 func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
 	m, label, ok := s.tenant(w, r)
 	if !ok {
 		return
 	}
 	snap, live, err := m.Health(r.Context())
+	reason := "ok"
+	status := http.StatusOK
 	if err != nil {
-		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "tenant": label, "error": err.Error()})
-		return
+		reason = "probe-failed"
+		if errors.Is(err, minter.ErrNoSession) {
+			// A report can retire the session before the next streaming request
+			// lazily creates a replacement. Treat that gap as expected.
+			reason = "no-session"
+		} else {
+			// Probe failures should be visible in logs even when callers do not poll
+			// /ping. Strict mode also exposes them through the status code.
+			s.log.Warn("ping probe failed", "tenant", label, "err", err)
+			if strictPing(r) {
+				status = http.StatusServiceUnavailable
+			}
+		}
 	}
 	// Browser proof describes playback in the daemon. A consumer report can still
 	// mark the session suspect after a successful proof. /ping deliberately omits
 	// guest identity data. navigator_webdriver remains because it is a
-	// browser-detection health signal.
-	writeJSON(w, http.StatusOK, map[string]any{
+	// browser-detection health signal. In failure responses these values come
+	// from a zero HealthSnapshot, so they are unknown or last-known state.
+	body := map[string]any{
 		"ok":                         live,
 		"tenant":                     label,
+		"reason":                     reason,
 		"attest":                     snap.AttestKind,
 		"generation":                 snap.Generation,
 		"navigator_webdriver":        snap.Identity.Webdriver,
 		"browser_proof_established":  snap.BrowserProofEstablished,
 		"last_browser_proof_outcome": snap.LastBrowserProofOutcome,
 		"streaming_suspect":          snap.StreamingSuspect,
-	})
+	}
+	if err != nil {
+		body["error"] = err.Error()
+	}
+	writeJSON(w, status, body)
 }
 
 // sessionCookie is the wire representation of one youtube.com cookie.
@@ -429,10 +491,31 @@ func (s *Server) handleReport(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, body)
 }
 
-// handleMetrics returns unauthenticated operational data. It includes per-tenant
-// counters and state, but no tokens, cookies, or keys.
+// metricsFull reports whether a request may see full per-tenant /metrics detail.
+// Keyless daemons and --metrics-public always serve full detail. On keyed
+// daemons, only the operator metrics key unlocks detail; tenant keys do not.
+func (s *Server) metricsFull(r *http.Request) bool {
+	if s.metricsPublic || !s.tenants.Keyed() {
+		return true
+	}
+	if !s.metricsKeyed {
+		return false
+	}
+	// Hash the presented key before comparison so both operands have fixed length.
+	// That avoids the length-based early return in ConstantTimeCompare.
+	got := sha256.Sum256([]byte(apiKey(r)))
+	return subtle.ConstantTimeCompare(got[:], s.metricsKeyHash[:]) == 1
+}
+
+// handleMetrics returns operational data: per-tenant counters and state, but no
+// tokens, cookies, or keys. On keyed daemons, requests without the operator key
+// receive a redacted aggregate. Every case returns HTTP 200.
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, s.tenants.MetricsSnapshot())
+	if s.metricsFull(r) {
+		writeJSON(w, http.StatusOK, s.tenants.MetricsSnapshot())
+		return
+	}
+	writeJSON(w, http.StatusOK, s.tenants.AggregateMetricsSnapshot())
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -536,6 +619,17 @@ func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any, allowEmpty 
 
 func writeErrDetails(w http.ResponseWriter, status int, code, msg, details string) {
 	writeJSON(w, status, errEnvelope{Error: msg, Code: code, Details: details})
+}
+
+// MetricsKeyCollision reports the tenant label that shares an API key with
+// metricsKey, if one exists. An empty metricsKey never collides. New and the CLI
+// both call this helper before accepting a metrics key.
+func MetricsKeyCollision(tenantKeys map[string]string, metricsKey string) (label string, collides bool) {
+	if metricsKey == "" {
+		return "", false
+	}
+	label, collides = tenantKeys[metricsKey]
+	return label, collides
 }
 
 // ParseTenantKeys parses comma-separated label=key entries and bare API keys into

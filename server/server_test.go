@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +19,13 @@ import (
 	"github.com/colespringer/waxseal/internal/browser"
 	"github.com/colespringer/waxseal/internal/minter"
 )
+
+// setMetricsKey configures the operator metrics key the same way server.New
+// does, without launching a browser.
+func setMetricsKey(s *Server, key string) {
+	s.metricsKeyed = true
+	s.metricsKeyHash = sha256.Sum256([]byte(key))
+}
 
 func TestParseTenantKeys(t *testing.T) {
 	for _, in := range []string{"", "  "} {
@@ -69,6 +77,26 @@ func TestParseTenantKeys(t *testing.T) {
 		if len(mix) != 2 || mix["KEYA"] == "" || mix["KEYB"] == "" || mix["KEYA"] == mix["KEYB"] {
 			t.Errorf("ParseTenantKeys(%q) = %v, want two distinct non-empty labels", in, mix)
 		}
+	}
+}
+
+func TestMetricsKeyCollision(t *testing.T) {
+	keys := map[string]string{"KEYA": "alice", "KEYB": "bob"}
+	// A metrics key equal to a tenant key collides and yields that tenant's label.
+	if label, collides := MetricsKeyCollision(keys, "KEYA"); !collides || label != "alice" {
+		t.Errorf("MetricsKeyCollision(KEYA) = (%q, %v), want (alice, true)", label, collides)
+	}
+	// A distinct operator key does not collide.
+	if label, collides := MetricsKeyCollision(keys, "OPSKEY"); collides {
+		t.Errorf("MetricsKeyCollision(OPSKEY) = (%q, true), want no collision", label)
+	}
+	// An empty metrics key never collides (no operator key configured).
+	if _, collides := MetricsKeyCollision(keys, ""); collides {
+		t.Error("empty metrics key reported a collision")
+	}
+	// A keyless registry has no tenant keys, so nothing collides.
+	if _, collides := MetricsKeyCollision(nil, "OPSKEY"); collides {
+		t.Error("keyless registry reported a collision")
 	}
 }
 
@@ -385,6 +413,7 @@ type fakePlayerSession struct {
 	abrURL      string
 	vd          string
 	established bool
+	pingErr     error // non-nil makes Ping fail, so a probe failure can be injected
 	closed      atomic.Bool
 }
 
@@ -395,7 +424,7 @@ func (f *fakePlayerSession) PlayerContext(context.Context, string) (browser.Play
 	return browser.PlayerContext{PlayabilityStatus: "OK", ServerAbrStreamingURL: f.abrURL, VisitorData: f.vd}, nil
 }
 func (f *fakePlayerSession) EnsureEstablished(context.Context) error { return nil }
-func (f *fakePlayerSession) Ping(context.Context) error              { return nil }
+func (f *fakePlayerSession) Ping(context.Context) error              { return f.pingErr }
 func (f *fakePlayerSession) AttestKind() string                      { return "integrity" }
 func (f *fakePlayerSession) Identity() browser.Identity {
 	return browser.Identity{VisitorData: f.vd, UserAgent: "UA", ClientVersion: "2.x"}
@@ -492,7 +521,10 @@ func TestPingHealthFields(t *testing.T) {
 	if v, ok := resp["navigator_webdriver"]; !ok || v != false {
 		t.Errorf("navigator_webdriver = %v (present=%v), want present with value false", v, ok)
 	}
-	for _, k := range []string{"ok", "attest", "generation", "navigator_webdriver", "browser_proof_established", "last_browser_proof_outcome", "streaming_suspect"} {
+	if resp["reason"] != "ok" {
+		t.Errorf("reason = %v, want \"ok\" on a healthy ping", resp["reason"])
+	}
+	for _, k := range []string{"ok", "attest", "generation", "navigator_webdriver", "browser_proof_established", "last_browser_proof_outcome", "streaming_suspect", "reason"} {
 		if _, ok := resp[k]; !ok {
 			t.Errorf("/ping missing field %q", k)
 		}
@@ -537,11 +569,294 @@ func TestMetricsSchemaStableAfterReport(t *testing.T) {
 			t.Errorf("%q = %v, want false", k, v)
 		}
 	}
-	// Session detail fields are omitted when no session is live.
-	for _, k := range []string{"last_browser_proof_outcome", "last_browser_proof_age_secs", "streaming_seconds_until_recycle", "streaming_suspect_video"} {
-		if _, present := tenant[k]; present {
-			t.Errorf("%q present after retire, want absent (state-dependent field)", k)
+	// Detail fields stay present after retirement. liveServer builds with
+	// streamingMaxAge == 0, so the recycle field stays absent because time-based
+	// recycling is disabled.
+	wantSentinel := map[string]any{
+		"last_browser_proof_outcome":  "",
+		"last_browser_proof_age_secs": nil,
+		"streaming_suspect_video":     "",
+	}
+	for k, want := range wantSentinel {
+		v, present := tenant[k]
+		if !present {
+			t.Errorf("%q absent after retire, want present (%v) for a stable schema", k, want)
+		} else if v != want {
+			t.Errorf("%q = %v, want %v after retire", k, v, want)
 		}
+	}
+	if _, present := tenant["streaming_seconds_until_recycle"]; present {
+		t.Error("streaming_seconds_until_recycle present though recycling is disabled (streamingMaxAge == 0)")
+	}
+}
+
+func TestMetricsRedaction(t *testing.T) {
+	keys := map[string]string{"KA": "alice", "KB": "bob"}
+	s := liveServer(t, keys, map[string]*fakePlayerSession{
+		"KA": {abrURL: "https://r/a", vd: "vd-a"},
+		"KB": {abrURL: "https://r/b", vd: "vd-b"},
+	})
+	setMetricsKey(s, "OPSKEY")
+
+	get := func(key string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+		if key != "" {
+			r.Header.Set("X-API-Key", key)
+		}
+		w := httptest.NewRecorder()
+		s.routes().ServeHTTP(w, r)
+		return w
+	}
+	// Drive asymmetric activity so the per-tenant counters differ and a real sum
+	// is exercised (alice mints twice, bob once).
+	mint := func(key, binding string) {
+		r := httptest.NewRequest(http.MethodPost, "/get_pot", strings.NewReader(`{"content_binding":"`+binding+`"}`))
+		r.Header.Set("X-API-Key", key)
+		w := httptest.NewRecorder()
+		s.routes().ServeHTTP(w, r)
+		if w.Code != http.StatusOK {
+			t.Fatalf("get_pot(%s,%s) status = %d, body=%s", key, binding, w.Code, w.Body)
+		}
+	}
+	mint("KA", "vid-a1")
+	mint("KA", "vid-a2")
+	mint("KB", "vid-b1")
+
+	// Full per-tenant detail with the operator key (always HTTP 200).
+	fullW := get("OPSKEY")
+	if fullW.Code != http.StatusOK {
+		t.Fatalf("ops-key /metrics status = %d", fullW.Code)
+	}
+	var full struct {
+		Tenants   float64                   `json:"tenants"`
+		PerTenant map[string]map[string]any `json:"per_tenant"`
+		Redacted  bool                      `json:"redacted"`
+	}
+	if err := json.Unmarshal(fullW.Body.Bytes(), &full); err != nil {
+		t.Fatalf("decode full: %v", err)
+	}
+	if full.Redacted {
+		t.Error("ops-key view is redacted, want full per-tenant detail")
+	}
+	if full.Tenants != 2 || len(full.PerTenant) != 2 {
+		t.Fatalf("full view tenants=%v per_tenant=%d, want 2/2", full.Tenants, len(full.PerTenant))
+	}
+	for _, label := range []string{"alice", "bob"} {
+		if _, ok := full.PerTenant[label]; !ok {
+			t.Errorf("full view missing tenant %q", label)
+		}
+	}
+
+	// An unauthenticated scrape and a tenant key both get the redacted aggregate,
+	// at HTTP 200, with no labels and no per-tenant breakdown.
+	for _, key := range []string{"", "KA"} {
+		w := get(key)
+		if w.Code != http.StatusOK {
+			t.Fatalf("redacted /metrics (key=%q) status = %d, want 200", key, w.Code)
+		}
+		var red struct {
+			Redacted  bool           `json:"redacted"`
+			Aggregate map[string]any `json:"aggregate"`
+			PerTenant any            `json:"per_tenant"`
+			Tenants   any            `json:"tenants"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &red); err != nil {
+			t.Fatalf("decode redacted (key=%q): %v", key, err)
+		}
+		if !red.Redacted {
+			t.Errorf("key=%q: redacted = false, want true (tenant keys do not unlock detail)", key)
+		}
+		if red.PerTenant != nil || red.Tenants != nil {
+			t.Errorf("key=%q: redacted view leaks per_tenant/tenants", key)
+		}
+		if red.Aggregate == nil {
+			t.Fatalf("key=%q: redacted view has no aggregate", key)
+		}
+		if body := w.Body.String(); strings.Contains(body, "alice") || strings.Contains(body, "bob") {
+			t.Errorf("key=%q: redacted body leaks a tenant label: %s", key, body)
+		}
+		// Every aggregate counter equals the per-tenant sum.
+		for k, rawAgg := range red.Aggregate {
+			aggV, ok := rawAgg.(float64)
+			if !ok {
+				t.Errorf("key=%q: aggregate[%q] is %T, want a number", key, k, rawAgg)
+				continue
+			}
+			av, _ := full.PerTenant["alice"][k].(float64)
+			bv, _ := full.PerTenant["bob"][k].(float64)
+			if aggV != av+bv {
+				t.Errorf("key=%q: aggregate[%q] = %v, want %v (alice %v + bob %v)", key, k, aggV, av+bv, av, bv)
+			}
+		}
+	}
+
+	// --metrics-public serves full detail unauthenticated.
+	pub := liveServer(t, keys, map[string]*fakePlayerSession{
+		"KA": {abrURL: "https://r/a", vd: "vd-a"},
+		"KB": {abrURL: "https://r/b", vd: "vd-b"},
+	})
+	pub.metricsPublic = true
+	pubW := httptest.NewRecorder()
+	pub.routes().ServeHTTP(pubW, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	var pubResp struct {
+		PerTenant map[string]any `json:"per_tenant"`
+		Redacted  bool           `json:"redacted"`
+	}
+	json.Unmarshal(pubW.Body.Bytes(), &pubResp)
+	if pubResp.Redacted || len(pubResp.PerTenant) != 2 {
+		t.Errorf("--metrics-public view = redacted=%v per_tenant=%d, want full with 2 tenants", pubResp.Redacted, len(pubResp.PerTenant))
+	}
+
+	// A keyless daemon serves full detail with no key.
+	keyless := liveServer(t, nil, map[string]*fakePlayerSession{"": {abrURL: "https://r/x", vd: "vd"}})
+	klW := httptest.NewRecorder()
+	keyless.routes().ServeHTTP(klW, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	var klResp struct {
+		PerTenant map[string]any `json:"per_tenant"`
+		Redacted  bool           `json:"redacted"`
+	}
+	json.Unmarshal(klW.Body.Bytes(), &klResp)
+	if klResp.Redacted || len(klResp.PerTenant) != 1 {
+		t.Errorf("keyless view = redacted=%v per_tenant=%d, want full with 1 tenant", klResp.Redacted, len(klResp.PerTenant))
+	}
+}
+
+// TestNewRejectsMetricsKeyCollision checks the public constructor path: a
+// metrics key equal to a tenant key is rejected before the browser launches, and
+// the error names the tenant label without leaking the key.
+func TestNewRejectsMetricsKeyCollision(t *testing.T) {
+	_, err := New(Config{
+		TenantKeys: map[string]string{"TENANTKEY": "alice"},
+		MetricsKey: "TENANTKEY",
+		Logger:     slog.New(slog.DiscardHandler),
+	})
+	if err == nil {
+		t.Fatal("New accepted a metrics key that collides with a tenant key")
+	}
+	if !strings.Contains(err.Error(), "alice") {
+		t.Errorf("error = %v, want it to name the colliding tenant label", err)
+	}
+	if strings.Contains(err.Error(), "TENANTKEY") {
+		t.Errorf("error leaks key material: %v", err)
+	}
+}
+
+// TestPingReason covers the machine-readable /ping reason across keyless and
+// keyed daemons: no-session versus probe-failed.
+func TestPingReason(t *testing.T) {
+	probeErr := errors.New("cdp connection closed")
+	cases := []struct {
+		name string
+		keys map[string]string
+		key  string // request API key ("" in keyless mode)
+	}{
+		{"keyless", nil, ""},
+		{"keyed", map[string]string{"K": "alice"}, "K"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ping := func(s *Server) map[string]any {
+				r := httptest.NewRequest(http.MethodGet, "/ping", nil)
+				if tc.key != "" {
+					r.Header.Set("X-API-Key", tc.key)
+				}
+				w := httptest.NewRecorder()
+				s.routes().ServeHTTP(w, r)
+				if w.Code != http.StatusOK {
+					t.Fatalf("status = %d, want 200", w.Code)
+				}
+				var resp map[string]any
+				json.Unmarshal(w.Body.Bytes(), &resp)
+				return resp
+			}
+
+			// No session yet: benign no-session.
+			noSess := &Server{tenants: minter.NewTenants(nil, "", tc.keys, browser.Options{}, 0, 0), log: slog.New(slog.DiscardHandler)}
+			if resp := ping(noSess); resp["ok"] != false || resp["reason"] != "no-session" {
+				t.Errorf("no-session: ok=%v reason=%v, want false/no-session", resp["ok"], resp["reason"])
+			}
+
+			// An injected session whose probe fails: probe-failed.
+			s := liveServer(t, tc.keys, map[string]*fakePlayerSession{tc.key: {abrURL: "https://r/x", vd: "vd", pingErr: probeErr}})
+			if resp := ping(s); resp["ok"] != false || resp["reason"] != "probe-failed" {
+				t.Errorf("probe-failed: ok=%v reason=%v, want false/probe-failed", resp["ok"], resp["reason"])
+			}
+		})
+	}
+}
+
+// TestStrictPingParsing covers how the ?strict query parameter is read: a bare
+// flag enables it, common truthy spellings enable it, and absence or explicit
+// false values disable it.
+func TestStrictPingParsing(t *testing.T) {
+	cases := map[string]bool{
+		"/ping":              false, // absent
+		"/ping?strict":       true,  // bare flag (no value)
+		"/ping?strict=":      true,  // present, empty value
+		"/ping?strict=true":  true,
+		"/ping?strict=1":     true,
+		"/ping?strict=True":  true, // ParseBool accepts these spellings
+		"/ping?strict=t":     true,
+		"/ping?strict=false": false,
+		"/ping?strict=0":     false,
+		"/ping?strict=nope":  false, // unparseable values are disabled
+	}
+	for target, want := range cases {
+		r := httptest.NewRequest(http.MethodGet, target, nil)
+		if got := strictPing(r); got != want {
+			t.Errorf("strictPing(%q) = %v, want %v", target, got, want)
+		}
+	}
+}
+
+// TestPingStrict checks the opt-in status-code mapping: ?strict=true returns 503
+// only for a real probe failure; no-session and healthy stay 200, and the
+// default (no strict) is always 200.
+func TestPingStrict(t *testing.T) {
+	probeErr := errors.New("cdp connection closed")
+	keys := map[string]string{"K": "alice"}
+
+	ping := func(s *Server, strict bool) int {
+		u := "/ping"
+		if strict {
+			u += "?strict=true"
+		}
+		r := httptest.NewRequest(http.MethodGet, u, nil)
+		r.Header.Set("X-API-Key", "K")
+		w := httptest.NewRecorder()
+		s.routes().ServeHTTP(w, r)
+		return w.Code
+	}
+	newHealthy := func() *Server {
+		return liveServer(t, keys, map[string]*fakePlayerSession{"K": {abrURL: "https://r/ok", vd: "vd"}})
+	}
+	newFailing := func() *Server {
+		return liveServer(t, keys, map[string]*fakePlayerSession{"K": {abrURL: "https://r/x", vd: "vd", pingErr: probeErr}})
+	}
+	newNoSession := func() *Server {
+		return &Server{tenants: minter.NewTenants(nil, "", keys, browser.Options{}, 0, 0), log: slog.New(slog.DiscardHandler)}
+	}
+
+	// With ?strict=true only a real probe failure flips to 503.
+	if code := ping(newFailing(), true); code != http.StatusServiceUnavailable {
+		t.Errorf("strict probe-failed status = %d, want 503", code)
+	}
+	if code := ping(newNoSession(), true); code != http.StatusOK {
+		t.Errorf("strict no-session status = %d, want 200 (benign)", code)
+	}
+	if code := ping(newHealthy(), true); code != http.StatusOK {
+		t.Errorf("strict healthy status = %d, want 200", code)
+	}
+
+	// Without strict, every case stays 200.
+	if code := ping(newFailing(), false); code != http.StatusOK {
+		t.Errorf("non-strict probe-failed status = %d, want 200", code)
+	}
+	if code := ping(newNoSession(), false); code != http.StatusOK {
+		t.Errorf("non-strict no-session status = %d, want 200", code)
+	}
+	if code := ping(newHealthy(), false); code != http.StatusOK {
+		t.Errorf("non-strict healthy status = %d, want 200", code)
 	}
 }
 

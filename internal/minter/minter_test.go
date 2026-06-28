@@ -2,6 +2,7 @@ package minter
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/colespringer/waxseal/internal/browser"
@@ -493,11 +494,11 @@ func newPingMinter(ping func() error) (*Minter, *[]*fakeSession, *sync.Mutex) {
 	return m, &sessions, &smu
 }
 
-// An unwarmed tenant must report errNoSession without launching a browser.
+// An unwarmed tenant must report ErrNoSession without launching a browser.
 func TestMinterHealthNoSession(t *testing.T) {
 	m, sessions, smu := newPingMinter(nil)
-	if _, live, err := m.Health(context.Background()); live || !errors.Is(err, errNoSession) {
-		t.Errorf("Health = (live=%v, %v), want (false, errNoSession)", live, err)
+	if _, live, err := m.Health(context.Background()); live || !errors.Is(err, ErrNoSession) {
+		t.Errorf("Health = (live=%v, %v), want (false, ErrNoSession)", live, err)
 	}
 	smu.Lock()
 	defer smu.Unlock()
@@ -1240,8 +1241,9 @@ func TestMinterHealthSnapshotSingleGeneration(t *testing.T) {
 	}
 }
 
-// MetricsSnapshot omits proof details until a probe runs and includes the suspect
-// video only while a report is outstanding.
+// MetricsSnapshot keeps the proof-detail fields present (with ""/null sentinels)
+// before a probe runs and carries the suspect video only while a report is
+// outstanding.
 func TestMinterMetricsSnapshotStreamingFields(t *testing.T) {
 	m, _, _, _ := newStreamingMinter(time.Hour, nil)
 	ctx := context.Background()
@@ -1249,11 +1251,12 @@ func TestMinterMetricsSnapshotStreamingFields(t *testing.T) {
 		t.Fatalf("warm: %v", err)
 	}
 	snap := m.MetricsSnapshot()
-	if _, ok := snap["last_browser_proof_outcome"]; ok {
-		t.Error("last_browser_proof_outcome present though the session was never probed")
+	// Never probed: the proof fields are present with sentinel values, not absent.
+	if v, ok := snap["last_browser_proof_outcome"]; !ok || v != "" {
+		t.Errorf("last_browser_proof_outcome = %v (present=%v), want \"\" present", v, ok)
 	}
-	if _, ok := snap["last_browser_proof_age_secs"]; ok {
-		t.Error("last_browser_proof_age_secs present though the session was never probed")
+	if v, ok := snap["last_browser_proof_age_secs"]; !ok || v != nil {
+		t.Errorf("last_browser_proof_age_secs = %v (present=%v), want null present", v, ok)
 	}
 	if v, ok := snap["browser_proof_established"]; !ok || v != false {
 		t.Errorf("browser_proof_established = %v (present=%v), want false present", v, ok)
@@ -1264,8 +1267,9 @@ func TestMinterMetricsSnapshotStreamingFields(t *testing.T) {
 	if v := snap["streaming_suspect"]; v != false {
 		t.Errorf("streaming_suspect = %v, want false", v)
 	}
-	if _, ok := snap["streaming_suspect_video"]; ok {
-		t.Error("streaming_suspect_video present when no report is outstanding")
+	// Present even with no outstanding report; the value is "" until one arrives.
+	if v, ok := snap["streaming_suspect_video"]; !ok || v != "" {
+		t.Errorf("streaming_suspect_video = %v (present=%v), want \"\" present", v, ok)
 	}
 	for _, k := range []string{"streaming_recycles", "report_driven_recycles", "degradation_reports_accepted", "degradation_reports_rejected_stale", "degradation_reports_rate_limited"} {
 		if _, ok := snap[k]; !ok {
@@ -1322,9 +1326,73 @@ func TestMinterMetricsSnapshotStableWhenNotLive(t *testing.T) {
 			t.Errorf("%q = %v, want false", k, v)
 		}
 	}
-	for _, k := range []string{"last_browser_proof_outcome", "last_browser_proof_age_secs", "streaming_seconds_until_recycle", "streaming_suspect_video"} {
-		if _, present := snap[k]; present {
-			t.Errorf("%q present when not live, want absent", k)
+	// Detail fields stay present after retirement. streamingMaxAge is enabled
+	// here, so the recycle field is present as null when no session is live.
+	wantSentinel := map[string]any{
+		"last_browser_proof_outcome":      "",
+		"last_browser_proof_age_secs":     nil,
+		"streaming_suspect_video":         "",
+		"streaming_seconds_until_recycle": nil,
+	}
+	for k, want := range wantSentinel {
+		v, present := snap[k]
+		if !present {
+			t.Errorf("%q absent when not live, want present (%v) for a stable schema", k, want)
+		} else if v != want {
+			t.Errorf("%q = %v, want %v when not live", k, v, want)
+		}
+	}
+}
+
+// TestMetricsSnapshotNullEncoding verifies that not-applicable numeric fields
+// marshal to JSON null in the never-probed, not-live state. They must not be
+// omitted or encoded as 0, which means "just proved" for proof age.
+func TestMetricsSnapshotNullEncoding(t *testing.T) {
+	m, _, _, _ := newStreamingMinter(time.Hour, nil) // recycling enabled
+	if err := m.Warm(context.Background()); err != nil {
+		t.Fatalf("warm: %v", err)
+	}
+	if !m.retire(1, "test", false) { // not live, never probed
+		t.Fatal("retire(1) returned false, want true")
+	}
+	raw, err := json.Marshal(m.MetricsSnapshot())
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	for _, k := range []string{"last_browser_proof_age_secs", "streaming_seconds_until_recycle"} {
+		v, ok := fields[k]
+		if !ok {
+			t.Errorf("%q absent, want JSON null", k)
+			continue
+		}
+		if string(v) != "null" {
+			t.Errorf("%q = %s, want null rather than zero or omission", k, v)
+		}
+	}
+}
+
+// TestCounterKeysAligned keeps counterValues and lifetimeCounterKeys in sync.
+// Per-tenant metrics and the redacted aggregate both rely on that shared key set.
+func TestCounterKeysAligned(t *testing.T) {
+	m := NewMinter("v", browser.Options{}, 0, 0)
+	cv := m.counterValues()
+	if len(cv) != len(lifetimeCounterKeys) {
+		t.Errorf("counterValues has %d keys, lifetimeCounterKeys has %d", len(cv), len(lifetimeCounterKeys))
+	}
+	want := make(map[string]bool, len(lifetimeCounterKeys))
+	for _, k := range lifetimeCounterKeys {
+		want[k] = true
+		if _, ok := cv[k]; !ok {
+			t.Errorf("lifetimeCounterKeys has %q but counterValues does not", k)
+		}
+	}
+	for k := range cv {
+		if !want[k] {
+			t.Errorf("counterValues has %q but lifetimeCounterKeys does not", k)
 		}
 	}
 }

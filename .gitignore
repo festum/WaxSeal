@@ -10,3 +10,7 @@ build/js/node_modules/
 
 # internal/browser/bg_browser_bundle.js is a committed build output. Do not
 # ignore it.
+
+# Built CLI binary at the repo root. Anchored so it does not also match the
+# cmd/waxseal source directory.
+/waxseal
