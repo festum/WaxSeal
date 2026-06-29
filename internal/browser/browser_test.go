@@ -11,25 +11,6 @@ import (
 	"time"
 )
 
-func TestLaunchWithin(t *testing.T) {
-	u, err := launchWithin(func() (string, error) { return "ws://ok", nil }, time.Second)
-	if err != nil || u != "ws://ok" {
-		t.Errorf("success path = (%q, %v), want (ws://ok, nil)", u, err)
-	}
-	_, err = launchWithin(func() (string, error) { return "", errors.New("boom") }, time.Second)
-	if err == nil || !strings.Contains(err.Error(), "boom") {
-		t.Errorf("error path = %v, want it to carry \"boom\"", err)
-	}
-	start := time.Now()
-	_, err = launchWithin(func() (string, error) { select {} }, 50*time.Millisecond)
-	if !errors.Is(err, errLaunchTimeout) {
-		t.Errorf("timeout path = %v, want errLaunchTimeout", err)
-	}
-	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Errorf("timeout took %s, want ~50ms", elapsed)
-	}
-}
-
 func TestDetectChromeEnvOverride(t *testing.T) {
 	t.Setenv("WAXSEAL_CHROME_BIN", "/custom/chromium")
 	got, err := DetectChrome()
@@ -48,6 +29,39 @@ func TestWithDefaults(t *testing.T) {
 	}
 	if got := withDefaults(Options{NavTimeout: 5 * time.Second}).NavTimeout; got != 5*time.Second {
 		t.Errorf("explicit NavTimeout overwritten: %v", got)
+	}
+}
+
+// TestUAOverride pins normalizeUA's actual emitted Network.setUserAgentOverride
+// payload. The CDP wire golden marshals a separate hand-written struct, so it
+// cannot catch drift in this producer, such as Architecture changing to x86_64,
+// brand version changes, or Bitness being omitted. This asserts the real
+// producer's bytes.
+func TestUAOverride(t *testing.T) {
+	const realUA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
+	const want = `{"userAgent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36","userAgentMetadata":{"brands":[{"brand":"Chromium","version":"149"},{"brand":"Not)A;Brand","version":"24"}],"fullVersionList":[{"brand":"Chromium","version":"149.0.0.0"},{"brand":"Not)A;Brand","version":"24.0.0.0"}],"fullVersion":"149.0.0.0","platform":"Linux","platformVersion":"","architecture":"x86","model":"","mobile":false,"bitness":"64"}}`
+
+	got, err := json.Marshal(uaOverride(realUA))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != want {
+		t.Errorf("uaOverride payload drift:\n got: %s\nwant: %s", got, want)
+	}
+	for _, must := range []string{`"model":""`, `"platformVersion":""`} {
+		if !strings.Contains(string(got), must) {
+			t.Errorf("payload missing %s (omitempty regression)", must)
+		}
+	}
+
+	// HeadlessChrome is rewritten and the major comes from the real UA, not the
+	// hardcoded fallback.
+	hl := uaOverride("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/151.0.0.0 Safari/537.36")
+	if strings.Contains(hl.UserAgent, "HeadlessChrome") {
+		t.Errorf("HeadlessChrome marker not removed: %q", hl.UserAgent)
+	}
+	if hl.UserAgentMetadata.Brands[0].Version != "151" {
+		t.Errorf("major = %q, want 151 (derived from the real UA)", hl.UserAgentMetadata.Brands[0].Version)
 	}
 }
 

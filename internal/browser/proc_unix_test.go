@@ -9,52 +9,6 @@ import (
 	"testing"
 )
 
-func TestGuardPathUnsafe(t *testing.T) {
-	dir := t.TempDir()
-
-	if unsafe, _ := guardPathUnsafe(filepath.Join(dir, "absent")); unsafe {
-		t.Error("absent path flagged unsafe; want safe (leakless extracts a verified copy)")
-	}
-
-	safe := filepath.Join(dir, "guard")
-	if err := os.WriteFile(safe, []byte("x"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if unsafe, why := guardPathUnsafe(safe); unsafe {
-		t.Errorf("self-owned 0755 path flagged unsafe: %s", why)
-	}
-
-	ww := filepath.Join(dir, "worldwritable")
-	if err := os.WriteFile(ww, []byte("x"), 0o777); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(ww, 0o777); err != nil { // Ensure the test is independent of umask.
-		t.Fatal(err)
-	}
-	if unsafe, _ := guardPathUnsafe(ww); !unsafe {
-		t.Error("world-writable path not flagged; want unsafe")
-	}
-
-	gw := filepath.Join(dir, "groupwritable")
-	if err := os.WriteFile(gw, []byte("x"), 0o770); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(gw, 0o770); err != nil {
-		t.Fatal(err)
-	}
-	if unsafe, _ := guardPathUnsafe(gw); !unsafe {
-		t.Error("group-writable path not flagged; want unsafe")
-	}
-
-	link := filepath.Join(dir, "link")
-	if err := os.Symlink(safe, link); err != nil {
-		t.Fatal(err)
-	}
-	if unsafe, _ := guardPathUnsafe(link); !unsafe {
-		t.Error("symlink not flagged; want unsafe (could redirect the executed target)")
-	}
-}
-
 func TestMarkerLockable(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), creatorMarkerFile)
 	if err := os.WriteFile(marker, []byte("123"), 0o600); err != nil {

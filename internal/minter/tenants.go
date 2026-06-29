@@ -126,13 +126,13 @@ func (t *Tenants) SelfTestOne(ctx context.Context, apiKey string) error {
 	return m.SelfTest(ctx)
 }
 
-// CurrentBrowserPID returns the process ID of the shared Chromium launcher, or 0
-// when no pool or launcher is available.
+// CurrentBrowserPID returns the process ID of the shared Chromium process, or 0
+// when no pool or browser is available.
 func (t *Tenants) CurrentBrowserPID() int {
 	if t.pool == nil {
 		return 0
 	}
-	return t.pool.CurrentLauncherPID()
+	return t.pool.CurrentBrowserPID()
 }
 
 // Keyed reports whether the registry runs in multi-tenant (keyed) mode. The key

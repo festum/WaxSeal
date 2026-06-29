@@ -12,21 +12,15 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"os"
-	"path/filepath"
 	"regexp"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/colespringer/waxseal/internal/botguard"
+	"github.com/colespringer/waxseal/internal/cdp"
 	"github.com/colespringer/waxseal/internal/httpx"
 	"github.com/colespringer/waxseal/internal/innertube"
-
-	"github.com/go-rod/rod"
-	"github.com/go-rod/rod/lib/launcher"
-	"github.com/go-rod/rod/lib/proto"
-	"github.com/ysmood/leakless/pkg/shared"
 )
 
 // DefaultVideo is the landing video used to capture the browser identity. It is
@@ -100,8 +94,8 @@ type Identity struct {
 // client uses the page's cookies so att/get and GenerateIT share the browser's
 // session and egress IP.
 type Session struct {
-	browser *rod.Browser
-	page    *rod.Page
+	browser *cdp.Browser
+	page    *cdp.Page
 	dispose func() // closes the browser from Launch or the context from Pool
 	id      Identity
 	client  *httpx.Client // egresses with the browser's cookies
@@ -134,13 +128,12 @@ type Session struct {
 // with ValidVideoID before calling Launch.
 func Launch(ctx context.Context, videoID string, opts Options) (*Session, error) {
 	opts = withDefaults(opts)
-	browser, l, profile, err := launchChromium(opts)
+	browser, profile, err := launchChromium(opts)
 	if err != nil {
 		return nil, err
 	}
 	teardown := func() {
 		_ = browser.Close()
-		l.Kill()
 		_ = os.RemoveAll(profile)
 	}
 	s, err := setupSession(ctx, browser, videoID, opts)
@@ -162,147 +155,56 @@ func withDefaults(opts Options) Options {
 	return opts
 }
 
-// launchChromium starts Chromium and connects rod to it. The caller must close
-// the browser, stop the launcher, and remove the returned profile directory.
-func launchChromium(opts Options) (*rod.Browser, *launcher.Launcher, string, error) {
+// launchChromium starts Chromium over a CDP pipe. The caller must close the
+// returned browser and remove the profile directory.
+func launchChromium(opts Options) (*cdp.Browser, string, error) {
 	bin := opts.ChromeBin
 	if bin == "" {
 		b, err := DetectChrome()
 		if err != nil {
-			return nil, nil, "", err
+			return nil, "", err
 		}
 		bin = b
 	}
 	opts.Logger.Info("waxseal: launching chromium", "bin", bin, "headful", opts.Headful)
 
-	// Leakless executes a helper from a predictable temporary path. Validate that
-	// path before the launcher can execute an existing file.
-	if err := secureLeaklessDir(); err != nil {
-		return nil, nil, "", err
-	}
-
 	// Snap-confined Chromium can only write a user-data-dir under $HOME, not /tmp.
 	profileDir, err := os.MkdirTemp(homeTmpBase(), profilePrefix)
 	if err != nil {
-		return nil, nil, "", fmt.Errorf("waxseal: temp profile: %w", err)
+		return nil, "", fmt.Errorf("waxseal: temp profile: %w", err)
 	}
 	// The startup reaper only removes marked profiles whose ownership lock is free.
 	markProfileDir(profileDir)
 
-	// Keep go-rod's default leakless guard enabled so Chromium is terminated when
-	// WaxSeal cannot run normal teardown.
-	l := launcher.New().
-		Bin(bin).
-		Set("user-data-dir", profileDir).
-		Set("no-sandbox").            // snap confinement provides isolation; experiment-only
-		Set("disable-dev-shm-usage"). // WSL2 /dev/shm is small
-		Set("disable-gpu").
-		Set("mute-audio").
-		// Without these, go-rod leaves navigator.webdriver === true, which no real
-		// browser sets. This removes the automation flag without changing the
-		// remaining fingerprint.
-		Delete("enable-automation").
-		Set("disable-blink-features", "AutomationControlled")
-	if opts.Headful {
-		l = l.Headless(false)
-	} else {
-		l = l.Headless(false).Set("headless", "new")
-	}
-
-	// Leakless waits indefinitely for its fixed lock port. Bound the launch so an
-	// occupied port cannot block startup forever.
-	controlURL, err := launchWithin(l.Launch, launchTimeout)
+	// Keep the launch argv byte-compatible with the previous CDP driver wherever
+	// flags affect Chromium's fingerprint or process model. BuildArgs is pinned by
+	// a golden in internal/cdp. It also omits enable-automation so
+	// navigator.webdriver stays false. The pipe transport gives startup a
+	// cancellable version handshake owned by this process.
+	browser, err := cdp.Spawn(context.Background(), bin, cdp.BuildArgs(profileDir, opts.Headful), cdp.SpawnOptions{
+		LaunchTimeout: launchTimeout,
+		Logger:        opts.Logger,
+	})
 	if err != nil {
-		if errors.Is(err, errLaunchTimeout) {
-			// Launcher has no cancellation API. Killing it here would race with the
-			// launch still running in the background, so leave cleanup to leakless and
-			// the next startup sweep.
-			return nil, nil, "", fmt.Errorf("waxseal: launch chromium: %w", err)
-		}
-		l.Kill()
 		_ = os.RemoveAll(profileDir)
-		return nil, nil, "", fmt.Errorf("waxseal: launch chromium: %w", err)
+		return nil, "", fmt.Errorf("waxseal: launch chromium: %w", err)
 	}
-	// NoDefaultDevice prevents go-rod from replacing the browser's Linux user
-	// agent with its built-in Chrome 114 macOS value.
-	browser := rod.New().ControlURL(controlURL).NoDefaultDevice()
-	if err := browser.Connect(); err != nil {
-		l.Kill()
-		_ = os.RemoveAll(profileDir)
-		return nil, nil, "", fmt.Errorf("waxseal: connect cdp: %w", err)
-	}
-	return browser, l, profileDir, nil
+	return browser, profileDir, nil
 }
 
-// launchTimeout limits how long startup waits for Chromium.
+// launchTimeout limits how long startup waits for Chromium's version handshake.
 const launchTimeout = 60 * time.Second
-
-// errLaunchTimeout distinguishes a timed-out launch from a completed launch
-// failure.
-var errLaunchTimeout = errors.New("launch timed out")
-
-// launchWithin waits up to timeout for launch. It cannot cancel launch after the
-// timeout because launcher.Launch has no cancellation API.
-func launchWithin(launch func() (string, error), timeout time.Duration) (string, error) {
-	type result struct {
-		url string
-		err error
-	}
-	ch := make(chan result, 1)
-	go func() {
-		url, err := launch()
-		ch <- result{url, err}
-	}()
-	select {
-	case r := <-ch:
-		return r.url, r.err
-	case <-time.After(timeout):
-		return "", fmt.Errorf(
-			"%w after %s; leakless port 2978 may be in use, or TMPDIR may be unwritable or mounted noexec",
-			errLaunchTimeout,
-			timeout,
-		)
-	}
-}
-
-// leaklessGuardDir returns the temporary directory used by the pinned leakless
-// version.
-func leaklessGuardDir() string {
-	return filepath.Join(os.TempDir(), "leakless-"+runtime.GOARCH+"-"+shared.Version)
-}
-
-// secureLeaklessDir validates the predictable path from which leakless executes
-// its helper. It creates the directory with mode 0700 when absent and rejects
-// symlinks, foreign ownership, and paths writable by a group or other users.
-func secureLeaklessDir() error {
-	dir := leaklessGuardDir()
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("waxseal: prepare leakless guard directory: %w", err)
-	}
-	paths := []string{
-		dir,
-		filepath.Join(dir, "leakless"),
-		filepath.Join(dir, "leakless.exe"),
-	}
-	for _, p := range paths {
-		if unsafe, why := guardPathUnsafe(p); unsafe {
-			return fmt.Errorf(
-				"waxseal: refusing to launch: leakless guard path is unsafe: %s; set TMPDIR to a writable private directory on a filesystem that permits execution, such as TMPDIR=$HOME/tmp",
-				why,
-			)
-		}
-	}
-	return nil
-}
 
 // setupSession parks a page in browser (the main browser, or an incognito context
 // for a tenant), navigates to videoID's watch page, captures the identity, injects
 // the bundle, and builds the HTTP client. dispose is left for the caller to set.
 // On error the caller is responsible for teardown.
-func setupSession(ctx context.Context, browser *rod.Browser, videoID string, opts Options) (_ *Session, err error) {
+func setupSession(ctx context.Context, browser *cdp.Browser, videoID string, opts Options) (_ *Session, err error) {
 	s := &Session{browser: browser, log: opts.Logger, landingVideo: videoID}
 
-	page, err := browser.Page(proto.TargetCreateTarget{URL: "about:blank"})
+	// Bind page creation (createTarget/attachToTarget/Page.enable) to the caller's
+	// ctx so an alive-but-unresponsive Chromium cannot hang setup past the deadline.
+	page, err := browser.Context(ctx).Page(cdp.TargetCreateTarget{URL: "about:blank"})
 	if err != nil {
 		return nil, fmt.Errorf("waxseal: new page: %w", err)
 	}
@@ -310,7 +212,7 @@ func setupSession(ctx context.Context, browser *rod.Browser, videoID string, opt
 
 	// Bypass CSP so the injected bundle's new Function(interpreter) can run on the
 	// youtube.com origin (which otherwise forbids unsafe-eval).
-	if err = (proto.PageSetBypassCSP{Enabled: true}).Call(s.page); err != nil {
+	if err = s.page.SetBypassCSP(true); err != nil {
 		return nil, fmt.Errorf("waxseal: bypass csp: %w", err)
 	}
 
@@ -365,16 +267,15 @@ var errPoolClosed = errors.New("waxseal: browser pool is closed")
 // browserInstance groups a Chromium connection with the resources that must be
 // released with it. Pool relaunches replace the entire instance.
 type browserInstance struct {
-	browser      *rod.Browser
-	launcher     *launcher.Launcher
+	browser      *cdp.Browser
 	profile      string
 	onTeardown   func()    // test hook; nil in production
 	teardownOnce sync.Once // teardown runs at most once even if Close races a relaunch
 }
 
-// teardown closes the browser, kills the launcher, and removes the profile. The
-// bounded browser close prevents a stalled CDP connection from blocking recovery.
-// teardown is idempotent and accepts partially initialized instances.
+// teardown closes the browser (group-killing the process) and removes the profile.
+// The bounded browser close prevents a stalled CDP connection from blocking
+// recovery. teardown is idempotent and accepts partially initialized instances.
 func (i *browserInstance) teardown() {
 	if i == nil {
 		return
@@ -384,9 +285,6 @@ func (i *browserInstance) teardown() {
 			tctx, cancel := context.WithTimeout(context.Background(), teardownTimeout)
 			_ = i.browser.Context(tctx).Close()
 			cancel()
-		}
-		if i.launcher != nil {
-			i.launcher.Kill()
 		}
 		if i.profile != "" {
 			_ = os.RemoveAll(i.profile)
@@ -399,11 +297,11 @@ func (i *browserInstance) teardown() {
 
 // launchInstance launches Chromium and groups its resources for teardown.
 func launchInstance(opts Options) (*browserInstance, error) {
-	b, l, profile, err := launchChromium(opts)
+	b, profile, err := launchChromium(opts)
 	if err != nil {
 		return nil, err
 	}
-	return &browserInstance{browser: b, launcher: l, profile: profile}, nil
+	return &browserInstance{browser: b, profile: profile}, nil
 }
 
 // Pool owns one Chromium and creates isolated incognito-context Sessions. Each
@@ -457,7 +355,9 @@ func (p *Pool) NewSession(ctx context.Context, videoID string) (*Session, error)
 	if err != nil {
 		return nil, err
 	}
-	incog, err := inst.browser.Incognito()
+	// Bind the context creation to the caller's ctx so an unresponsive browser
+	// cannot hang the request past its deadline.
+	incog, err := inst.browser.Context(ctx).Incognito()
 	if err != nil {
 		// Relaunch only when the context error came from a dead browser.
 		if browserAlive(inst.browser) {
@@ -468,13 +368,18 @@ func (p *Pool) NewSession(ctx context.Context, videoID string) (*Session, error)
 		if err != nil {
 			return nil, err
 		}
-		if incog, err = inst.browser.Incognito(); err != nil {
+		if incog, err = inst.browser.Context(ctx).Incognito(); err != nil {
 			return nil, fmt.Errorf("waxseal: new browser context after relaunch: %w", err)
 		}
 	}
 	// Incognito copies the browser connection by value. Closing this copy disposes
-	// the original context without affecting a replacement pool instance.
-	dispose := func() { _ = incog.Close() }
+	// the original context without affecting a replacement pool instance. The
+	// dispose is bounded so an unresponsive browser cannot block session teardown.
+	dispose := func() {
+		dctx, cancel := context.WithTimeout(context.Background(), teardownTimeout)
+		defer cancel()
+		_ = incog.Context(dctx).Close()
+	}
 	s, err := setupSession(ctx, incog, videoID, p.opts)
 	if err != nil {
 		dispose()
@@ -486,7 +391,7 @@ func (p *Pool) NewSession(ctx context.Context, videoID string) (*Session, error)
 
 // browserAlive reports whether the browser answers a CDP Version request within
 // aliveProbeTimeout.
-func browserAlive(b *rod.Browser) bool {
+func browserAlive(b *cdp.Browser) bool {
 	actx, cancel := context.WithTimeout(context.Background(), aliveProbeTimeout)
 	defer cancel()
 	_, err := b.Context(actx).Version()
@@ -558,15 +463,16 @@ func (p *Pool) relaunch(stale *browserInstance) (*browserInstance, error) {
 	}
 }
 
-// CurrentLauncherPID returns the process ID of the current Chromium launcher, or
-// 0 if no launcher is available.
-func (p *Pool) CurrentLauncherPID() int {
+// CurrentBrowserPID returns the process ID of the current Chromium process, or 0
+// if none is available. cdp owns the Chromium process directly, so this is its
+// PID; cdp.Browser.PID guards a nil browser as 0.
+func (p *Pool) CurrentBrowserPID() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.cur == nil || p.cur.launcher == nil {
+	if p.cur == nil {
 		return 0
 	}
-	return p.cur.launcher.PID()
+	return p.cur.browser.PID()
 }
 
 // backoffWindow returns the capped exponential delay for relaunchStreak.
@@ -627,7 +533,7 @@ func (s *Session) captureIdentity(ctx context.Context, watchURL string) error {
 				UA  string `json:"ua"`
 				WD  bool   `json:"wd"`
 			}
-			if jerr := json.Unmarshal([]byte(obj.Value.Str()), &raw); jerr == nil && raw.VD != "" {
+			if jerr := json.Unmarshal([]byte(obj.Str()), &raw); jerr == nil && raw.VD != "" {
 				ident.VD, ident.CV, ident.Key, ident.UA, ident.WD = raw.VD, raw.CV, raw.Key, raw.UA, raw.WD
 				break
 			}
@@ -656,6 +562,41 @@ func (s *Session) captureIdentity(ctx context.Context, watchURL string) error {
 	return nil
 }
 
+// chromeMajorRE extracts the Chrome major version from a user agent.
+var chromeMajorRE = regexp.MustCompile(`Chrome/(\d+)`)
+
+// uaOverride builds the Network.setUserAgentOverride request for realUA. It
+// removes HeadlessChrome, derives UA-CH from the observed Chrome major version,
+// and falls back only for malformed input. TestUAOverride pins the exact JSON
+// shape used on the wire.
+func uaOverride(realUA string) *cdp.NetworkSetUserAgentOverride {
+	fixed := strings.Replace(realUA, "HeadlessChrome", "Chrome", 1)
+	major := "149"
+	if m := chromeMajorRE.FindStringSubmatch(fixed); m != nil {
+		major = m[1]
+	}
+	full := major + ".0.0.0"
+	return &cdp.NetworkSetUserAgentOverride{
+		UserAgent: fixed,
+		UserAgentMetadata: &cdp.UserAgentMetadata{
+			Brands: []*cdp.UserAgentBrandVersion{
+				{Brand: "Chromium", Version: major},
+				{Brand: "Not)A;Brand", Version: "24"},
+			},
+			FullVersionList: []*cdp.UserAgentBrandVersion{
+				{Brand: "Chromium", Version: full},
+				{Brand: "Not)A;Brand", Version: "24.0.0.0"},
+			},
+			Platform:        "Linux",
+			PlatformVersion: "",
+			Architecture:    "x86",
+			Bitness:         "64",
+			Mobile:          false,
+			FullVersion:     full,
+		},
+	}
+}
+
 // normalizeUA removes the HeadlessChrome marker from navigator.userAgent before
 // navigation and keeps UA-CH consistent. No other fingerprint values are changed.
 func (s *Session) normalizeUA(ctx context.Context) error {
@@ -663,30 +604,8 @@ func (s *Session) normalizeUA(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("waxseal: read ua for normalize: %w", err)
 	}
-	realUA := obj.Value.Str()
-	fixed := strings.Replace(realUA, "HeadlessChrome", "Chrome", 1)
-	major := "149"
-	if m := regexp.MustCompile(`Chrome/(\d+)`).FindStringSubmatch(fixed); m != nil {
-		major = m[1]
-	}
-	full := major + ".0.0.0"
-	md := &proto.EmulationUserAgentMetadata{
-		Brands: []*proto.EmulationUserAgentBrandVersion{
-			{Brand: "Chromium", Version: major},
-			{Brand: "Not)A;Brand", Version: "24"},
-		},
-		FullVersionList: []*proto.EmulationUserAgentBrandVersion{
-			{Brand: "Chromium", Version: full},
-			{Brand: "Not)A;Brand", Version: "24.0.0.0"},
-		},
-		Platform:        "Linux",
-		PlatformVersion: "",
-		Architecture:    "x86",
-		Bitness:         "64",
-		Mobile:          false,
-		FullVersion:     full,
-	}
-	if err := (proto.NetworkSetUserAgentOverride{UserAgent: fixed, UserAgentMetadata: md}).Call(s.page); err != nil {
+	override := uaOverride(obj.Str())
+	if err := s.page.Context(ctx).SetUserAgentOverride(override); err != nil {
 		return fmt.Errorf("waxseal: ua override: %w", err)
 	}
 	s.log.Info("waxseal: normalized UA (HeadlessChrome->Chrome)")
@@ -711,7 +630,7 @@ func (s *Session) captureSTS(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("waxseal: capture sts: %w", err)
 	}
-	s.id.STS = obj.Value.Int()
+	s.id.STS = obj.Int()
 	if s.id.STS == 0 {
 		s.log.Warn("waxseal: signatureTimestamp not found; /player will likely be UNPLAYABLE")
 	}
@@ -744,12 +663,12 @@ func (s *Session) buildCoherentClient() error {
 func (s *Session) Identity() Identity { return s.id }
 
 // BrowserCookies returns the browser's youtube.com cookies so a consumer can
-// adopt the same guest session.
+// adopt the same guest session. ctx bounds the CDP read.
 //
 // It reads the browser-level cookie store because page-level reads can be empty
 // after the page leaves youtube.com.
-func (s *Session) BrowserCookies() ([]*http.Cookie, error) {
-	cs, err := s.browser.GetCookies()
+func (s *Session) BrowserCookies(ctx context.Context) ([]*http.Cookie, error) {
+	cs, err := s.browser.Context(ctx).GetCookies()
 	if err != nil {
 		return nil, fmt.Errorf("waxseal: read browser cookies: %w", err)
 	}
@@ -766,8 +685,17 @@ func (s *Session) BrowserCookies() ([]*http.Cookie, error) {
 	return out, nil
 }
 
-// Page returns the underlying rod page used by the minter's crash watcher.
-func (s *Session) Page() *rod.Page { return s.page }
+// WaitCrash blocks until the session's browser target crashes or detaches, the
+// CDP connection is lost, or ctx is cancelled. It returns a diagnostic reason, or
+// "" on cancellation. A session with no live page waits for ctx cancellation so
+// callers can use the same cleanup path.
+func (s *Session) WaitCrash(ctx context.Context) string {
+	if s.page == nil {
+		<-ctx.Done()
+		return ""
+	}
+	return s.page.WaitCrash(ctx)
+}
 
 // Ping checks whether the session page answers a CDP request. It does not mint or
 // establish the session.
@@ -810,7 +738,7 @@ func (s *Session) Attest(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("waxseal: runBotguard: %w", err)
 	}
-	botguardResponse := obj.Value.Str()
+	botguardResponse := obj.Str()
 	if botguardResponse == "" {
 		return fmt.Errorf("waxseal: empty botguardResponse")
 	}
@@ -862,7 +790,7 @@ func (s *Session) Mint(ctx context.Context, identifier string) (MintResult, erro
 	if err != nil {
 		return MintResult{}, fmt.Errorf("waxseal: mint: %w", err)
 	}
-	token := mintObj.Value.Str()
+	token := mintObj.Str()
 	if token == "" {
 		return MintResult{}, fmt.Errorf("waxseal: empty minted token")
 	}
@@ -1126,14 +1054,20 @@ func (s *Session) revertPlayerContext(ctx context.Context) {
 // established context. Both PlayerContext and VerifyFullLength use this path so
 // the diagnostic probe exercises the same setup as the production endpoint. The
 // caller is responsible for restoring the shared page.
-func (s *Session) establish(ctx context.Context, page *rod.Page, videoID string, deadline time.Time) (playerContextRaw, error) {
+func (s *Session) establish(ctx context.Context, page *cdp.Page, videoID string, deadline time.Time) (playerContextRaw, error) {
+	// Bind page Evals to the establish deadline. The loops below check the
+	// deadline only between Evals; without this, one Eval retrying after context
+	// loss could exceed the deadline while holding the tenant's mintMu.
+	ectx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+	page = page.Context(ectx)
 	// Phase 1: wait for the player API to hydrate, then point it at videoID once.
 	for {
 		ready, err := page.Eval(playerReadyJS)
 		if err != nil {
 			return playerContextRaw{}, fmt.Errorf("waxseal: player-context ready probe: %w", err)
 		}
-		if ready.Value.Bool() {
+		if ready.Bool() {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -1149,7 +1083,7 @@ func (s *Session) establish(ctx context.Context, page *rod.Page, videoID string,
 	if err != nil {
 		return playerContextRaw{}, fmt.Errorf("waxseal: player-context loadVideoById: %w", err)
 	}
-	if !loaded.Value.Bool() {
+	if !loaded.Bool() {
 		return playerContextRaw{}, fmt.Errorf("waxseal: player-context: movie_player.loadVideoById unavailable")
 	}
 
@@ -1175,7 +1109,7 @@ func (s *Session) establish(ctx context.Context, page *rod.Page, videoID string,
 		}
 		evalErrs = 0
 		var raw playerContextRaw
-		if err := json.Unmarshal([]byte(obj.Value.Str()), &raw); err != nil {
+		if err := json.Unmarshal([]byte(obj.Str()), &raw); err != nil {
 			return playerContextRaw{}, fmt.Errorf("waxseal: player-context parse: %w", err)
 		}
 		if ue, ok := confirmTerminal(raw, videoID); ok {
@@ -1424,7 +1358,7 @@ func (s *Session) proveFullLength(ctx context.Context, videoID string) (FullLeng
 		return probe, nil
 	}
 
-	if seeked, serr := page.Eval(playerSeekJS, fullLengthTargetSecs); serr != nil || !seeked.Value.Bool() {
+	if seeked, serr := page.Eval(playerSeekJS, fullLengthTargetSecs); serr != nil || !seeked.Bool() {
 		probe.Outcome = OutcomeTargetNotBuffered
 		if serr != nil {
 			probe.Reason = "seek past the cap failed: " + serr.Error()
@@ -1468,7 +1402,7 @@ func (s *Session) proveFullLength(ctx context.Context, videoID string) (FullLeng
 			ABRURL       string  `json:"abr_url"`
 			Error        string  `json:"error"`
 		}
-		if jerr := json.Unmarshal([]byte(obj.Value.Str()), &b); jerr != nil {
+		if jerr := json.Unmarshal([]byte(obj.Str()), &b); jerr != nil {
 			// A malformed payload may be transient, but it must not extend the
 			// configured probe budget.
 			if time.Now().After(budgetDeadline) {

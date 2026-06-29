@@ -14,8 +14,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/go-rod/rod/lib/proto"
 )
 
 // Minter adds token caching, single-flight attestation, retries, crash recovery,
@@ -62,7 +60,7 @@ type minterSession interface {
 	Ping(ctx context.Context) error
 	AttestKind() string
 	Identity() browser.Identity
-	BrowserCookies() ([]*http.Cookie, error)
+	BrowserCookies(ctx context.Context) ([]*http.Cookie, error)
 	Established() bool
 	LastProof() (browser.FullLengthProbe, time.Time)
 	Close()
@@ -299,32 +297,25 @@ func (m *Minter) retire(gen uint64, reason string, isCrash bool) bool {
 	return true
 }
 
-// watchCrash retires the session if its browser target crashes or detaches, so a
-// crash is recovered proactively (next request relaunches) instead of only after
-// a failed mint. No-op for a non-*browser.Session (test fake).
+// watchCrash retires the session when its browser target crashes, detaches, or
+// loses the CDP connection. That lets the next request relaunch instead of first
+// failing against a dead session. Only browser.Session exposes the event stream;
+// test fakes are ignored.
+//
+// The context is tied to the session lifetime, not the launch request. WaitCrash
+// returns a reason on browser loss and "" when ctx is cancelled.
 func (m *Minter) watchCrash(s minterSession, ctx context.Context, gen uint64) {
 	real, ok := s.(*browser.Session)
-	if !ok || real.Page() == nil {
+	if !ok {
 		return
 	}
-	// A lost connection ends the event loop without a CDP crash or detach event.
-	reason := "browser connection lost"
-	// Use a session-scoped context so the watcher survives the launch request and
-	// exits when the session is torn down.
-	wait := real.Page().Context(ctx).EachEvent(
-		func(*proto.InspectorTargetCrashed) (stop bool) {
-			reason = "browser target crashed"
-			return true
-		},
-		func(e *proto.InspectorDetached) (stop bool) {
-			reason = "browser detached: " + e.Reason
-			return true
-		},
-	)
-	wait()
+	reason := real.WaitCrash(ctx)
 	// Intentional retirement cancels the watcher before closing the session.
 	if ctx.Err() != nil {
 		return
+	}
+	if reason == "" {
+		return // no crash detected (e.g. the session had no live page)
 	}
 	m.retire(gen, reason, true)
 }
@@ -670,7 +661,7 @@ func (m *Minter) SessionSnapshot(ctx context.Context) (browser.Identity, []*http
 	if err := sess.EnsureEstablished(ctx); err != nil {
 		return browser.Identity{}, nil, 0, err
 	}
-	cookies, err := sess.BrowserCookies()
+	cookies, err := sess.BrowserCookies(ctx)
 	if err != nil {
 		return browser.Identity{}, nil, 0, err
 	}

@@ -1,0 +1,387 @@
+// Package cdp is a small standard-library Chrome DevTools Protocol client. It
+// drives Chromium over --remote-debugging-pipe: Chromium reads commands on fd 3,
+// writes responses and events on fd 4, and frames messages as NUL-delimited JSON.
+// The package preserves the request JSON and Chromium argv that WaxSeal's browser
+// fingerprint depends on.
+//
+// The package must not import internal/browser. Linux (and other Unix) is the
+// supported runtime target; Windows compiles but Spawn returns an error because
+// exec.Cmd.ExtraFiles cannot pass the pipe fds there.
+package cdp
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"os"
+	"os/exec"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// Tunables for the transport. writeTimeout bounds a single pipe write so an
+// unresponsive Chromium cannot hold writeMu past a caller's own context;
+// defaultStderrMax bounds the crash-diagnostics ring buffer.
+const (
+	writeTimeout     = 10 * time.Second
+	defaultStderrMax = 64 << 10
+	eventChanBuffer  = 8
+)
+
+// ErrConnClosed reports that the CDP connection was torn down: Chromium exited,
+// the pipe hit EOF, or Close ran. Callers waiting on a request use it as a
+// relaunch signal.
+var ErrConnClosed = errors.New("cdp: connection closed")
+
+// rpcError is a CDP protocol error returned in a response. It is the error value
+// surfaced from a Call so context-loss retries can match on it.
+type rpcError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+	// Data is the optional error detail. CDP usually sends a string, but JSON-RPC
+	// permits any JSON value. Keeping it raw prevents object or array data from
+	// failing frame unmarshal and leaving the pending call open.
+	Data json.RawMessage `json:"data,omitempty"`
+}
+
+func (e *rpcError) Error() string {
+	if len(e.Data) > 0 {
+		return fmt.Sprintf("cdp rpc error %d: %s (%s)", e.Code, e.Message, e.Data)
+	}
+	return fmt.Sprintf("cdp rpc error %d: %s", e.Code, e.Message)
+}
+
+// request is the outbound JSON-RPC envelope (id, sessionId, method, params), the
+// standard CDP JSON-RPC request framing.
+type request struct {
+	ID        int64           `json:"id"`
+	SessionID string          `json:"sessionId,omitempty"`
+	Method    string          `json:"method"`
+	Params    json.RawMessage `json:"params,omitempty"`
+}
+
+// inFrame is a single inbound message: a response carries id; an event carries
+// method without id.
+type inFrame struct {
+	ID        *int64          `json:"id"`
+	Method    string          `json:"method"`
+	SessionID string          `json:"sessionId"`
+	Result    json.RawMessage `json:"result"`
+	Error     *rpcError       `json:"error"`
+	Params    json.RawMessage `json:"params"`
+}
+
+// rpcResult delivers a response to a waiting Call.
+type rpcResult struct {
+	result json.RawMessage
+	err    error
+}
+
+// eventMsg is a delivered protocol event.
+type eventMsg struct {
+	method string
+	params json.RawMessage
+}
+
+// subscription receives events for one session, filtered to a method set so a
+// busy domain cannot crowd out the events a watcher actually waits for.
+type subscription struct {
+	id        int
+	sessionID string
+	methods   map[string]bool
+	ch        chan eventMsg
+}
+
+// Conn owns the pipe transport to one Chromium process: the write side, a read
+// loop, the pending-response map, and the event router.
+type Conn struct {
+	cmd   *exec.Cmd
+	wpipe *os.File // parent writes commands here (child fd 3)
+	rpipe *os.File // parent reads responses/events here (child fd 4)
+	log   *slog.Logger
+
+	// procExited is set by the reaper once cmd.Wait has returned. After that the OS
+	// may recycle the PID, so the process group must no longer be signaled.
+	procExited atomic.Bool
+
+	writeMu sync.Mutex
+
+	mu       sync.Mutex
+	closed   bool
+	closeCh  chan struct{} // closed once on teardown
+	closeErr error
+	nextID   int64
+	pending  map[int64]chan rpcResult
+
+	subMu   sync.Mutex
+	subs    map[int]*subscription
+	nextSub int
+
+	closeBrowserOnce sync.Once
+}
+
+// Done returns a channel closed when the connection is torn down.
+func (c *Conn) Done() <-chan struct{} { return c.closeCh }
+
+// pid returns the spawned process id, or 0.
+func (c *Conn) pid() int {
+	if c == nil || c.cmd == nil || c.cmd.Process == nil {
+		return 0
+	}
+	return c.cmd.Process.Pid
+}
+
+// readLoop reads NUL-delimited frames and dispatches them. A malformed frame is
+// logged and skipped; only an EOF/IO error tears down the connection.
+func (c *Conn) readLoop() {
+	r := bufio.NewReaderSize(c.rpipe, 64<<10)
+	for {
+		line, err := r.ReadBytes(0)
+		if err != nil {
+			c.teardown(fmt.Errorf("%w: %v", ErrConnClosed, err))
+			return
+		}
+		if n := len(line); n > 0 && line[n-1] == 0 {
+			line = line[:n-1]
+		}
+		if len(line) == 0 {
+			continue
+		}
+		var f inFrame
+		if jerr := json.Unmarshal(line, &f); jerr != nil {
+			c.log.Warn("cdp: skipping malformed frame", "err", jerr, "bytes", len(line))
+			continue
+		}
+		switch {
+		case f.ID != nil:
+			c.dispatchResponse(*f.ID, f)
+		case f.Method != "":
+			c.dispatchEvent(f)
+		}
+	}
+}
+
+func (c *Conn) dispatchResponse(id int64, f inFrame) {
+	c.mu.Lock()
+	ch, ok := c.pending[id]
+	if ok {
+		delete(c.pending, id)
+	}
+	c.mu.Unlock()
+	if !ok {
+		return
+	}
+	var res rpcResult
+	if f.Error != nil {
+		res.err = f.Error
+	} else {
+		res.result = f.Result
+	}
+	ch <- res // buffered (cap 1): never blocks the read loop
+}
+
+func (c *Conn) dispatchEvent(f inFrame) {
+	c.subMu.Lock()
+	for _, s := range c.subs {
+		if s.sessionID != "" && s.sessionID != f.SessionID {
+			continue
+		}
+		if !s.methods[f.Method] {
+			continue
+		}
+		select {
+		case s.ch <- eventMsg{method: f.Method, params: f.Params}:
+		default: // full subscriber: drop, do not block the read loop
+		}
+	}
+	c.subMu.Unlock()
+}
+
+// teardown marks the connection closed, fails every pending Call, and wakes
+// everything waiting on Done. It is idempotent.
+func (c *Conn) teardown(err error) {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
+	c.closed = true
+	c.closeErr = err
+	pend := c.pending
+	c.pending = nil
+	close(c.closeCh)
+	c.mu.Unlock()
+
+	for _, ch := range pend {
+		ch <- rpcResult{err: err} // buffered (cap 1)
+	}
+}
+
+// rawCall sends method+params and returns the raw response result. It registers a
+// pending entry, writes under writeMu with a deadline, and selects on the
+// response, the caller ctx, and connection teardown.
+func (c *Conn) rawCall(ctx context.Context, sessionID, method string, params any) (json.RawMessage, error) {
+	var raw json.RawMessage
+	if params != nil {
+		b, err := json.Marshal(params)
+		if err != nil {
+			return nil, fmt.Errorf("cdp: marshal %s params: %w", method, err)
+		}
+		raw = b
+	}
+
+	c.mu.Lock()
+	if c.closed {
+		err := c.closeErr
+		c.mu.Unlock()
+		return nil, err
+	}
+	c.nextID++
+	id := c.nextID
+	ch := make(chan rpcResult, 1)
+	c.pending[id] = ch
+	c.mu.Unlock()
+
+	data, err := json.Marshal(request{ID: id, SessionID: sessionID, Method: method, Params: raw})
+	if err != nil {
+		c.dropPending(id)
+		return nil, fmt.Errorf("cdp: marshal %s request: %w", method, err)
+	}
+	data = append(data, 0) // NUL-terminate
+
+	if err := c.write(data); err != nil {
+		c.dropPending(id)
+		return nil, err
+	}
+
+	select {
+	case <-ctx.Done():
+		c.dropPending(id)
+		return nil, ctx.Err()
+	case <-c.closeCh:
+		return nil, c.closeErr
+	case res := <-ch:
+		return res.result, res.err
+	}
+}
+
+// call sends method+params and unmarshals the response result into result when
+// non-nil.
+func (c *Conn) call(ctx context.Context, sessionID, method string, params, result any) error {
+	raw, err := c.rawCall(ctx, sessionID, method, params)
+	if err != nil {
+		return err
+	}
+	if result != nil && len(raw) > 0 {
+		if err := json.Unmarshal(raw, result); err != nil {
+			return fmt.Errorf("cdp: unmarshal %s result: %w", method, err)
+		}
+	}
+	return nil
+}
+
+func (c *Conn) dropPending(id int64) {
+	c.mu.Lock()
+	delete(c.pending, id)
+	c.mu.Unlock()
+}
+
+// write serializes one frame onto the pipe under writeMu with a deadline so an
+// unresponsive Chromium cannot stall other calls. A failed write tears down the
+// connection.
+func (c *Conn) write(data []byte) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	_ = c.wpipe.SetWriteDeadline(time.Now().Add(writeTimeout))
+	if _, err := c.wpipe.Write(data); err != nil {
+		werr := fmt.Errorf("cdp: write: %w", err)
+		c.forceClose(werr)
+		return werr
+	}
+	return nil
+}
+
+// subscribe registers an event subscription for sessionID and the given methods.
+func (c *Conn) subscribe(sessionID string, methods ...string) *subscription {
+	set := make(map[string]bool, len(methods))
+	for _, m := range methods {
+		set[m] = true
+	}
+	c.subMu.Lock()
+	c.nextSub++
+	s := &subscription{id: c.nextSub, sessionID: sessionID, methods: set, ch: make(chan eventMsg, eventChanBuffer)}
+	if c.subs == nil {
+		c.subs = make(map[int]*subscription)
+	}
+	c.subs[s.id] = s
+	c.subMu.Unlock()
+	return s
+}
+
+func (c *Conn) unsubscribe(s *subscription) {
+	if s == nil {
+		return
+	}
+	c.subMu.Lock()
+	delete(c.subs, s.id)
+	c.subMu.Unlock()
+}
+
+// closePipes closes the parent ends, which lets Chromium read EOF on fd 3 and
+// exit, and unblocks the read loop and cmd.Wait.
+func (c *Conn) closePipes() {
+	if c.wpipe != nil {
+		_ = c.wpipe.Close()
+	}
+	if c.rpipe != nil {
+		_ = c.rpipe.Close()
+	}
+}
+
+// killProcessGroup SIGKILLs Chromium's process group, unless the process has
+// already been reaped. Once cmd.Wait has returned, the OS may have recycled the
+// PID, so signaling -pid could hit an unrelated process group; and when the
+// process is already gone there is nothing left to kill.
+func (c *Conn) killProcessGroup() {
+	if c.procExited.Load() {
+		return
+	}
+	killGroup(c.cmd)
+}
+
+// forceClose terminates the process group when needed, closes the pipes, and
+// fails every pending call. It is the single force-close sequence shared by the
+// handshake-timeout, write-stall, and graceful-close paths, and is idempotent via
+// teardown.
+func (c *Conn) forceClose(err error) {
+	c.killProcessGroup()
+	c.closePipes()
+	c.teardown(fmt.Errorf("%w: %v", ErrConnClosed, err))
+}
+
+// ringBuffer is a bounded io.Writer keeping the most recent max bytes.
+type ringBuffer struct {
+	mu  sync.Mutex
+	buf []byte
+	max int
+}
+
+func (r *ringBuffer) Write(p []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.buf = append(r.buf, p...)
+	if len(r.buf) > r.max {
+		r.buf = append(r.buf[:0], r.buf[len(r.buf)-r.max:]...)
+	}
+	return len(p), nil
+}
+
+func (r *ringBuffer) String() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return string(r.buf)
+}

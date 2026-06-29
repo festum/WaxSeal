@@ -2,10 +2,6 @@
 
 package browser
 
-// guardPathUnsafe is a no-op on Windows because the Unix ownership checks do not
-// apply.
-func guardPathUnsafe(string) (bool, string) { return false, "" }
-
 // holdProfileLock reports that advisory profile locks are unavailable on Windows.
 func holdProfileLock(string) bool { return false }
 

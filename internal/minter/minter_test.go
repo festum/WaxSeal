@@ -61,7 +61,9 @@ func (f *fakeSession) Identity() browser.Identity {
 	}
 	return f.id
 }
-func (f *fakeSession) BrowserCookies() ([]*http.Cookie, error) { return f.cookies, f.cookiesErr }
+func (f *fakeSession) BrowserCookies(context.Context) ([]*http.Cookie, error) {
+	return f.cookies, f.cookiesErr
+}
 func (f *fakeSession) Established() bool                       { return f.established }
 func (f *fakeSession) LastProof() (browser.FullLengthProbe, time.Time) {
 	return f.lastProbe, f.lastProbeAt

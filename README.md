@@ -1,8 +1,9 @@
 # WaxSeal
 
 WaxSeal is a YouTube **PO Token (POT)** provider that runs Google's BotGuard in
-a real headless Chromium through [go-rod](https://github.com/go-rod/rod). It
-provides a bgutil-compatible HTTP daemon, a CLI, and reusable Go clients.
+a real headless Chromium, driven over the Chrome DevTools Protocol by a
+repository-local standard-library client. It provides a bgutil-compatible HTTP
+daemon, a CLI, and reusable Go clients.
 
 Using a real browser lets BotGuard inspect the actual navigator and reliably
 produce tokens with the **integrity** grade.
@@ -237,10 +238,15 @@ always present and have value zero when there are no tenants.
 One Chromium process hosts an isolated incognito context per tenant. Additional
 tenants attest on their first token, player-context, or session request.
 
-WaxSeal runs Chromium under go-rod's leakless process guard and cleans up
-abandoned WaxSeal profiles that it can identify on Unix startup. On shared
-hosts, set `TMPDIR` to a private directory. If `/tmp` is mounted `noexec`, set
-`TMPDIR` to a writable filesystem that permits execution.
+WaxSeal launches Chromium over a CDP pipe. During normal teardown, it
+terminates Chromium's process group and removes the profile. On a clean daemon
+exit, closing the command pipe also lets Chromium read EOF and quit. If the
+daemon dies without teardown, for example from SIGKILL or OOM, a browser process
+may remain for a short time. The next startup removes abandoned WaxSeal profile
+directories it can prove are not in use; it does not scan or kill processes.
+Chromium generally exits after losing its profile directory. Profiles are
+created under `$HOME` so snap-confined Chromium can open them, and so shared
+hosts keep each daemon's profiles private.
 
 The `crashes` metric counts unexpected browser loss detected by Chromium events
 or a failed health probe. Session retirement caused by age, a consumer report,

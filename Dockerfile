@@ -1,9 +1,10 @@
 # syntax=docker/dockerfile:1
 #
 # WaxSeal is a real-browser PO-token service. The image includes Chromium and
-# drives it through go-rod. Chromium runs with --no-sandbox inside the container,
-# so the container boundary provides the isolation. The image uses a non-root
-# user, and compose.yaml drops capabilities and disables privilege escalation.
+# drives it through the Chrome DevTools Protocol. Chromium runs with
+# --no-sandbox inside the container, so the container boundary provides the
+# isolation. The image uses a non-root user, and compose.yaml drops capabilities
+# and disables privilege escalation.
 
 # build
 FROM golang:1.26-bookworm AS build

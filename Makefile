@@ -1,6 +1,7 @@
 # WaxSeal build orchestration.
 #
-# WaxSeal mints YouTube PO tokens from a real headless Chromium through go-rod.
+# WaxSeal mints YouTube PO tokens from a real headless Chromium, driven through
+# the Chrome DevTools Protocol by internal/cdp.
 # Node and esbuild produce the browser bundle embedded in internal/browser. The
 # bundle is committed, so `go build` and `go test` do not need Node. The CLI and
 # daemon still require Chromium at runtime.

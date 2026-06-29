@@ -3,38 +3,10 @@
 package browser
 
 import (
-	"fmt"
 	"os"
 	"sync"
 	"syscall"
 )
-
-// guardPathUnsafe reports whether path is unsafe for executing the leakless
-// helper. Missing paths are safe because leakless creates a fresh copy. Ownership
-// and write permissions are checked without relying on the process umask.
-func guardPathUnsafe(path string) (bool, string) {
-	fi, err := os.Lstat(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return false, "" // Leakless will create a missing path.
-		}
-		return true, fmt.Sprintf("%s cannot be inspected: %v", path, err)
-	}
-	if fi.Mode()&os.ModeSymlink != 0 {
-		return true, fmt.Sprintf("%s is a symlink (unexpected for the leakless guard)", path)
-	}
-	st, ok := fi.Sys().(*syscall.Stat_t)
-	if !ok {
-		return true, fmt.Sprintf("%s ownership cannot be determined", path)
-	}
-	if euid := os.Geteuid(); int(st.Uid) != euid {
-		return true, fmt.Sprintf("%s is owned by uid %d, not this process (uid %d)", path, st.Uid, euid)
-	}
-	if perm := fi.Mode().Perm(); perm&0o022 != 0 {
-		return true, fmt.Sprintf("%s is group- or world-writable (mode %#o)", path, perm)
-	}
-	return false, ""
-}
 
 // heldProfileLocks keeps marker file descriptors open so their locks remain held.
 var heldProfileLocks struct {

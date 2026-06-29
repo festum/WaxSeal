@@ -511,7 +511,7 @@ func (f *fakePlayerSession) AttestKind() string                      { return "i
 func (f *fakePlayerSession) Identity() browser.Identity {
 	return browser.Identity{VisitorData: f.vd, UserAgent: "UA", ClientVersion: "2.x"}
 }
-func (f *fakePlayerSession) BrowserCookies() ([]*http.Cookie, error) {
+func (f *fakePlayerSession) BrowserCookies(context.Context) ([]*http.Cookie, error) {
 	return []*http.Cookie{{Name: "VISITOR_INFO1_LIVE", Value: "abc"}}, nil
 }
 func (f *fakePlayerSession) Established() bool { return f.established }

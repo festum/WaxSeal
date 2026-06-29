@@ -18,13 +18,11 @@ was copied. Algorithms ported from MIT sources are attributed below.
 
 ## Go module dependencies
 
-- **github.com/go-rod/rod** (MIT): the Chrome DevTools Protocol driver used to run
-  BotGuard in a real headless Chromium. It pulls
-  `ysmood/{gson,goob,fetchup,leakless}` and `google.golang.org/protobuf`.
-  <https://github.com/go-rod/rod>
 - **github.com/spf13/cobra** and **spf13/pflag** (Apache-2.0): CLI framework.
 
-The product drives an external system **Chromium** at run time; Chromium is not
+WaxSeal speaks the Chrome DevTools Protocol to Chromium through
+`internal/cdp`, a standard-library client maintained in this repository. The
+product drives an external system **Chromium** at run time; Chromium is not
 bundled and carries its own (BSD-style) license.
 
 ## Ported algorithms (MIT, with attribution)

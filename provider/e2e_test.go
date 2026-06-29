@@ -302,7 +302,9 @@ func TestLazyTenantFirstCallFullLengthHTTP(t *testing.T) {
 		t.Skip("lazy-tenant test requires an in-process daemon")
 	}
 	const warmKey, lazyKey = "KEYWARM", "KEYLAZY"
-	srv, addr := newInProcessDaemon(t, server.Config{TenantKeys: map[string]string{"warm": warmKey, "lazy": lazyKey}})
+	// TenantKeys maps API key to tenant label (see server.Config), so key the map by
+	// the API key, not the label.
+	srv, addr := newInProcessDaemon(t, server.Config{TenantKeys: map[string]string{warmKey: "warm", lazyKey: "lazy"}})
 	warmCtx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	if err := srv.Warm(warmCtx, warmKey); err != nil { // warm only the "warm" tenant
 		cancel()

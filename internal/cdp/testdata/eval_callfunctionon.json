@@ -1,0 +1,1 @@
+{"functionDeclaration":"function() { return ((id) =\u003e mint(id)).apply(this, arguments) }","objectId":"OBJ","arguments":[{"value":"VIDEOID"}],"returnByValue":true,"awaitPromise":true}
