@@ -24,18 +24,26 @@ import (
 )
 
 // Tunables for the transport. writeTimeout bounds a single pipe write so an
-// unresponsive Chromium cannot hold writeMu past a caller's own context;
-// defaultStderrMax bounds the crash-diagnostics ring buffer.
+// unresponsive Chromium cannot stall the transport indefinitely;
+// defaultStderrMax bounds the crash-diagnostics ring buffer. maxFrameBytes bounds
+// per-frame memory. Normal CDP eval responses are small, and media bytes are
+// fetched over HTTPS by the consumer rather than through this pipe.
 const (
 	writeTimeout     = 10 * time.Second
 	defaultStderrMax = 64 << 10
 	eventChanBuffer  = 8
+	maxFrameBytes    = 64 << 20
 )
 
 // ErrConnClosed reports that the CDP connection was torn down: Chromium exited,
 // the pipe hit EOF, or Close ran. Callers waiting on a request use it as a
 // relaunch signal.
 var ErrConnClosed = errors.New("cdp: connection closed")
+
+// errFrameTooLarge reports that an inbound frame exceeded maxFrameBytes. A
+// live-but-misbehaving browser sent it, so the read loop force-closes rather than
+// waiting for the pipe EOF used by normal teardown.
+var errFrameTooLarge = errors.New("cdp: inbound frame exceeds size limit")
 
 // rpcError is a CDP protocol error returned in a response. It is the error value
 // surfaced from a Call so context-loss retries can match on it.
@@ -108,7 +116,10 @@ type Conn struct {
 	// may recycle the PID, so the process group must no longer be signaled.
 	procExited atomic.Bool
 
-	writeMu sync.Mutex
+	// writeSem is a 1-token semaphore guarding the write side. Unlike a mutex its
+	// acquisition is cancellable, so a caller can observe its own context (or
+	// teardown) instead of parking behind a writer stalled in wpipe.Write.
+	writeSem chan struct{}
 
 	mu       sync.Mutex
 	closed   bool
@@ -124,6 +135,20 @@ type Conn struct {
 	closeBrowserOnce sync.Once
 }
 
+// newConn initializes the channels used by Conn. Tests should use it too; a
+// zero-value writeSem would leave write waiting on a send that can never proceed.
+func newConn(cmd *exec.Cmd, wpipe, rpipe *os.File, log *slog.Logger) *Conn {
+	return &Conn{
+		cmd:      cmd,
+		wpipe:    wpipe,
+		rpipe:    rpipe,
+		log:      log,
+		closeCh:  make(chan struct{}),
+		pending:  make(map[int64]chan rpcResult),
+		writeSem: make(chan struct{}, 1),
+	}
+}
+
 // Done returns a channel closed when the connection is torn down.
 func (c *Conn) Done() <-chan struct{} { return c.closeCh }
 
@@ -136,12 +161,18 @@ func (c *Conn) pid() int {
 }
 
 // readLoop reads NUL-delimited frames and dispatches them. A malformed frame is
-// logged and skipped; only an EOF/IO error tears down the connection.
+// logged and skipped. A normal EOF/IO error means Chromium is going away, so the
+// connection is torn down; an oversized frame means a live browser is
+// misbehaving, so the process group is force-closed.
 func (c *Conn) readLoop() {
 	r := bufio.NewReaderSize(c.rpipe, 64<<10)
 	for {
-		line, err := r.ReadBytes(0)
+		line, err := readFrame(r, maxFrameBytes)
 		if err != nil {
+			if errors.Is(err, errFrameTooLarge) {
+				c.forceClose(err)
+				return
+			}
 			c.teardown(fmt.Errorf("%w: %v", ErrConnClosed, err))
 			return
 		}
@@ -162,6 +193,31 @@ func (c *Conn) readLoop() {
 		case f.Method != "":
 			c.dispatchEvent(f)
 		}
+	}
+}
+
+// readFrame reads one NUL-delimited frame and returns errFrameTooLarge if the
+// accumulated frame would exceed limit. The returned slice is freshly allocated:
+// readLoop may hand it to other goroutines as json.RawMessage, while ReadSlice
+// aliases bufio.Reader's buffer. Partial chunks are copied before the next read.
+func readFrame(r *bufio.Reader, limit int) ([]byte, error) {
+	var buf []byte
+	for {
+		chunk, err := r.ReadSlice(0)
+		if len(buf)+len(chunk) > limit {
+			return nil, errFrameTooLarge
+		}
+		if err == bufio.ErrBufferFull {
+			buf = append(buf, chunk...) // copy out before the next read overwrites the buffer
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		// append copies chunk, which aliases the bufio buffer, into either a new slice
+		// for single-chunk frames or the heap slice from prior iterations. The returned
+		// frame never aliases the reader buffer.
+		return append(buf, chunk...), nil
 	}
 }
 
@@ -201,8 +257,10 @@ func (c *Conn) dispatchEvent(f inFrame) {
 	c.subMu.Unlock()
 }
 
-// teardown marks the connection closed, fails every pending Call, and wakes
-// everything waiting on Done. It is idempotent.
+// teardown marks the connection closed, releases the pipes, fails every pending
+// Call, and wakes everything waiting on Done. It is idempotent, so it owns pipe
+// closing for every shutdown path: read-loop EOF, the process-exit reaper, and
+// forceClose. Closing the pipes also wakes a readLoop parked on rpipe.
 func (c *Conn) teardown(err error) {
 	c.mu.Lock()
 	if c.closed {
@@ -216,14 +274,15 @@ func (c *Conn) teardown(err error) {
 	close(c.closeCh)
 	c.mu.Unlock()
 
+	c.closePipes()
 	for _, ch := range pend {
 		ch <- rpcResult{err: err} // buffered (cap 1)
 	}
 }
 
 // rawCall sends method+params and returns the raw response result. It registers a
-// pending entry, writes under writeMu with a deadline, and selects on the
-// response, the caller ctx, and connection teardown.
+// pending entry, writes under the cancellable write semaphore with a deadline, and
+// selects on the response, the caller ctx, and connection teardown.
 func (c *Conn) rawCall(ctx context.Context, sessionID, method string, params any) (json.RawMessage, error) {
 	var raw json.RawMessage
 	if params != nil {
@@ -253,7 +312,7 @@ func (c *Conn) rawCall(ctx context.Context, sessionID, method string, params any
 	}
 	data = append(data, 0) // NUL-terminate
 
-	if err := c.write(data); err != nil {
+	if err := c.write(ctx, data); err != nil {
 		c.dropPending(id)
 		return nil, err
 	}
@@ -290,12 +349,30 @@ func (c *Conn) dropPending(id int64) {
 	c.mu.Unlock()
 }
 
-// write serializes one frame onto the pipe under writeMu with a deadline so an
-// unresponsive Chromium cannot stall other calls. A failed write tears down the
-// connection.
-func (c *Conn) write(data []byte) error {
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
+// write serializes one frame through a 1-token semaphore and sets a fixed pipe
+// deadline. The semaphore acquire observes ctx and teardown, so callers with short
+// deadlines do not wait behind another writer stuck in wpipe.Write. The pipe
+// deadline is deliberately independent of ctx: a short request deadline should not
+// tear down the shared Conn for every tenant, and aborting mid-frame would corrupt
+// the stream. Any actual write failure force-closes the connection.
+func (c *Conn) write(ctx context.Context, data []byte) error {
+	select {
+	case c.writeSem <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.closeCh:
+		return c.closeErr
+	}
+	defer func() { <-c.writeSem }()
+	// If ctx or closeCh became ready at the same time as the semaphore, select may
+	// still choose the semaphore case. Check again before putting bytes on the pipe.
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.closeCh:
+		return c.closeErr
+	default:
+	}
 	_ = c.wpipe.SetWriteDeadline(time.Now().Add(writeTimeout))
 	if _, err := c.wpipe.Write(data); err != nil {
 		werr := fmt.Errorf("cdp: write: %w", err)
@@ -353,13 +430,12 @@ func (c *Conn) killProcessGroup() {
 	killGroup(c.cmd)
 }
 
-// forceClose terminates the process group when needed, closes the pipes, and
-// fails every pending call. It is the single force-close sequence shared by the
-// handshake-timeout, write-stall, and graceful-close paths, and is idempotent via
-// teardown.
+// forceClose terminates the process group, then tears down (which closes the pipes
+// and fails every pending call). It is the single force-close sequence shared by
+// the handshake-timeout, write-stall, oversized-frame, and browser-close paths.
+// teardown keeps the sequence idempotent.
 func (c *Conn) forceClose(err error) {
 	c.killProcessGroup()
-	c.closePipes()
 	c.teardown(fmt.Errorf("%w: %v", ErrConnClosed, err))
 }
 

@@ -1,12 +1,42 @@
 package main
 
 import (
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 )
+
+// Bad --addr values should be usage errors (exit 2), not nil-request panics. URL
+// input is rejected before request construction; the rest fail URL parsing.
+func TestPingCLIInvalidAddr(t *testing.T) {
+	for _, addr := range []string{
+		"http://127.0.0.1:4416", // URL instead of host:port
+		"127.0.0.1",             // bare host, no port (would otherwise dial :80)
+		"host with space:80",    // space in authority
+		"[::1",                  // unbalanced bracket
+		"%zz",                   // bad percent-escape
+	} {
+		t.Run(addr, func(t *testing.T) {
+			c := newPingCmd()
+			c.SetArgs([]string{"--addr", addr})
+			c.SetOut(io.Discard)
+			c.SetErr(io.Discard)
+			err := c.Execute()
+			if err == nil {
+				t.Fatalf("addr %q: want an error, got nil", addr)
+			}
+			if _, ok := errors.AsType[*usageError](err); !ok {
+				t.Fatalf("addr %q: error %v is not a *usageError", addr, err)
+			}
+			if got := exitCodeFor(err); got != 2 {
+				t.Errorf("addr %q: exit code = %d, want 2", addr, got)
+			}
+		})
+	}
+}
 
 // TestPingCLIStrict verifies the exit semantics of `waxseal ping` with and
 // without --strict against canned /ping responses. Without --strict a live

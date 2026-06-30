@@ -64,8 +64,14 @@ func bytesFromProtobuf(pb []byte, field uint32) ([]byte, bool) {
 			}
 			i += n
 		case 1: // fixed 64-bit
+			if i+8 > len(pb) {
+				return nil, false // truncated
+			}
 			i += 8
 		case 5: // fixed 32-bit
+			if i+4 > len(pb) {
+				return nil, false // truncated
+			}
 			i += 4
 		case 2: // length-delimited (string/bytes)
 			length, n := parseVarint(pb[i:])
@@ -73,15 +79,18 @@ func bytesFromProtobuf(pb []byte, field uint32) ([]byte, bool) {
 				return nil, false
 			}
 			i += n
-			if i+int(length) > len(pb) {
-				return nil, false // truncated
+			// Keep the bound check in uint64. A length above MaxInt64 would become
+			// negative when cast to int and could pass the old end check.
+			if i > len(pb) || length > uint64(len(pb)-i) {
+				return nil, false // out of range / truncated
 			}
+			end := i + int(length)
 			if fieldNum == field {
 				out := make([]byte, length)
-				copy(out, pb[i:i+int(length)])
+				copy(out, pb[i:end])
 				return out, true
 			}
-			i += int(length)
+			i = end
 		default: // wire types 3,4 (groups, deprecated) or invalid
 			return nil, false
 		}

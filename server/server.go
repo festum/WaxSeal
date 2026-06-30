@@ -102,23 +102,45 @@ func New(cfg Config) (*Server, error) {
 		metricsKeyed:   cfg.MetricsKey != "",
 		metricsKeyHash: sha256.Sum256([]byte(cfg.MetricsKey)),
 	}
-	s.srv = &http.Server{Addr: cfg.Addr, Handler: s.routes(), ReadHeaderTimeout: 10 * time.Second}
+	s.srv = newHTTPServer(cfg.Addr, s.routes())
 	return s, nil
 }
 
+// newHTTPServer builds the daemon's http.Server with timeouts for browser-backed
+// handlers. WriteTimeout must exceed requestProcessTimeout: a cold
+// /player-context request can consume the full handler budget, and net/http
+// applies WriteTimeout across handler execution. Keeping this helper separate lets
+// tests assert the timeout values without launching a browser.
+func newHTTPServer(addr string, h http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           h,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,                       // bounds a slow request-body send (bodies <=1 MiB)
+		WriteTimeout:      requestProcessTimeout + 30*time.Second, // backstop above the handler budget
+		IdleTimeout:       120 * time.Second,
+	}
+}
+
 // routes registers method-specific handlers and path-only 405 fallbacks.
-// ServeMux routes HEAD requests to GET handlers. Because authentication runs in
-// endpoint handlers, unsupported methods are rejected before tenant lookup.
+// ServeMux routes HEAD requests to GET handlers. For /session and /player-context
+// that would run browser-backed work, so explicit HEAD patterns reject them with
+// 405. HEAD /ping and /metrics stay on the GET handlers because they are cheap.
+// Add the same HEAD gate for any future browser-backed GET endpoint. Because
+// authentication runs in endpoint handlers, unsupported methods are rejected before
+// tenant lookup.
 func (s *Server) routes() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /get_pot", s.handleGetPot)
 	mux.HandleFunc("/get_pot", methodNotAllowed(http.MethodPost))
 	mux.HandleFunc("GET /player-context", s.handlePlayerContext)
 	mux.HandleFunc("POST /player-context", s.handlePlayerContext) // body or ?video_id=
+	mux.HandleFunc("HEAD /player-context", methodNotAllowed(http.MethodGet, http.MethodPost))
 	mux.HandleFunc("/player-context", methodNotAllowed(http.MethodGet, http.MethodPost))
 	mux.HandleFunc("GET /ping", s.handlePing)
 	mux.HandleFunc("/ping", methodNotAllowed(http.MethodGet))
 	mux.HandleFunc("GET /session", s.handleSession)
+	mux.HandleFunc("HEAD /session", methodNotAllowed(http.MethodGet))
 	mux.HandleFunc("/session", methodNotAllowed(http.MethodGet))
 	mux.HandleFunc("POST /report", s.handleReport)
 	mux.HandleFunc("/report", methodNotAllowed(http.MethodPost))
@@ -574,8 +596,27 @@ type errEnvelope struct {
 	Details string `json:"details,omitempty"`
 }
 
+// maxErrTextBytes bounds each error-envelope text field. err.Error() can include
+// multi-KiB CDP/V8 stack traces; if an envelope crosses the client's 64 KiB read
+// cap, the client may fail to parse Code and Details. All error envelopes pass
+// through writeErrDetails, so clamping here covers future endpoints too. JSON
+// escaping can expand a byte to six bytes (\u00XX), and two 4 KiB fields still fit
+// comfortably under the client cap.
+const maxErrTextBytes = 4 << 10
+
 func writeErr(w http.ResponseWriter, status int, code, msg string) {
-	writeJSON(w, status, errEnvelope{Error: msg, Code: code})
+	// Keep the clamp in writeErrDetails, the common path.
+	writeErrDetails(w, status, code, msg, "")
+}
+
+// clampErrText caps s at maxErrTextBytes and appends a marker. It may split a
+// UTF-8 sequence; json.Marshal replaces invalid bytes with U+FFFD, so the envelope
+// stays valid JSON.
+func clampErrText(s string) string {
+	if len(s) <= maxErrTextBytes {
+		return s
+	}
+	return s[:maxErrTextBytes] + "... [truncated]"
 }
 
 // decodeErrMsg returns a stable client-facing message for a JSON decoding error
@@ -641,7 +682,7 @@ func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any, allowEmpty 
 }
 
 func writeErrDetails(w http.ResponseWriter, status int, code, msg, details string) {
-	writeJSON(w, status, errEnvelope{Error: msg, Code: code, Details: details})
+	writeJSON(w, status, errEnvelope{Error: clampErrText(msg), Code: code, Details: clampErrText(details)})
 }
 
 // MetricsKeyCollision reports the tenant label that shares an API key with

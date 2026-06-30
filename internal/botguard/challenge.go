@@ -427,16 +427,19 @@ func ClearInterpreterCache() {
 	clear(interpCache.m)
 }
 
+// DomainMatches reports whether host is base or a dotted subdomain of base. It is
+// shared by challenge URL validation and browser cookie filtering so both checks
+// reject look-alike domains the same way. Callers normalize case and any leading
+// or trailing dot before calling.
+func DomainMatches(host, base string) bool {
+	return host == base || strings.HasSuffix(host, "."+base)
+}
+
 // hostAllowed permits google.com/youtube.com and their subdomains only, by exact
 // or dotted-suffix match. A substring such as "evilgoogle.com" is rejected.
 func hostAllowed(host string) bool {
 	host = strings.ToLower(strings.TrimSuffix(host, "."))
-	for _, base := range []string{"google.com", "youtube.com"} {
-		if host == base || strings.HasSuffix(host, "."+base) {
-			return true
-		}
-	}
-	return false
+	return DomainMatches(host, "google.com") || DomainMatches(host, "youtube.com")
 }
 
 // setProtoHeaders sets the JSON+protobuf attestation headers. userAgent is the

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"time"
@@ -46,13 +47,28 @@ func runPing(cmd *cobra.Command, p *pingOpts) error {
 	if p.strict {
 		q.Set("strict", "true")
 	}
+	// --addr is host:port. Reject URL input before building http://<addr>/ping;
+	// otherwise the doubled scheme parses and fails later as an unreachable host.
+	if looksLikeURL(p.addr) {
+		return &usageError{msg: fmt.Sprintf("invalid --addr %q: use host:port, not a URL", p.addr)}
+	}
+	// Require an explicit host:port. SplitHostPort also rejects bare hosts, extra
+	// colons, and unbalanced brackets.
+	if _, _, err := net.SplitHostPort(p.addr); err != nil {
+		return &usageError{msg: fmt.Sprintf("invalid --addr %q: use host:port (%v)", p.addr, err)}
+	}
 	u := "http://" + p.addr + "/ping"
 	if len(q) > 0 {
 		u += "?" + q.Encode()
 	}
 	ctx, cancel := context.WithTimeout(cmd.Context(), 100*time.Second)
 	defer cancel()
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		// Keep malformed authorities (spaces, bad escapes, broken brackets) on the
+		// usage-error path. Passing a nil request to http.DefaultClient.Do would panic.
+		return &usageError{msg: fmt.Sprintf("invalid --addr %q: %v", p.addr, err)}
+	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("unreachable: %w", err)

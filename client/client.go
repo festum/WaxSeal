@@ -338,7 +338,10 @@ func (e *APIError) Error() string {
 }
 
 func (c *Client) statusErr(path string, resp *http.Response) error {
-	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<12))
+	// Keep enough of the body to decode a full error envelope, including the CDP
+	// stack traces V8 can return. The server clamps each text field, so 64 KiB
+	// leaves room for Code and Details.
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
 	body := bytes.TrimSpace(b)
 	apiErr := &APIError{Path: path, StatusCode: resp.StatusCode}
 	if len(body) == 0 {

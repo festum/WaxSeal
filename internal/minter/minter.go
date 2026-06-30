@@ -412,10 +412,13 @@ func (m *Minter) ReportDegraded(gen uint64, videoID, reason string) ReportResult
 	// Only the first report for this generation attempts immediate retirement.
 	if m.mintMu.TryLock() {
 		acted := m.retire(gen, "consumer report: "+reason, false)
-		m.mu.Lock()
-		m.lastReportRetireAt = time.Now()
-		m.mu.Unlock()
+		// Arm the debounce only when this report actually recycles the session. If a
+		// crash watcher or max-age retirement already closed the generation, retire is
+		// a no-op and should not suppress the next real report.
 		if acted {
+			m.mu.Lock()
+			m.lastReportRetireAt = time.Now()
+			m.mu.Unlock()
 			m.metrics.ReportDrivenRecycles.Add(1)
 		}
 		m.mintMu.Unlock()
@@ -487,7 +490,7 @@ func (m *Minter) Mint(ctx context.Context, scope, binding string) (res browser.M
 // nonce. Terminal unplayable errors are cached briefly.
 func (m *Minter) PlayerContext(ctx context.Context, videoID string) (browser.PlayerContext, uint64, error) {
 	// A known-unplayable video fails before mintMu and the session, so a consumer
-	// retrying a 502 (or a malicious caller) can't grind the tenant into relaunches.
+	// retrying a 502 (or a malicious caller) cannot force repeated relaunches.
 	if err := m.negCacheGet(videoID); err != nil {
 		m.metrics.PlayerContextFailures.Add(1)
 		return browser.PlayerContext{}, 0, err
@@ -527,6 +530,15 @@ func (m *Minter) PlayerContext(ctx context.Context, videoID string) (browser.Pla
 	// playerContextStop has already counted both failed attempts.
 	if errors.Is(err, browser.ErrStatus2Unconfirmed) {
 		m.metrics.Status2Rejections.Add(1)
+		return browser.PlayerContext{}, gen, err
+	}
+
+	// Incomplete context is session-local and is often a transient extraction miss.
+	// After the in-place retry, return the error without relaunching. Relaunch holds
+	// mintMu and cannot fix a video whose player response is structurally missing
+	// data. The next request can retry, and the video is not negative-cached.
+	// playerContextStop has already counted both failed attempts.
+	if errors.Is(err, browser.ErrIncompleteContext) {
 		return browser.PlayerContext{}, gen, err
 	}
 
@@ -584,13 +596,15 @@ func (m *Minter) negCachePut(videoID string, err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	now := time.Now()
-	if len(m.negCache) >= minterNegCacheMax {
+	// Only a new key can force eviction; refreshing an existing entry must not drop
+	// another, matching cachePut.
+	if _, exists := m.negCache[videoID]; !exists && len(m.negCache) >= minterNegCacheMax {
 		for k, e := range m.negCache {
 			if now.After(e.expiry) {
 				delete(m.negCache, k)
 			}
 		}
-		for len(m.negCache) >= minterNegCacheMax { // all live: evict one to make room
+		if len(m.negCache) >= minterNegCacheMax { // all live: evict one to make room
 			for k := range m.negCache {
 				delete(m.negCache, k)
 				break
@@ -777,6 +791,8 @@ func (m *Minter) SelfTest(ctx context.Context) error {
 		if res, mintErr = sess.Mint(ctx, vd); mintErr == nil {
 			break
 		}
+		// Count attempts, matching the Mint path.
+		m.metrics.MintFailures.Add(1)
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}

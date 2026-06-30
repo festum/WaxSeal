@@ -57,6 +57,43 @@ func TestValidateRejectsBadBase64(t *testing.T) {
 	}
 }
 
+// A length-delimited field whose length varint exceeds MaxInt64 must be rejected,
+// not panic. The old signed cast wrapped that varint negative, slipping past the
+// bounds check and reaching make([]byte, length) or a negative slice index.
+func TestValidateRejectsOverflowLength(t *testing.T) {
+	// 2^63 encoded as a varint: nine 0x80 continuation bytes, then 0x01.
+	overflow := []byte{0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01}
+	for name, tag := range map[string]byte{
+		"field6 (validated, makeslice path)": 0x32, // field 6, wire type 2
+		"field1 (skipped, cursor path)":      0x0a, // field 1, wire type 2
+	} {
+		t.Run(name, func(t *testing.T) {
+			raw := append([]byte{tag}, overflow...)
+			if _, ok := bytesFromProtobuf(raw, 6); ok {
+				t.Errorf("bytesFromProtobuf reported ok for an overflow length")
+			}
+			if _, err := ValidatePOToken(base64.RawURLEncoding.EncodeToString(raw)); !errors.Is(err, ErrInvalidToken) {
+				t.Errorf("ValidatePOToken err = %v, want ErrInvalidToken", err)
+			}
+		})
+	}
+}
+
+// A fixed64/fixed32 field with fewer trailing bytes than its width must be
+// rejected instead of advancing the cursor past the buffer.
+func TestValidateRejectsTruncatedFixed(t *testing.T) {
+	for name, raw := range map[string][]byte{
+		"fixed64": {0x09, 1, 2, 3}, // field 1 wire 1, only 3 of 8 bytes
+		"fixed32": {0x0d, 1, 2},    // field 1 wire 5, only 2 of 4 bytes
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, ok := bytesFromProtobuf(raw, 6); ok {
+				t.Errorf("reported ok for a truncated fixed-width field")
+			}
+		})
+	}
+}
+
 // Field 6 must be reachable past skipped varint/fixed64/fixed32 fields.
 func TestValidateSkipsOtherWireTypes(t *testing.T) {
 	raw := []byte{

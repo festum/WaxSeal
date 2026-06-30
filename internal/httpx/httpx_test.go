@@ -151,6 +151,69 @@ func TestDoHonorsRetryAfter(t *testing.T) {
 	}
 }
 
+// errRoundTripper fails every attempt with a fixed retryable transport error.
+type errRoundTripper struct {
+	err   error
+	calls *int32
+}
+
+func (rt errRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
+	atomic.AddInt32(rt.calls, 1)
+	return nil, rt.err
+}
+
+// When a retry's body rewind (GetBody) fails, the original transport error that
+// triggered the retry must still surface rather than be masked by the prep error.
+func TestDoJSONRewindFailurePreservesTransportError(t *testing.T) {
+	transportErr := errors.New("connection reset")
+	var calls int32
+	c := New(&http.Client{Transport: errRoundTripper{err: transportErr, calls: &calls}})
+	c.BaseDelay = time.Millisecond
+
+	req, _ := http.NewRequest(http.MethodPost, "http://example.invalid/", strings.NewReader("payload"))
+	req.GetBody = func() (io.ReadCloser, error) { return nil, errors.New("getbody boom") }
+
+	_, err := c.DoJSON(req, 1<<10)
+	if err == nil {
+		t.Fatal("want an error")
+	}
+	if !errors.Is(err, transportErr) {
+		t.Errorf("err = %v, want it to wrap the original transport error %v", err, transportErr)
+	}
+	// The retry failed at rewind, before reaching the transport a second time.
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Errorf("transport calls = %d, want 1", got)
+	}
+}
+
+// A context canceled during the backoff wait must surface as context.Canceled, not
+// the wrapped retryable-status error, so errors.Is(err, context.Canceled) holds.
+func TestDoJSONCanceledDuringBackoffReturnsContextCanceled(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable) // retryable: forces a backoff wait before the retry
+	}))
+	defer srv.Close()
+
+	c := New(srv.Client())
+	c.BaseDelay = time.Hour // long enough that cancellation must win
+	ctx, cancel := context.WithCancel(context.Background())
+	req, _ := http.NewRequest(http.MethodGet, srv.URL, nil)
+	req = req.WithContext(ctx)
+
+	done := make(chan error, 1)
+	go func() { _, err := c.DoJSON(req, 1<<10); done <- err }()
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v, want context.Canceled (cancellation must not be masked by the status error)", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("DoJSON did not return after cancel")
+	}
+}
+
 func TestDoNoRetryOnCanceledContext(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)

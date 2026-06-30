@@ -74,6 +74,13 @@ func (e *UnplayableError) Unwrap() error { return ErrUnplayable }
 // the video.
 var ErrStatus2Unconfirmed = errors.New("waxseal: status-1 streaming not confirmed before deadline")
 
+// ErrIncompleteContext means YouTube returned a player context but left out data
+// required by downstream consumers: player_url, ustreamer config, or audio
+// formats. The minter treats it like a session-local extraction miss. It retries
+// in place and on the next request, but it does not relaunch Chromium or
+// negative-cache the video.
+var ErrIncompleteContext = errors.New("waxseal: player-context incomplete")
+
 // Options configure a browser Session. The zero value auto-detects Chromium,
 // runs in the new headless mode, and discards logs.
 type Options struct {
@@ -124,6 +131,8 @@ type Session struct {
 	fallbackToken  string // set on the fallback path (no per-identifier minter)
 	lifetimeSecs   int
 	tokenExpiresAt time.Time // when tokens from this attestation expire (attest time + lifetime)
+
+	closeOnce sync.Once // dispose runs at most once even if Close is called concurrently
 }
 
 // Launch starts a dedicated Chromium for one Session, parks a page on videoID's
@@ -141,7 +150,7 @@ func Launch(ctx context.Context, videoID string, opts Options) (*Session, error)
 	}
 	teardown := func() {
 		_ = browser.Close()
-		_ = os.RemoveAll(profile)
+		profile.cleanup()
 	}
 	s, err := setupSession(ctx, browser, videoID, opts)
 	if err != nil {
@@ -162,14 +171,37 @@ func withDefaults(opts Options) Options {
 	return opts
 }
 
+// profileHandle keeps the temporary profile directory and the open file that holds
+// its advisory lock together, so launch and pool teardown release them in the same
+// order.
+type profileHandle struct {
+	dir  string
+	lock *os.File
+}
+
+// cleanup removes the profile directory before releasing its advisory lock. That
+// order matters because ReapStaleProfiles runs at daemon startup and can race a
+// different process tearing a profile down. Holding the lock until creator.pid is
+// gone keeps the reaper from acting on a half-removed directory. It is safe on a
+// zero-value handle.
+func (h profileHandle) cleanup() {
+	if h.dir != "" {
+		_ = os.RemoveAll(h.dir)
+	}
+	if h.lock != nil {
+		_ = h.lock.Close()
+	}
+}
+
 // launchChromium starts Chromium over a CDP pipe. The caller must close the
-// returned browser and remove the profile directory.
-func launchChromium(opts Options) (*cdp.Browser, string, error) {
+// returned browser and call profileHandle.cleanup to remove the profile and
+// release its lock.
+func launchChromium(opts Options) (*cdp.Browser, profileHandle, error) {
 	bin := opts.ChromeBin
 	if bin == "" {
 		b, err := DetectChrome()
 		if err != nil {
-			return nil, "", err
+			return nil, profileHandle{}, err
 		}
 		bin = b
 	}
@@ -178,10 +210,10 @@ func launchChromium(opts Options) (*cdp.Browser, string, error) {
 	// Snap-confined Chromium can only write a user-data-dir under $HOME, not /tmp.
 	profileDir, err := os.MkdirTemp(homeTmpBase(), profilePrefix)
 	if err != nil {
-		return nil, "", fmt.Errorf("waxseal: temp profile: %w", err)
+		return nil, profileHandle{}, fmt.Errorf("waxseal: temp profile: %w", err)
 	}
 	// The startup reaper only removes marked profiles whose ownership lock is free.
-	markProfileDir(profileDir)
+	handle := profileHandle{dir: profileDir, lock: markProfileDir(profileDir)}
 
 	// Keep the launch argv byte-compatible with the previous CDP driver wherever
 	// flags affect Chromium's fingerprint or process model. BuildArgs is pinned by
@@ -193,10 +225,10 @@ func launchChromium(opts Options) (*cdp.Browser, string, error) {
 		Logger:        opts.Logger,
 	})
 	if err != nil {
-		_ = os.RemoveAll(profileDir)
-		return nil, "", fmt.Errorf("waxseal: launch chromium: %w", err)
+		handle.cleanup()
+		return nil, profileHandle{}, fmt.Errorf("waxseal: launch chromium: %w", err)
 	}
-	return browser, profileDir, nil
+	return browser, handle, nil
 }
 
 // launchTimeout limits how long startup waits for Chromium's version handshake.
@@ -275,14 +307,15 @@ var errPoolClosed = errors.New("waxseal: browser pool is closed")
 // released with it. Pool relaunches replace the entire instance.
 type browserInstance struct {
 	browser      *cdp.Browser
-	profile      string
+	profile      profileHandle
 	onTeardown   func()    // test hook; nil in production
 	teardownOnce sync.Once // teardown runs at most once even if Close races a relaunch
 }
 
-// teardown closes the browser (group-killing the process) and removes the profile.
-// The bounded browser close prevents a stalled CDP connection from blocking
-// recovery. teardown is idempotent and accepts partially initialized instances.
+// teardown closes the browser (group-killing the process), then removes the
+// profile and releases its lock. The bounded browser close prevents a stalled CDP
+// connection from blocking recovery. teardown is idempotent and accepts partially
+// initialized instances.
 func (i *browserInstance) teardown() {
 	if i == nil {
 		return
@@ -293,9 +326,7 @@ func (i *browserInstance) teardown() {
 			_ = i.browser.Context(tctx).Close()
 			cancel()
 		}
-		if i.profile != "" {
-			_ = os.RemoveAll(i.profile)
-		}
+		i.profile.cleanup()
 		if i.onTeardown != nil {
 			i.onTeardown()
 		}
@@ -530,8 +561,9 @@ func (s *Session) captureIdentity(ctx context.Context, watchURL string) error {
 		VD, CV, Key, UA string
 		WD              bool
 	}
+	page := s.page.Context(ctx)
 	for {
-		obj, err := s.page.Context(ctx).Eval(js)
+		obj, err := page.Eval(js)
 		if err == nil {
 			var raw struct {
 				VD  string `json:"vd"`
@@ -551,9 +583,16 @@ func (s *Session) captureIdentity(ctx context.Context, watchURL string) error {
 			}
 			break
 		}
-		time.Sleep(500 * time.Millisecond)
+		// Check cancellation between polls; otherwise a canceled request can wait
+		// until the polling deadline expires. This matches establish,
+		// confirmPastCap, and reReadContext.
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
 	}
-	cookies, err := s.page.Context(ctx).Cookies([]string{"https://www.youtube.com"})
+	cookies, err := page.Cookies([]string{"https://www.youtube.com"})
 	if err != nil {
 		return fmt.Errorf("waxseal: read cookies: %w", err)
 	}
@@ -681,7 +720,7 @@ func (s *Session) BrowserCookies(ctx context.Context) ([]*http.Cookie, error) {
 	}
 	out := make([]*http.Cookie, 0, len(cs))
 	for _, c := range cs {
-		if !strings.Contains(c.Domain, "youtube.com") {
+		if !isYouTubeCookieDomain(c.Domain) {
 			continue
 		}
 		out = append(out, &http.Cookie{
@@ -690,6 +729,15 @@ func (s *Session) BrowserCookies(ctx context.Context) ([]*http.Cookie, error) {
 		})
 	}
 	return out, nil
+}
+
+// isYouTubeCookieDomain accepts youtube.com and real subdomains after normalizing
+// case and the optional cookie-domain leading dot. It shares the same suffix
+// matcher as challenge URL validation, so look-alikes such as youtube.com.evil.com
+// are rejected consistently.
+func isYouTubeCookieDomain(domain string) bool {
+	d := strings.ToLower(strings.TrimPrefix(domain, "."))
+	return botguard.DomainMatches(d, "youtube.com")
 }
 
 // WaitCrash blocks until the session's browser target crashes or detaches, the
@@ -1040,16 +1088,29 @@ func (s *Session) PlayerContext(ctx context.Context, videoID string) (PlayerCont
 	if err != nil {
 		return PlayerContext{}, err
 	}
-	if raw.ServerAbrStreamingURL == "" {
-		return PlayerContext{}, fmt.Errorf("waxseal: player-context: no serverAbrStreamingUrl (playabilityStatus %q)", raw.PlayabilityStatus)
-	}
-	if raw.PlayerURL == "" {
-		return PlayerContext{}, fmt.Errorf("waxseal: player-context: no player_url (PLAYER_JS_URL missing); consumer cannot descramble n")
-	}
-	if raw.AudioFormats == nil {
-		raw.AudioFormats = []AudioFormat{}
+	if err := validatePlayerContext(raw); err != nil {
+		return PlayerContext{}, err
 	}
 	return raw.PlayerContext, nil
+}
+
+// validatePlayerContext checks for the fields downstream consumers need: SABR URL,
+// player_url for n-descrambling, ustreamer config, and at least one audio format.
+// Returning ErrIncompleteContext tells the minter to retry without negative-caching
+// the video or starting a Chromium relaunch loop. The helper keeps the
+// browser-independent cases table-testable.
+func validatePlayerContext(raw playerContextRaw) error {
+	switch {
+	case raw.ServerAbrStreamingURL == "":
+		return fmt.Errorf("%w: no serverAbrStreamingUrl (playabilityStatus %q)", ErrIncompleteContext, raw.PlayabilityStatus)
+	case raw.PlayerURL == "":
+		return fmt.Errorf("%w: no player_url (PLAYER_JS_URL missing); consumer cannot descramble n", ErrIncompleteContext)
+	case raw.VideoPlaybackUstreamerConfig == "":
+		return fmt.Errorf("%w: no video_playback_ustreamer_config (required by the consumer)", ErrIncompleteContext)
+	case len(raw.AudioFormats) == 0:
+		return fmt.Errorf("%w: no audio formats", ErrIncompleteContext)
+	}
+	return nil
 }
 
 // revertPlayerContext stops playback and restores the visibility override used by
@@ -1673,6 +1734,7 @@ func (s *Session) reReadContext(ctx context.Context, page *cdp.Page, videoID str
 			// diagnosable under load.
 			s.log.Debug("waxseal: player-context re-read transient eval error; retrying", "err", evalErr, "attempt", evalErrs)
 		} else {
+			evalErrs = 0 // count consecutive errors; a success resets the streak
 			var raw playerContextRaw
 			if err := json.Unmarshal([]byte(obj.Str()), &raw); err != nil {
 				return playerContextRaw{}, fmt.Errorf("waxseal: player-context re-read parse: %w", err)
@@ -1702,14 +1764,17 @@ func (s *Session) reReadContext(ctx context.Context, page *cdp.Page, videoID str
 func (s *Session) AttestKind() string { return s.attestKind }
 
 // Close releases the browser created by Launch or the context created by
-// Pool.NewSession. It is idempotent.
+// Pool.NewSession. closeOnce keeps concurrent Close calls from running dispose
+// more than once, matching browserInstance.teardownOnce.
 func (s *Session) Close() {
-	if s == nil || s.dispose == nil {
+	if s == nil {
 		return
 	}
-	d := s.dispose
-	s.dispose = nil
-	d()
+	s.closeOnce.Do(func() {
+		if s.dispose != nil {
+			s.dispose()
+		}
+	})
 }
 
 // DetectChrome resolves a Chromium binary from WAXSEAL_CHROME_BIN or common

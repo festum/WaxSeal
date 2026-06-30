@@ -9,6 +9,31 @@ import (
 	"testing"
 )
 
+// markProfileDir returns the open lock file instead of stashing it in a process
+// global. cleanup then removes the profile directory and closes the lock, letting
+// another daemon's reaper reclaim the slot.
+func TestProfileHandleCleanup(t *testing.T) {
+	dir, err := os.MkdirTemp(t.TempDir(), profilePrefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock := markProfileDir(dir)
+	if lock == nil {
+		t.Fatal("markProfileDir returned a nil lock; the FD must be handed back for cleanup")
+	}
+	marker := filepath.Join(dir, creatorMarkerFile)
+	if markerLockable(marker) {
+		t.Error("marker should be locked while the handle holds it")
+	}
+
+	profileHandle{dir: dir, lock: lock}.cleanup()
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Errorf("cleanup did not remove the profile dir: %v", err)
+	}
+	// cleanup must be nil-safe for partially initialized handles.
+	profileHandle{}.cleanup()
+}
+
 func TestMarkerLockable(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), creatorMarkerFile)
 	if err := os.WriteFile(marker, []byte("123"), 0o600); err != nil {

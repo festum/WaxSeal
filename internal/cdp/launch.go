@@ -129,14 +129,7 @@ func Spawn(ctx context.Context, bin string, args []string, opts SpawnOptions) (*
 	_ = aR.Close()
 	_ = bW.Close()
 
-	c := &Conn{
-		cmd:     cmd,
-		wpipe:   aW,
-		rpipe:   bR,
-		log:     opts.Logger,
-		closeCh: make(chan struct{}),
-		pending: make(map[int64]chan rpcResult),
-	}
+	c := newConn(cmd, aW, bR, opts.Logger)
 	go c.readLoop()
 	go func() {
 		// Reap the process and signal exit even if the read loop has not yet seen

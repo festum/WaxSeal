@@ -8,9 +8,29 @@ import (
 	"log/slog"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+// Close must run dispose once even when called concurrently. Run this test under
+// -race when changing Close.
+func TestSessionCloseOnce(t *testing.T) {
+	var calls atomic.Int64
+	s := &Session{dispose: func() { calls.Add(1) }}
+	var wg sync.WaitGroup
+	for range 16 {
+		wg.Add(1)
+		go func() { defer wg.Done(); s.Close() }()
+	}
+	wg.Wait()
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("dispose called %d times, want exactly 1", got)
+	}
+	// A session that was never given a dispose must not panic.
+	(&Session{}).Close()
+}
 
 func TestDetectChromeEnvOverride(t *testing.T) {
 	t.Setenv("WAXSEAL_CHROME_BIN", "/custom/chromium")
@@ -419,6 +439,67 @@ func TestEstablishFromCandidates(t *testing.T) {
 			}
 			if !slices.Equal(calls, tt.wantCalls) {
 				t.Errorf("calls = %v, want %v", calls, tt.wantCalls)
+			}
+		})
+	}
+}
+
+// The cookie filter accepts youtube.com and real subdomains after case and
+// leading-dot normalization, and rejects look-alikes a substring match would allow.
+func TestIsYouTubeCookieDomain(t *testing.T) {
+	for _, tt := range []struct {
+		domain string
+		want   bool
+	}{
+		{"youtube.com", true},
+		{".youtube.com", true},
+		{".YouTube.com", true},
+		{"www.youtube.com", true},
+		{"music.youtube.com", true},
+		{"youtube.com.evil.com", false},
+		{"notyoutube.com", false},
+		{"evil.com", false},
+		{"", false},
+	} {
+		if got := isYouTubeCookieDomain(tt.domain); got != tt.want {
+			t.Errorf("isYouTubeCookieDomain(%q) = %v, want %v", tt.domain, got, tt.want)
+		}
+	}
+}
+
+// validatePlayerContext accepts complete contexts and marks missing required
+// fields as ErrIncompleteContext, so the minter retries without relaunching or
+// caching a permanent unplayable result.
+func TestValidatePlayerContext(t *testing.T) {
+	full := PlayerContext{
+		ServerAbrStreamingURL:        "https://r/abr",
+		PlayerURL:                    "https://r/base.js",
+		VideoPlaybackUstreamerConfig: "cfg",
+		AudioFormats:                 []AudioFormat{{Itag: 140}},
+	}
+	if err := validatePlayerContext(playerContextRaw{PlayerContext: full}); err != nil {
+		t.Errorf("complete context: unexpected error %v", err)
+	}
+
+	for name, mut := range map[string]func(*PlayerContext){
+		"no abr url":        func(p *PlayerContext) { p.ServerAbrStreamingURL = "" },
+		"no player url":     func(p *PlayerContext) { p.PlayerURL = "" },
+		"no ustreamer cfg":  func(p *PlayerContext) { p.VideoPlaybackUstreamerConfig = "" },
+		"no audio formats":  func(p *PlayerContext) { p.AudioFormats = nil },
+		"empty audio slice": func(p *PlayerContext) { p.AudioFormats = []AudioFormat{} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			pc := full
+			mut(&pc)
+			err := validatePlayerContext(playerContextRaw{PlayerContext: pc})
+			if err == nil {
+				t.Fatalf("want an error for %q", name)
+			}
+			if !errors.Is(err, ErrIncompleteContext) {
+				t.Errorf("error must wrap ErrIncompleteContext (so the minter retries without relaunching): %v", err)
+			}
+			if errors.Is(err, ErrUnplayable) {
+				t.Errorf("error must not be ErrUnplayable (so it is not negative-cached): %v", err)
 			}
 		})
 	}

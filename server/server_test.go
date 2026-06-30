@@ -248,6 +248,13 @@ func TestRoutesMethodMatching(t *testing.T) {
 		{http.MethodDelete, "/ping", "/ping"},
 		{http.MethodGet, "/session", "GET /session"},
 		{http.MethodPost, "/session", "/session"},
+		// HEAD on browser-backed endpoints hits the explicit HEAD pattern (more
+		// specific than GET, which would otherwise also serve HEAD).
+		{http.MethodHead, "/session", "HEAD /session"},
+		{http.MethodHead, "/player-context", "HEAD /player-context"},
+		// HEAD on the cheap endpoints still falls through to the GET handler.
+		{http.MethodHead, "/ping", "GET /ping"},
+		{http.MethodHead, "/metrics", "GET /metrics"},
 		{http.MethodPost, "/report", "POST /report"},
 		{http.MethodGet, "/report", "/report"},
 		{http.MethodGet, "/metrics", "GET /metrics"},
@@ -287,6 +294,79 @@ func TestMethodNotAllowedBeforeAuth(t *testing.T) {
 	}
 	if env.Code != CodeMethodNotAllowed {
 		t.Errorf("code = %q, want %q (got 401 unauthorized instead?)", env.Code, CodeMethodNotAllowed)
+	}
+}
+
+// HEAD on the browser-backed endpoints must 405 (ServeMux otherwise maps HEAD to
+// the GET handler, driving a real proof/context fetch); HEAD /ping stays a cheap
+// liveness probe. The methodNotAllowed handler runs before any tenant lookup, and
+// /ping's Health reports no-session without launching a browser, so no Chromium is
+// needed.
+func TestHeadGate(t *testing.T) {
+	s := &Server{
+		tenants: minter.NewTenants(nil, "", nil, browser.Options{}, 0, 0), // keyless, no browser
+		log:     slog.New(slog.DiscardHandler),
+	}
+	mux := s.routes()
+
+	for _, tt := range []struct{ path, wantAllow string }{
+		{"/session", http.MethodGet},
+		{"/player-context", http.MethodGet + ", " + http.MethodPost},
+	} {
+		r := httptest.NewRequest(http.MethodHead, tt.path, nil)
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, r)
+		if w.Code != http.StatusMethodNotAllowed {
+			t.Errorf("HEAD %s: status = %d, want 405", tt.path, w.Code)
+		}
+		if got := w.Header().Get("Allow"); got != tt.wantAllow {
+			t.Errorf("HEAD %s: Allow = %q, want %q", tt.path, got, tt.wantAllow)
+		}
+	}
+
+	r := httptest.NewRequest(http.MethodHead, "/ping", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Errorf("HEAD /ping: status = %d, want 200 (cheap liveness probe stays working)", w.Code)
+	}
+}
+
+// newHTTPServer's WriteTimeout must exceed requestProcessTimeout, or it can cut
+// off a cold-start full-length player-context fetch. The other timeouts must be
+// set.
+func TestNewHTTPServerTimeouts(t *testing.T) {
+	srv := newHTTPServer("127.0.0.1:0", http.NewServeMux())
+	if srv.WriteTimeout <= requestProcessTimeout {
+		t.Errorf("WriteTimeout = %v, want > requestProcessTimeout (%v)", srv.WriteTimeout, requestProcessTimeout)
+	}
+	if srv.ReadHeaderTimeout <= 0 || srv.ReadTimeout <= 0 || srv.IdleTimeout <= 0 {
+		t.Errorf("timeouts must all be set: ReadHeader=%v Read=%v Idle=%v", srv.ReadHeaderTimeout, srv.ReadTimeout, srv.IdleTimeout)
+	}
+}
+
+// A large error message (e.g. a wrapped CDP V8 stack trace) must be clamped so the
+// envelope stays small enough for the client to parse and Code is preserved.
+func TestErrEnvelopeClampPreservesCode(t *testing.T) {
+	w := httptest.NewRecorder()
+	huge := strings.Repeat("x", 100<<10) // 100 KiB, far past the client's 64 KiB read cap
+	writeErr(w, http.StatusBadGateway, CodeMintFailed, "mint failed: "+huge)
+
+	if n := w.Body.Len(); n > maxErrTextBytes+1024 {
+		t.Errorf("clamped body = %d bytes, want <= ~%d", n, maxErrTextBytes+1024)
+	}
+	var env struct {
+		Error string `json:"error"`
+		Code  string `json:"code"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("body not JSON: %v", err)
+	}
+	if env.Code != CodeMintFailed {
+		t.Errorf("code = %q, want %q (clamp must keep the envelope parseable)", env.Code, CodeMintFailed)
+	}
+	if !strings.Contains(env.Error, "truncated") {
+		t.Error("clamped message should carry the truncation marker")
 	}
 }
 

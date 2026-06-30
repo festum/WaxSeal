@@ -4,31 +4,23 @@ package browser
 
 import (
 	"os"
-	"sync"
 	"syscall"
 )
 
-// heldProfileLocks keeps marker file descriptors open so their locks remain held.
-var heldProfileLocks struct {
-	sync.Mutex
-	files []*os.File
-}
-
-// holdProfileLock takes an exclusive advisory lock on marker and retains it for
-// the process lifetime. It reports whether the lock was acquired.
-func holdProfileLock(marker string) bool {
+// holdProfileLock takes an exclusive advisory lock on marker and returns the open
+// file holding it; the caller must keep the file open for as long as the lock is
+// needed and close it (via profileHandle.cleanup) to release it. The bool reports
+// whether the lock was acquired.
+func holdProfileLock(marker string) (*os.File, bool) {
 	f, err := os.OpenFile(marker, os.O_RDONLY, 0)
 	if err != nil {
-		return false
+		return nil, false
 	}
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		_ = f.Close()
-		return false
+		return nil, false
 	}
-	heldProfileLocks.Lock()
-	heldProfileLocks.files = append(heldProfileLocks.files, f)
-	heldProfileLocks.Unlock()
-	return true
+	return f, true
 }
 
 // markerLockable reports whether marker's advisory lock is free. It releases the

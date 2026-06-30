@@ -2,6 +2,7 @@ package cdp
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,67 @@ import (
 	"testing"
 	"time"
 )
+
+// write must observe an already-canceled context and put no frame on the pipe,
+// so a caller with a short deadline cannot park behind a stalled writer.
+func TestConnWriteHonorsCanceledContext(t *testing.T) {
+	c, reqR, _ := newPipeConn(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := c.write(ctx, append([]byte(`{"id":1}`), 0)); !errors.Is(err, context.Canceled) {
+		t.Fatalf("write err = %v, want context.Canceled", err)
+	}
+	// Nothing must have been written: a read times out rather than returning a frame.
+	_ = reqR.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	if n, err := reqR.Read(make([]byte, 1)); n != 0 || !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("read after canceled write: n=%d err=%v, want 0 bytes and a deadline timeout", n, err)
+	}
+}
+
+// After teardown, write must return ErrConnClosed even if select chooses the
+// writeSem acquire, not a raw write-to-closed-pipe error.
+func TestConnWriteAfterTeardownReturnsClosed(t *testing.T) {
+	c, _, _ := newPipeConn(t)
+	c.teardown(fmt.Errorf("%w: test", ErrConnClosed))
+	for i := range 16 { // both closeCh and writeSem are ready, so exercise both outcomes
+		if err := c.write(context.Background(), append([]byte("{}"), 0)); !errors.Is(err, ErrConnClosed) {
+			t.Fatalf("iter %d: write err = %v, want ErrConnClosed", i, err)
+		}
+	}
+}
+
+// readFrame stops at the limit instead of buffering an unbounded frame.
+func TestReadFrameRejectsOversize(t *testing.T) {
+	r := bufio.NewReaderSize(bytes.NewReader(bytes.Repeat([]byte{'a'}, 1024)), 64) // no NUL within the limit
+	if _, err := readFrame(r, 100); !errors.Is(err, errFrameTooLarge) {
+		t.Fatalf("readFrame err = %v, want errFrameTooLarge", err)
+	}
+}
+
+// readFrame returns the frame, including its trailing NUL, as a fresh slice.
+func TestReadFrameReturnsFrame(t *testing.T) {
+	got, err := readFrame(bufio.NewReaderSize(bytes.NewReader([]byte("hello\x00")), 64), 100)
+	if err != nil {
+		t.Fatalf("readFrame: %v", err)
+	}
+	if string(got) != "hello\x00" {
+		t.Fatalf("got %q, want %q", got, "hello\x00")
+	}
+}
+
+// teardown owns pipe closing for every path, so both parent-side ends are closed
+// after it runs.
+func TestConnTeardownClosesPipes(t *testing.T) {
+	c, _, _ := newPipeConn(t)
+	c.teardown(errors.New("boom"))
+	if _, err := c.wpipe.Write([]byte{0}); !errors.Is(err, os.ErrClosed) {
+		t.Errorf("wpipe write after teardown: err = %v, want os.ErrClosed", err)
+	}
+	if _, err := c.rpipe.Read(make([]byte, 1)); !errors.Is(err, os.ErrClosed) {
+		t.Errorf("rpipe read after teardown: err = %v, want os.ErrClosed", err)
+	}
+}
 
 // newPipeConn wires a Conn to two os.Pipes so a test can act as the browser side:
 // it reads outgoing requests from reqR and writes responses to respW.
@@ -27,13 +89,7 @@ func newPipeConn(t *testing.T) (c *Conn, reqR *os.File, respW *os.File) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c = &Conn{
-		wpipe:   wW,
-		rpipe:   rR,
-		log:     slog.New(slog.DiscardHandler),
-		closeCh: make(chan struct{}),
-		pending: make(map[int64]chan rpcResult),
-	}
+	c = newConn(nil, wW, rR, slog.New(slog.DiscardHandler))
 	go c.readLoop()
 	t.Cleanup(func() { _ = rR.Close(); _ = rW.Close(); _ = wR.Close(); _ = wW.Close() })
 	return c, wR, rW

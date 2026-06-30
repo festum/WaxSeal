@@ -28,19 +28,24 @@ func writeMarker(dir string) error {
 	return os.WriteFile(filepath.Join(dir, creatorMarkerFile), []byte(strconv.Itoa(os.Getpid())), 0o600)
 }
 
-// markProfileDir writes the marker and holds its advisory lock for the process
-// lifetime. Advisory locks avoid false liveness results from PID reuse and PID
+// markProfileDir writes the marker and takes its advisory lock, returning the open
+// file that holds the lock (nil if marking or locking failed). The caller owns the
+// returned file and must close it to release the lock, after removing the profile
+// directory. Advisory locks avoid false liveness results from PID reuse and PID
 // namespaces. If marking or locking fails, the marker is removed so the reaper
 // leaves the profile untouched.
-func markProfileDir(dir string) {
+func markProfileDir(dir string) *os.File {
 	marker := filepath.Join(dir, creatorMarkerFile)
 	if err := writeMarker(dir); err != nil {
 		_ = os.Remove(marker)
-		return
+		return nil
 	}
-	if !holdProfileLock(marker) {
+	lock, ok := holdProfileLock(marker)
+	if !ok {
 		_ = os.Remove(marker)
+		return nil
 	}
+	return lock
 }
 
 // profileState describes one profile directory considered by the reaper.

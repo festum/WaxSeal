@@ -15,12 +15,6 @@ import (
 	"time"
 )
 
-// Doer is the HTTP surface required by the BotGuard flow. Both *http.Client and
-// *Client implement it.
-type Doer interface {
-	Do(*http.Request) (*http.Response, error)
-}
-
 // ErrBodyTooLarge is returned when a response body exceeds the configured limit.
 var ErrBodyTooLarge = errors.New("httpx: response body exceeds cap")
 
@@ -35,54 +29,13 @@ type Client struct {
 }
 
 // New wraps hc with default retry and backoff settings. A nil hc uses
-// http.DefaultClient.
+// http.DefaultClient. There is no client-level Timeout (it interacts poorly with
+// multi-attempt retries); callers must drive each request with a bounded context.
 func New(hc *http.Client) *Client {
 	if hc == nil {
 		hc = http.DefaultClient
 	}
 	return &Client{HTTP: hc, MaxRetries: 2, BaseDelay: 500 * time.Millisecond, MaxDelay: 5 * time.Second}
-}
-
-// Do executes req with bounded retries on network errors, 429, and 5xx,
-// honoring Retry-After and the caller's context. The request body is rewound
-// between attempts via req.GetBody (set automatically for bytes/strings
-// readers). The returned response's Body is the caller's to close.
-func (c *Client) Do(req *http.Request) (*http.Response, error) {
-	attempts := max(c.MaxRetries+1, 1)
-	var (
-		lastErr  error
-		lastCode int
-		delay    time.Duration
-	)
-	for attempt := range attempts {
-		if err := c.preAttempt(req, attempt, delay); err != nil {
-			return nil, err
-		}
-
-		resp, err := c.HTTP.Do(req)
-		if err != nil {
-			lastErr, lastCode = err, 0
-			if !retryableErr(err) || attempt == attempts-1 {
-				return nil, err
-			}
-			delay = c.backoff(attempt)
-			c.logRetry(req, attempt, 0, delay, err)
-			continue
-		}
-
-		if retryableStatus(resp.StatusCode) && attempt < attempts-1 {
-			lastErr, lastCode = fmt.Errorf("status %d", resp.StatusCode), resp.StatusCode
-			delay = c.retryDelay(resp, attempt)
-			resp.Body.Close()
-			c.logRetry(req, attempt, resp.StatusCode, delay, nil)
-			continue
-		}
-		return resp, nil
-	}
-	if lastErr == nil {
-		lastErr = fmt.Errorf("status %d", lastCode)
-	}
-	return nil, lastErr
 }
 
 // DoJSON runs req, requires a 2xx status, and returns a body no larger than
@@ -99,6 +52,16 @@ func (c *Client) DoJSON(req *http.Request, maxBody int64) ([]byte, error) {
 	)
 	for attempt := range attempts {
 		if err := c.preAttempt(req, attempt, delay); err != nil {
+			// preAttempt returns either an intended cancellation from the backoff wait
+			// or a rewind (GetBody) failure. A cancellation must pass through so the
+			// caller's errors.Is(err, context.Canceled) still holds; a rewind failure
+			// should not mask the original transport error that triggered the retry.
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return nil, err
+			}
+			if lastErr != nil {
+				return nil, fmt.Errorf("%w (retry prep failed: %v)", lastErr, err)
+			}
 			return nil, err
 		}
 
@@ -215,8 +178,8 @@ func (c *Client) logRetry(req *http.Request, attempt, status int, delay time.Dur
 }
 
 // preAttempt prepares a retry by rewinding the request body and waiting for the
-// backoff period. The first attempt needs no preparation. Do and DoJSON share
-// this helper.
+// backoff period. The first attempt needs no preparation. DoJSON calls it before
+// each attempt.
 func (c *Client) preAttempt(req *http.Request, attempt int, delay time.Duration) error {
 	if attempt == 0 {
 		return nil

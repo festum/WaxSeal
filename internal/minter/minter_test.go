@@ -605,6 +605,49 @@ func TestMinterPlayerContextStatus2TransientClears(t *testing.T) {
 	}
 }
 
+// An incomplete context, such as a video with no audio formats, is returned after
+// the in-place retry without relaunching Chromium. The error is not
+// negative-cached.
+func TestMinterPlayerContextIncompleteNoRelaunch(t *testing.T) {
+	var calls int64
+	m, launches, sessions, smu := newTestMinterFull(
+		func(string) (browser.MintResult, error) { return browser.MintResult{Lifetime: 3600}, nil },
+		func(string) (browser.PlayerContext, error) {
+			atomic.AddInt64(&calls, 1)
+			return browser.PlayerContext{}, fmt.Errorf("%w: no audio formats", browser.ErrIncompleteContext)
+		},
+	)
+	ctx := context.Background()
+	if err := m.Warm(ctx); err != nil { // gen 1
+		t.Fatalf("warm: %v", err)
+	}
+	_, _, err := m.PlayerContext(ctx, "vid")
+	if err == nil || !errors.Is(err, browser.ErrIncompleteContext) {
+		t.Fatalf("err = %v, want ErrIncompleteContext", err)
+	}
+	if got := atomic.LoadInt64(&calls); got != 2 {
+		t.Errorf("session PlayerContext calls = %d, want 2 (initial + one in-place retry)", got)
+	}
+	if got := atomic.LoadInt64(launches); got != 1 {
+		t.Errorf("launches = %d, want 1 (incomplete context must not relaunch)", got)
+	}
+	if got := m.metrics.Escalations.Load(); got != 0 {
+		t.Errorf("escalations = %d, want 0 (no relaunch on incomplete context)", got)
+	}
+	// Not negative-cached: a second request runs again rather than returning a cached error.
+	if _, _, err := m.PlayerContext(ctx, "vid"); !errors.Is(err, browser.ErrIncompleteContext) {
+		t.Fatalf("second request err = %v, want ErrIncompleteContext (not negative-cached)", err)
+	}
+	if got := atomic.LoadInt64(&calls); got != 4 {
+		t.Errorf("session calls after a second request = %d, want 4 (not negative-cached)", got)
+	}
+	smu.Lock()
+	defer smu.Unlock()
+	if (*sessions)[0].closed.Load() {
+		t.Errorf("warm session should survive an incomplete-context rejection (no relaunch)")
+	}
+}
+
 // TestMinterNegCacheBoundedEvicts: at capacity with every entry live, a new terminal
 // result is still cached (evicting an older one) instead of dropped, so the map stays
 // bounded and the newest unplayable id is the one kept.
@@ -622,6 +665,25 @@ func TestMinterNegCacheBoundedEvicts(t *testing.T) {
 	}
 	if err := m.negCacheGet("newestUnplay"); !errors.Is(err, browser.ErrUnplayable) {
 		t.Errorf("newest terminal result should be cached after eviction, got %v", err)
+	}
+}
+
+// Refreshing an existing neg-cache entry at capacity must not evict a live entry,
+// matching cachePut. The old code ran the eviction path on any insert, dropping an
+// unrelated entry on a refresh. Each refresh must leave the cache full.
+func TestMinterNegCacheRefreshNoEvict(t *testing.T) {
+	m := NewMinter("v", browser.Options{}, 0, 0)
+	for i := 0; i < minterNegCacheMax; i++ {
+		m.negCachePut(fmt.Sprintf("vid%05d", i), browser.ErrUnplayable)
+	}
+	if got := len(m.negCache); got != minterNegCacheMax {
+		t.Fatalf("setup: negCache size = %d, want %d", got, minterNegCacheMax)
+	}
+	for i := 0; i < 8; i++ { // distinct existing keys; eviction order is randomized
+		m.negCachePut(fmt.Sprintf("vid%05d", i), browser.ErrUnplayable)
+		if got := len(m.negCache); got != minterNegCacheMax {
+			t.Fatalf("after refreshing an existing key, negCache size = %d, want %d (a live entry was evicted)", got, minterNegCacheMax)
+		}
 	}
 }
 
@@ -963,6 +1025,21 @@ func TestMinterSelfTestMintFatal(t *testing.T) {
 	})
 	if err := m.SelfTest(context.Background()); err == nil {
 		t.Fatal("SelfTest = nil, want an error after a persistent mint failure")
+	}
+}
+
+// SelfTest counts each failed mint attempt, same as the normal Mint path.
+func TestMinterSelfTestMintFailuresCounted(t *testing.T) {
+	defer func(d time.Duration) { selfTestMintRetryDelay = d }(selfTestMintRetryDelay)
+	selfTestMintRetryDelay = time.Millisecond
+	m, _, _, _ := newTestMinter(func(string) (browser.MintResult, error) {
+		return browser.MintResult{}, errors.New("mint broken")
+	})
+	if err := m.SelfTest(context.Background()); err == nil {
+		t.Fatal("SelfTest = nil, want a persistent mint failure")
+	}
+	if got := m.metrics.MintFailures.Load(); got != int64(selfTestMintAttempts) {
+		t.Errorf("mint_failures = %d, want %d (one per attempt)", got, selfTestMintAttempts)
 	}
 }
 
@@ -1407,6 +1484,33 @@ func TestMinterReportConcurrentAtMostOnce(t *testing.T) {
 	defer smu.Unlock()
 	if !(*sessions)[0].closed.Load() {
 		t.Error("the reported session should be retired exactly once")
+	}
+}
+
+// A report that loses the retire race to another goroutine must not arm the
+// debounce. lastReportRetireAt advances only when this report actually recycled
+// the session. Running several rounds makes the race show up without relying on
+// timing.
+func TestMinterReportNoopRetireDoesNotArmDebounce(t *testing.T) {
+	for round := 0; round < 200; round++ {
+		m, _, _, _ := newStreamingMinter(0, nil)
+		if err := m.Warm(context.Background()); err != nil { // gen 1
+			t.Fatalf("round %d warm: %v", round, err)
+		}
+		var res ReportResult
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); res = m.ReportDegraded(1, "vid", "cap") }()
+		go func() { defer wg.Done(); m.retire(1, "concurrent retirement", false) }()
+		wg.Wait()
+
+		m.mu.Lock()
+		armed := !m.lastReportRetireAt.IsZero()
+		m.mu.Unlock()
+		// The debounce is armed only when this report's own retire succeeded.
+		if armed != res.Retired {
+			t.Fatalf("round %d: debounce armed=%v but report Retired=%v (a no-op retire must not arm the debounce)", round, armed, res.Retired)
+		}
 	}
 }
 
