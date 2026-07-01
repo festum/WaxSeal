@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -572,26 +573,56 @@ func TestGetPotTrailingDataRejected(t *testing.T) {
 
 // fakePlayerSession exercises live-session handlers without a browser.
 type fakePlayerSession struct {
-	abrURL      string
-	vd          string
-	established bool
-	pingErr     error // non-nil makes Ping fail, so a probe failure can be injected
-	closed      atomic.Bool
+	abrURL          string
+	vd              string
+	established     bool
+	pingErr         error          // non-nil makes Ping fail, so a probe failure can be injected
+	mintErr         error          // non-nil makes Mint fail, so the mint ladder can be exercised
+	pcErr           error          // non-nil makes PlayerContext fail
+	establishErr    error          // non-nil makes EnsureEstablished fail (used by /session)
+	mintBlocks      bool           // Mint blocks until ctx is done (to exercise the server timeout)
+	pcBlocks        bool           // PlayerContext blocks until ctx is done (/player-context timeout)
+	establishBlocks bool           // EnsureEstablished blocks until ctx is done (/session timeout)
+	cookies         []*http.Cookie // when non-nil, BrowserCookies returns these
+	closed          atomic.Bool
 }
 
-func (f *fakePlayerSession) Mint(context.Context, string) (browser.MintResult, error) {
+func (f *fakePlayerSession) Mint(ctx context.Context, _ string) (browser.MintResult, error) {
+	if f.mintBlocks {
+		<-ctx.Done()
+		return browser.MintResult{}, ctx.Err()
+	}
+	if f.mintErr != nil {
+		return browser.MintResult{}, f.mintErr
+	}
 	return browser.MintResult{Kind: "integrity", Lifetime: 3600}, nil
 }
-func (f *fakePlayerSession) PlayerContext(context.Context, string) (browser.PlayerContext, error) {
+func (f *fakePlayerSession) PlayerContext(ctx context.Context, _ string) (browser.PlayerContext, error) {
+	if f.pcBlocks {
+		<-ctx.Done()
+		return browser.PlayerContext{}, ctx.Err()
+	}
+	if f.pcErr != nil {
+		return browser.PlayerContext{}, f.pcErr
+	}
 	return browser.PlayerContext{PlayabilityStatus: "OK", ServerAbrStreamingURL: f.abrURL, VisitorData: f.vd}, nil
 }
-func (f *fakePlayerSession) EnsureEstablished(context.Context) error { return nil }
-func (f *fakePlayerSession) Ping(context.Context) error              { return f.pingErr }
-func (f *fakePlayerSession) AttestKind() string                      { return "integrity" }
+func (f *fakePlayerSession) EnsureEstablished(ctx context.Context) error {
+	if f.establishBlocks {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	return f.establishErr
+}
+func (f *fakePlayerSession) Ping(context.Context) error { return f.pingErr }
+func (f *fakePlayerSession) AttestKind() string         { return "integrity" }
 func (f *fakePlayerSession) Identity() browser.Identity {
 	return browser.Identity{VisitorData: f.vd, UserAgent: "UA", ClientVersion: "2.x"}
 }
 func (f *fakePlayerSession) BrowserCookies(context.Context) ([]*http.Cookie, error) {
+	if f.cookies != nil {
+		return f.cookies, nil
+	}
 	return []*http.Cookie{{Name: "VISITOR_INFO1_LIVE", Value: "abc"}}, nil
 }
 func (f *fakePlayerSession) Established() bool { return f.established }
@@ -1390,5 +1421,334 @@ func TestPlayerContextEmptyBodyReportsMissingVideoID(t *testing.T) {
 	json.Unmarshal(w.Body.Bytes(), &env)
 	if env.Error != "video_id is required" {
 		t.Errorf("message = %q, want 'video_id is required'", env.Error)
+	}
+}
+
+// capturingHandler records slog records so a test can assert what was (and was
+// not) logged. It is safe for the synchronous handler path exercised here.
+type capturingHandler struct {
+	mu      sync.Mutex
+	records []slog.Record
+}
+
+func (h *capturingHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *capturingHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.records = append(h.records, r.Clone())
+	return nil
+}
+
+// WithAttrs and WithGroup intentionally return the same handler: the capturer
+// records every record by level and message only, ignoring attrs and groups, so
+// there is no child state to isolate. That keeps assertions simple and is safe for
+// these synchronous, single-goroutine tests.
+func (h *capturingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *capturingHandler) WithGroup(string) slog.Handler      { return h }
+
+func (h *capturingHandler) has(level slog.Level, msg string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, r := range h.records {
+		if r.Level == level && r.Message == msg {
+			return true
+		}
+	}
+	return false
+}
+
+// TestPresentErr covers the public error text used by HTTP responses. It strips
+// the internal "waxseal: " prefix from bare and embedded errors, then clamps long
+// messages.
+func TestPresentErr(t *testing.T) {
+	for in, want := range map[string]string{
+		"waxseal: boom":              "boom",
+		"mint failed: waxseal: boom": "mint failed: boom",
+		"no prefix here":             "no prefix here",
+	} {
+		if got := presentErr(in); got != want {
+			t.Errorf("presentErr(%q) = %q, want %q", in, got, want)
+		}
+	}
+	long := strings.Repeat("x", maxErrTextBytes+100)
+	if got := presentErr(long); !strings.HasSuffix(got, "... [truncated]") {
+		t.Errorf("presentErr did not clamp oversized text (len=%d)", len(got))
+	}
+}
+
+// TestPingClientGoneSuppressesProbeFailure checks that a client disconnect during
+// /ping is not reported as a server failure. It should not log a probe-failed
+// WARN, return a strict-mode 503, or write a response body.
+func TestPingClientGoneSuppressesProbeFailure(t *testing.T) {
+	sess := &fakePlayerSession{abrURL: "https://r/x", vd: "vd", pingErr: errors.New("cdp connection closed")}
+	s := liveServer(t, map[string]string{"K": "alice"}, map[string]*fakePlayerSession{"K": sess})
+	cap := &capturingHandler{}
+	s.log = slog.New(cap)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // the caller has gone away
+	r := httptest.NewRequest(http.MethodGet, "/ping?strict=true", nil).WithContext(ctx)
+	r.Header.Set("X-API-Key", "K")
+	w := httptest.NewRecorder()
+	s.routes().ServeHTTP(w, r)
+
+	if w.Code == http.StatusServiceUnavailable {
+		t.Error("status = 503; a client disconnect must not flip ?strict to a probe failure")
+	}
+	if body := w.Body.String(); body != "" {
+		t.Errorf("body = %q, want empty (nothing written for an abandoned request)", body)
+	}
+	if cap.has(slog.LevelWarn, "ping probe failed") {
+		t.Error("logged a probe-failed WARN for a client disconnect")
+	}
+}
+
+// TestPingErrorStripsPrefix checks that /ping's direct error write uses presentErr
+// like the error-envelope path.
+func TestPingErrorStripsPrefix(t *testing.T) {
+	sess := &fakePlayerSession{abrURL: "https://r/x", vd: "vd", pingErr: errors.New("waxseal: cdp closed")}
+	s := liveServer(t, map[string]string{"K": "alice"}, map[string]*fakePlayerSession{"K": sess})
+	r := httptest.NewRequest(http.MethodGet, "/ping", nil)
+	r.Header.Set("X-API-Key", "K")
+	w := httptest.NewRecorder()
+	s.routes().ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp["reason"] != "probe-failed" {
+		t.Errorf("reason = %v, want probe-failed", resp["reason"])
+	}
+	if resp["error"] != "cdp closed" {
+		t.Errorf("error = %v, want %q (internal prefix stripped)", resp["error"], "cdp closed")
+	}
+}
+
+// TestSameSiteWire maps the http.SameSite enum to the /session wire string.
+func TestSameSiteWire(t *testing.T) {
+	for _, tc := range []struct {
+		in   http.SameSite
+		want string
+	}{
+		{http.SameSiteStrictMode, "Strict"},
+		{http.SameSiteLaxMode, "Lax"},
+		{http.SameSiteNoneMode, "None"},
+		{http.SameSiteDefaultMode, ""},
+		{http.SameSite(0), ""},
+	} {
+		if got := sameSiteWire(tc.in); got != tc.want {
+			t.Errorf("sameSiteWire(%v) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestSessionExportsCookieExpiryAndSameSite checks that /session exports an
+// absolute RFC3339 expiry and same_site, while omitting expires for session
+// cookies.
+func TestSessionExportsCookieExpiryAndSameSite(t *testing.T) {
+	exp := time.Date(2035, 1, 2, 3, 4, 5, 0, time.UTC)
+	sess := &fakePlayerSession{abrURL: "https://r/ok", vd: "vd", cookies: []*http.Cookie{
+		{Name: "PREF", Value: "p", Domain: ".youtube.com", Path: "/", Secure: true, SameSite: http.SameSiteLaxMode, Expires: exp},
+		{Name: "YSC", Value: "s", Domain: ".youtube.com", Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode}, // session cookie: zero Expires
+	}}
+	s := liveServer(t, map[string]string{"K": "alice"}, map[string]*fakePlayerSession{"K": sess})
+	r := httptest.NewRequest(http.MethodGet, "/session", nil)
+	r.Header.Set("X-API-Key", "K")
+	w := httptest.NewRecorder()
+	s.routes().ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body)
+	}
+	var resp struct {
+		Cookies []map[string]any `json:"cookies"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Cookies) != 2 {
+		t.Fatalf("cookies = %d, want 2", len(resp.Cookies))
+	}
+	if got := resp.Cookies[0]["expires"]; got != exp.Format(time.RFC3339) {
+		t.Errorf("PREF expires = %v, want %q", got, exp.Format(time.RFC3339))
+	}
+	if got := resp.Cookies[0]["same_site"]; got != "Lax" {
+		t.Errorf("PREF same_site = %v, want Lax", got)
+	}
+	if _, present := resp.Cookies[1]["expires"]; present {
+		t.Errorf("session cookie must omit expires, got %v", resp.Cookies[1]["expires"])
+	}
+	if got := resp.Cookies[1]["same_site"]; got != "Lax" {
+		t.Errorf("YSC same_site = %v, want Lax", got)
+	}
+}
+
+// TestPlayerContextClientGoneNoMisleading502 checks that a client disconnect
+// during /player-context is not reported as a 502 or 504 and writes no body.
+func TestPlayerContextClientGoneNoMisleading502(t *testing.T) {
+	sess := &fakePlayerSession{abrURL: "https://r/ok", vd: "vd", pcErr: context.Canceled}
+	s := liveServer(t, map[string]string{"K": "alice"}, map[string]*fakePlayerSession{"K": sess})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r := httptest.NewRequest(http.MethodPost, "/player-context", strings.NewReader(`{"video_id":"aqz-KE-bpKQ"}`)).WithContext(ctx)
+	r.Header.Set("X-API-Key", "K")
+	w := httptest.NewRecorder()
+	s.routes().ServeHTTP(w, r)
+
+	if w.Code == http.StatusBadGateway || w.Code == http.StatusGatewayTimeout {
+		t.Errorf("status = %d; a client disconnect must not become a 502/504", w.Code)
+	}
+	if body := w.Body.String(); body != "" {
+		t.Errorf("body = %q, want empty", body)
+	}
+}
+
+// TestGetPotClientGoneComposesGuards exercises the handler and minter guards
+// together. With a failing mint and a canceled request, the handler writes no
+// 502/body and the minter leaves counters and the live session untouched.
+func TestGetPotClientGoneComposesGuards(t *testing.T) {
+	sess := &fakePlayerSession{abrURL: "https://r/ok", vd: "vd", mintErr: errors.New("mint boom")}
+	s := liveServer(t, map[string]string{"K": "alice"}, map[string]*fakePlayerSession{"K": sess})
+	mtr, _, err := s.tenants.Minter("K")
+	if err != nil {
+		t.Fatalf("minter: %v", err)
+	}
+	gen0 := mtr.Generation()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r := httptest.NewRequest(http.MethodPost, "/get_pot", strings.NewReader(`{"content_binding":"aqz-KE-bpKQ"}`)).WithContext(ctx)
+	r.Header.Set("X-API-Key", "K")
+	w := httptest.NewRecorder()
+	s.routes().ServeHTTP(w, r)
+
+	if w.Code == http.StatusBadGateway {
+		t.Error("status = 502; a client disconnect must not become a mint-failed 502")
+	}
+	if body := w.Body.String(); body != "" {
+		t.Errorf("body = %q, want empty", body)
+	}
+	if got := aggregateCounter(t, s, "mint_failures"); got != 0 {
+		t.Errorf("mint_failures = %v, want 0 (the minter guard trips before counting)", got)
+	}
+	if got := aggregateCounter(t, s, "escalations"); got != 0 {
+		t.Errorf("escalations = %v, want 0 (no relaunch)", got)
+	}
+	if sess.closed.Load() {
+		t.Error("session was retired; a client disconnect must not relaunch Chromium")
+	}
+	if got := mtr.Generation(); got != gen0 {
+		t.Errorf("generation = %d, want %d (no relaunch)", got, gen0)
+	}
+}
+
+// shortRequestTimeout shrinks requestProcessTimeout for the duration of a test so
+// the server's own deadline (not an injected error value) fires while the client
+// stays connected. The blocking fakes below return only when this derived context
+// is done.
+func shortRequestTimeout(t *testing.T, d time.Duration) {
+	t.Helper()
+	old := requestProcessTimeout
+	requestProcessTimeout = d
+	t.Cleanup(func() { requestProcessTimeout = old })
+}
+
+func decodeCode(t *testing.T, body []byte) string {
+	t.Helper()
+	var env struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(body, &env); err != nil {
+		t.Fatalf("decode error body %q: %v", body, err)
+	}
+	return env.Code
+}
+
+// TestGetPotServerTimeoutMaps504 exercises the real requestProcessTimeout path.
+// The mint blocks until the server's own shortened deadline fires while the
+// client stays connected, so /get_pot should report 504/timeout instead of a
+// generic 502. The minter guard should return the timeout without counting a mint
+// failure or relaunching.
+func TestGetPotServerTimeoutMaps504(t *testing.T) {
+	shortRequestTimeout(t, 20*time.Millisecond)
+	sess := &fakePlayerSession{abrURL: "https://r/ok", vd: "vd", mintBlocks: true}
+	s := liveServer(t, map[string]string{"K": "alice"}, map[string]*fakePlayerSession{"K": sess})
+	r := httptest.NewRequest(http.MethodPost, "/get_pot", strings.NewReader(`{"content_binding":"aqz-KE-bpKQ"}`))
+	r.Header.Set("X-API-Key", "K")
+	w := httptest.NewRecorder()
+	s.routes().ServeHTTP(w, r)
+	if w.Code != http.StatusGatewayTimeout {
+		t.Fatalf("status = %d, want 504", w.Code)
+	}
+	if got := decodeCode(t, w.Body.Bytes()); got != CodeTimeout {
+		t.Errorf("code = %q, want %q", got, CodeTimeout)
+	}
+	if got := aggregateCounter(t, s, "mint_failures"); got != 0 {
+		t.Errorf("mint_failures = %v, want 0 (a server timeout is not a mint failure)", got)
+	}
+	if got := aggregateCounter(t, s, "escalations"); got != 0 {
+		t.Errorf("escalations = %v, want 0 (no relaunch on server timeout)", got)
+	}
+	if sess.closed.Load() {
+		t.Error("session was retired on a server timeout")
+	}
+}
+
+// TestPlayerContextServerTimeoutMaps504 checks the same requestProcessTimeout
+// mapping for /player-context. The outer budget fires while the client stays
+// connected, so the response is 504 rather than 502.
+func TestPlayerContextServerTimeoutMaps504(t *testing.T) {
+	shortRequestTimeout(t, 20*time.Millisecond)
+	sess := &fakePlayerSession{abrURL: "https://r/ok", vd: "vd", pcBlocks: true}
+	s := liveServer(t, map[string]string{"K": "alice"}, map[string]*fakePlayerSession{"K": sess})
+	r := httptest.NewRequest(http.MethodPost, "/player-context", strings.NewReader(`{"video_id":"aqz-KE-bpKQ"}`))
+	r.Header.Set("X-API-Key", "K")
+	w := httptest.NewRecorder()
+	s.routes().ServeHTTP(w, r)
+	if w.Code != http.StatusGatewayTimeout {
+		t.Fatalf("status = %d, want 504", w.Code)
+	}
+	if got := decodeCode(t, w.Body.Bytes()); got != CodeTimeout {
+		t.Errorf("code = %q, want %q", got, CodeTimeout)
+	}
+}
+
+// TestSessionServerTimeoutMaps504 checks that /session reports 504/timeout, not
+// 503/no-session, when the server's own deadline fires while the client stays
+// connected.
+func TestSessionServerTimeoutMaps504(t *testing.T) {
+	shortRequestTimeout(t, 20*time.Millisecond)
+	sess := &fakePlayerSession{abrURL: "https://r/ok", vd: "vd", establishBlocks: true}
+	s := liveServer(t, map[string]string{"K": "alice"}, map[string]*fakePlayerSession{"K": sess})
+	r := httptest.NewRequest(http.MethodGet, "/session", nil)
+	r.Header.Set("X-API-Key", "K")
+	w := httptest.NewRecorder()
+	s.routes().ServeHTTP(w, r)
+	if w.Code != http.StatusGatewayTimeout {
+		t.Fatalf("status = %d, want 504", w.Code)
+	}
+	if got := decodeCode(t, w.Body.Bytes()); got != CodeTimeout {
+		t.Errorf("code = %q, want %q", got, CodeTimeout)
+	}
+}
+
+// TestInnerDeadlineIsNot504 checks that an inner browser deadline is not treated
+// as the request timeout. When the outer request context is still live, a wrapped
+// context.DeadlineExceeded should remain a generic upstream failure.
+func TestInnerDeadlineIsNot504(t *testing.T) {
+	sess := &fakePlayerSession{abrURL: "https://r/ok", vd: "vd", mintErr: context.DeadlineExceeded}
+	s := liveServer(t, map[string]string{"K": "alice"}, map[string]*fakePlayerSession{"K": sess})
+	r := httptest.NewRequest(http.MethodPost, "/get_pot", strings.NewReader(`{"content_binding":"aqz-KE-bpKQ"}`))
+	r.Header.Set("X-API-Key", "K")
+	w := httptest.NewRecorder()
+	s.routes().ServeHTTP(w, r)
+	if w.Code == http.StatusGatewayTimeout {
+		t.Fatalf("status = 504, want a non-timeout code (the outer request budget did not fire)")
+	}
+	if w.Code != http.StatusBadGateway || decodeCode(t, w.Body.Bytes()) != CodeMintFailed {
+		t.Errorf("status/code = %d/%q, want 502/%q", w.Code, decodeCode(t, w.Body.Bytes()), CodeMintFailed)
 	}
 }

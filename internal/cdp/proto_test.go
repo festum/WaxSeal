@@ -205,3 +205,25 @@ func TestIsContextLost(t *testing.T) {
 		t.Error("isContextLost(*EvalError) = true; JS exceptions must not be treated as context loss")
 	}
 }
+
+// TestCookieUnmarshalsExtras covers the cookie fields WaxSeal needs beyond name,
+// value, domain, path, and flags.
+func TestCookieUnmarshalsExtras(t *testing.T) {
+	const raw = `{"name":"PREF","value":"x","domain":".youtube.com","path":"/","secure":true,"httpOnly":false,"expires":1750000000,"session":false,"sameSite":"Lax"}`
+	var c Cookie
+	if err := json.Unmarshal([]byte(raw), &c); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if c.Name != "PREF" || c.Domain != ".youtube.com" || !c.Secure {
+		t.Errorf("base fields = %+v", c)
+	}
+	if c.Expires != 1750000000 {
+		t.Errorf("expires = %v, want 1750000000", c.Expires)
+	}
+	if c.Session {
+		t.Errorf("session = %v, want false", c.Session)
+	}
+	if c.SameSite != "Lax" {
+		t.Errorf("sameSite = %q, want Lax", c.SameSite)
+	}
+}

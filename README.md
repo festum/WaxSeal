@@ -67,14 +67,16 @@ For `/get_pot`, `content_binding` is the value the token is bound to: a
 **video ID** for a player token or **visitor data** for a GVS token. It is
 limited to 4096 bytes. The optional `scope` may be `player`, `gvs`, `pot`, or
 omitted. Scope only namespaces cache entries; `content_binding` selects the
-token type.
+token type. `/get_pot` sets `X-Pot-Cache: hit` when the token was served from
+the cache or `X-Pot-Cache: miss` when it was freshly minted.
 
 Tokens and exported identities are bound to the minting host's egress IP. The
 consumer must use that same IP for SABR media requests.
 
-`/session` proves full-length streaming, then returns the tenant's anonymous
-`visitor_data`, cookies, and `session_generation`. Exported sessions do not
-contain a Google login.
+`/session` verifies full-length streaming, then returns the tenant's anonymous
+`visitor_data`, cookies, and `session_generation`. Each cookie includes
+`expires` (RFC3339, omitted for session cookies) and `same_site`. Exported
+sessions do not contain a Google login.
 
 ### Player context
 
@@ -175,7 +177,7 @@ playability status.
 | `video-unavailable` | 422 | Terminal playability status |
 | `mint-failed`, `player-context-failed` | 502 | Upstream operation failed |
 | `no-session` | 503 | No attested session is available |
-| `timeout` | 504 | Player-context deadline elapsed |
+| `timeout` | 504 | Request processing deadline elapsed for `/get_pot`, `/player-context`, or `/session` |
 
 `/ping` is the exception: after authentication it returns HTTP 200 by default,
 with either `ok:true` or `ok:false`. An always-present `reason` field
@@ -188,7 +190,9 @@ distinguishes the two `ok:false` cases:
 - `reason:"probe-failed"`: a live session's health probe failed. The server logs
   this at `warn`.
 
-Alert only on `reason:"probe-failed"`. Status-code-only health checks
+Alert only on `reason:"probe-failed"`. A caller that disconnects mid-probe is
+not reported as `probe-failed` or logged as a WARN, because the canceled request
+is not a session fault. Status-code-only health checks
 (k8s liveness/readiness, `curl -f`, HAProxy) can pass
 `?strict=true` to map a `probe-failed` to **HTTP 503** while `no-session` and
 healthy stay **200**. This avoids liveness failures during the benign

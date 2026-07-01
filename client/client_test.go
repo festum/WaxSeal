@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/colespringer/waxseal/client"
 )
@@ -64,7 +65,7 @@ func TestSession(t *testing.T) {
 			"client_version":     "CV",
 			"session_generation": 7,
 			"cookies": []map[string]any{
-				{"name": "YSC", "value": "abc", "domain": ".youtube.com", "path": "/", "secure": true, "http_only": true},
+				{"name": "YSC", "value": "abc", "domain": ".youtube.com", "path": "/", "secure": true, "http_only": true, "expires": "2035-01-02T03:04:05Z", "same_site": "Lax"},
 			},
 		})
 	}))
@@ -80,8 +81,15 @@ func TestSession(t *testing.T) {
 	if s.SessionGeneration != 7 {
 		t.Errorf("session_generation = %d, want 7", s.SessionGeneration)
 	}
-	if ck := s.Cookies[0]; ck.Name != "YSC" || ck.Value != "abc" || !ck.Secure || !ck.HttpOnly {
+	ck := s.Cookies[0]
+	if ck.Name != "YSC" || ck.Value != "abc" || !ck.Secure || !ck.HttpOnly {
 		t.Errorf("cookie = %+v", ck)
+	}
+	if want := time.Date(2035, 1, 2, 3, 4, 5, 0, time.UTC); !ck.Expires.Equal(want) {
+		t.Errorf("cookie Expires = %v, want %v", ck.Expires, want)
+	}
+	if ck.SameSite != http.SameSiteLaxMode {
+		t.Errorf("cookie SameSite = %v, want Lax (%v)", ck.SameSite, http.SameSiteLaxMode)
 	}
 }
 

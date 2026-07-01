@@ -520,6 +520,10 @@ func TestMinterPlayerContextCancelNoEscalation(t *testing.T) {
 	if got := m.metrics.Escalations.Load(); got != 0 {
 		t.Errorf("escalations = %d, want 0", got)
 	}
+	// A client cancel is not counted as a player-context failure (parity with Mint).
+	if got := m.metrics.PlayerContextFailures.Load(); got != 0 {
+		t.Errorf("player_context_failures = %d, want 0 (a client cancel is not a failure)", got)
+	}
 	smu.Lock()
 	defer smu.Unlock()
 	if (*sessions)[0].closed.Load() {
@@ -1916,5 +1920,39 @@ func TestMinterReportDebounceDefaultsWhenUnset(t *testing.T) {
 	}
 	if m := NewMinter("v", browser.Options{}, 0, 90*time.Second); m.reportDebounce != 90*time.Second {
 		t.Errorf("reportDebounce = %v, want 90s", m.reportDebounce)
+	}
+}
+
+// TestMinterMintCancelNoEscalationNoRetire covers cancellation during Mint. The
+// guard returns ctx.Err() before updating failure metrics, warning, retiring the
+// session, or relaunching. The fake session fails unconditionally and ignores its
+// ctx, so the pre-canceled context is the only signal the guard can use.
+func TestMinterMintCancelNoEscalationNoRetire(t *testing.T) {
+	m, launches, sessions, smu := newTestMinter(func(string) (browser.MintResult, error) {
+		return browser.MintResult{}, errors.New("mint always fails")
+	})
+	if err := m.Warm(context.Background()); err != nil {
+		t.Fatalf("warm: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // the caller has gone away
+
+	_, _, err := m.Mint(ctx, "gvs", "vd")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Mint = %v, want context.Canceled", err)
+	}
+	if got := m.metrics.MintFailures.Load(); got != 0 {
+		t.Errorf("mint_failures = %d, want 0 (a canceled caller is not a mint failure)", got)
+	}
+	if got := m.metrics.Escalations.Load(); got != 0 {
+		t.Errorf("escalations = %d, want 0 (no relaunch on cancel)", got)
+	}
+	if got := atomic.LoadInt64(launches); got != 1 {
+		t.Errorf("launches = %d, want 1 (no relaunch)", got)
+	}
+	smu.Lock()
+	defer smu.Unlock()
+	if (*sessions)[0].closed.Load() {
+		t.Error("a canceled mint must not retire/relaunch the session")
 	}
 }

@@ -63,8 +63,9 @@ type Server struct {
 
 // requestProcessTimeout bounds how long one request can hold the per-tenant page
 // mutex. It allows the full cold-start retry sequence while preventing a hung
-// request from holding the mutex indefinitely.
-const requestProcessTimeout = 3 * time.Minute
+// request from holding the mutex indefinitely. It is a var so tests can shorten it
+// to exercise the server-timeout path.
+var requestProcessTimeout = 3 * time.Minute
 
 // New launches the shared Chromium and builds the service. It does not attest
 // until Warm or the first request. Shutdown tears the browser down.
@@ -262,6 +263,9 @@ func (s *Server) handleGetPot(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	res, cached, err := m.Mint(ctx, scope, req.ContentBinding)
 	if err != nil {
+		if s.writeCtxErr(w, r, ctx, label) {
+			return
+		}
 		writeErr(w, http.StatusBadGateway, CodeMintFailed, "mint failed: "+err.Error())
 		return
 	}
@@ -302,8 +306,11 @@ func (s *Server) handlePlayerContext(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	pc, gen, err := m.PlayerContext(ctx, videoID)
 	if err != nil {
-		// Separate terminal and timeout failures so callers can choose whether to
-		// retry.
+		// A client disconnect or the server's own timeout is handled uniformly; the
+		// switch below maps only operation-specific failures.
+		if s.writeCtxErr(w, r, ctx, label) {
+			return
+		}
 		switch {
 		case errors.Is(err, browser.ErrUnplayable):
 			// Preserve the playabilityStatus so clients do not need to parse the
@@ -313,8 +320,6 @@ func (s *Server) handlePlayerContext(w http.ResponseWriter, r *http.Request) {
 				status = ue.Status
 			}
 			writeErrDetails(w, http.StatusUnprocessableEntity, CodeVideoUnavailable, err.Error(), status)
-		case errors.Is(err, context.DeadlineExceeded):
-			writeErr(w, http.StatusGatewayTimeout, CodeTimeout, "player-context timed out")
 		default:
 			writeErr(w, http.StatusBadGateway, CodePlayerContextFailed, "player-context failed: "+err.Error())
 		}
@@ -401,6 +406,13 @@ func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
 	reason := "ok"
 	status := http.StatusOK
 	if err != nil {
+		// Check the caller first. A mid-probe disconnect is not a server condition, so
+		// write no body even if the probe also returned no-session. /ping uses the raw
+		// request context, which makes this check unambiguous.
+		if clientGone(r) {
+			s.log.Debug("request abandoned by client", "tenant", label, "err", r.Context().Err())
+			return
+		}
 		reason = "probe-failed"
 		if errors.Is(err, minter.ErrNoSession) {
 			// A report can retire the session before the next streaming request
@@ -432,7 +444,9 @@ func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
 		"streaming_suspect":          snap.StreamingSuspect,
 	}
 	if err != nil {
-		body["error"] = err.Error()
+		// /ping bypasses the error envelope, so strip the internal prefix (and clamp)
+		// here too, matching writeErrDetails and the CLI.
+		body["error"] = presentErr(err.Error())
 	}
 	writeJSON(w, status, body)
 }
@@ -445,6 +459,25 @@ type sessionCookie struct {
 	Path     string `json:"path"`
 	Secure   bool   `json:"secure"`
 	HTTPOnly bool   `json:"http_only"`
+	// Expires is the absolute expiry in RFC3339 and is omitted for session cookies.
+	// SameSite is "Strict", "Lax", or "None"; it is omitted when unset.
+	Expires  string `json:"expires,omitempty"`
+	SameSite string `json:"same_site,omitempty"`
+}
+
+// sameSiteWire maps an http.SameSite to its wire string. An unset or unknown
+// value yields "" so the field is omitted.
+func sameSiteWire(s http.SameSite) string {
+	switch s {
+	case http.SameSiteStrictMode:
+		return "Strict"
+	case http.SameSiteLaxMode:
+		return "Lax"
+	case http.SameSiteNoneMode:
+		return "None"
+	default:
+		return ""
+	}
 }
 
 // handleSession exports the tenant's anonymous visitor_data and cookies. A
@@ -460,16 +493,23 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	id, raw, gen, err := m.SessionSnapshot(ctx)
 	if err != nil {
+		if s.writeCtxErr(w, r, ctx, label) {
+			return
+		}
 		writeErr(w, http.StatusServiceUnavailable, CodeNoSession, "no session: "+err.Error())
 		return
 	}
 	cookies := make([]sessionCookie, 0, len(raw))
 	pairs := make([]string, 0, len(raw))
 	for _, c := range raw {
-		cookies = append(cookies, sessionCookie{
+		sc := sessionCookie{
 			Name: c.Name, Value: c.Value, Domain: c.Domain, Path: c.Path,
-			Secure: c.Secure, HTTPOnly: c.HttpOnly,
-		})
+			Secure: c.Secure, HTTPOnly: c.HttpOnly, SameSite: sameSiteWire(c.SameSite),
+		}
+		if !c.Expires.IsZero() {
+			sc.Expires = c.Expires.UTC().Format(time.RFC3339)
+		}
+		cookies = append(cookies, sc)
 		pairs = append(pairs, c.Name+"="+c.Value)
 	}
 	s.log.Info("session handed out", "tenant", label, "visitor_data_len", len(id.VisitorData), "cookies", len(cookies), "generation", gen)
@@ -567,6 +607,39 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+// clientGone reports whether the caller disconnected or its request context timed
+// out. Browser-backed endpoints derive their work context from r.Context() with
+// WithTimeout, so a nil r.Context().Err() means the server's own timeout fired.
+func clientGone(r *http.Request) bool { return r.Context().Err() != nil }
+
+// writeCtxErr handles the two request-lifecycle outcomes shared by the
+// browser-backed endpoints (/get_pot, /player-context, /session) when their
+// operation returns an error. ctx must be the handler's derived
+// WithTimeout(r.Context(), requestProcessTimeout) context. It returns true when it
+// wrote (or deliberately suppressed) the response, so the caller should return;
+// false means the error is operation-specific and the caller maps it.
+//
+//   - If the caller disconnected, log and write nothing. The response would go
+//     nowhere, and the disconnect is not a server failure.
+//   - If requestProcessTimeout fired while the caller stayed connected, write a
+//     504 timeout response.
+//
+// Gating the 504 on ctx.Err(), not on errors.Is(err, context.DeadlineExceeded),
+// keeps a shorter inner browser deadline (a ~45s nav or ~25s player-load stall)
+// classified as an upstream failure rather than a request timeout, because such an
+// inner deadline does not exhaust the outer request budget.
+func (s *Server) writeCtxErr(w http.ResponseWriter, r *http.Request, ctx context.Context, label string) bool {
+	if clientGone(r) {
+		s.log.Debug("request abandoned by client", "tenant", label, "err", r.Context().Err())
+		return true
+	}
+	if ctx.Err() != nil {
+		writeErr(w, http.StatusGatewayTimeout, CodeTimeout, "request timed out")
+		return true
+	}
+	return false
+}
+
 const (
 	// CodeUnauthorized indicates a missing or invalid API key.
 	CodeUnauthorized = "unauthorized"
@@ -579,7 +652,8 @@ const (
 	CodeMintFailed = "mint-failed"
 	// CodeVideoUnavailable indicates a terminal playabilityStatus.
 	CodeVideoUnavailable = "video-unavailable"
-	// CodeTimeout indicates that the player-context deadline elapsed.
+	// CodeTimeout indicates that a browser-backed operation's deadline elapsed
+	// (player-context, mint, or session).
 	CodeTimeout = "timeout"
 	// CodePlayerContextFailed indicates a non-terminal player-context failure.
 	CodePlayerContextFailed = "player-context-failed"
@@ -618,6 +692,12 @@ func clampErrText(s string) string {
 	}
 	return s[:maxErrTextBytes] + "... [truncated]"
 }
+
+// presentErr removes the internal "waxseal: " prefix that package errors carry,
+// matching the CLI's renderError, and then clamps. Direct HTTP/provider consumers
+// should not see internal package noise. ReplaceAll also handles embedded
+// prefixes, so "mint failed: waxseal: ..." becomes "mint failed: ...".
+func presentErr(s string) string { return clampErrText(strings.ReplaceAll(s, "waxseal: ", "")) }
 
 // decodeErrMsg returns a stable client-facing message for a JSON decoding error
 // without exposing Go type information.
@@ -682,7 +762,7 @@ func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any, allowEmpty 
 }
 
 func writeErrDetails(w http.ResponseWriter, status int, code, msg, details string) {
-	writeJSON(w, status, errEnvelope{Error: clampErrText(msg), Code: code, Details: clampErrText(details)})
+	writeJSON(w, status, errEnvelope{Error: presentErr(msg), Code: code, Details: presentErr(details)})
 }
 
 // MetricsKeyCollision reports the tenant label that shares an API key with

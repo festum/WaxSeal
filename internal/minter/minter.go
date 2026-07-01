@@ -462,11 +462,21 @@ func (m *Minter) Mint(ctx context.Context, scope, binding string) (res browser.M
 	}
 	res, err = sess.Mint(ctx, binding)
 	if err != nil { // level 1: transient failure, one in-place retry, no re-attest.
+		// A canceled or timed-out caller is not a mint failure. Return the context
+		// error before touching failure metrics or the relaunch ladder. This matches
+		// playerContextStop and Health, and lets a stuck page recover through the
+		// crash watcher or a later /ping-triggered retire instead of this request.
+		if ctx.Err() != nil {
+			return browser.MintResult{}, false, ctx.Err()
+		}
 		m.metrics.MintFailures.Add(1)
 		m.log.Warn("minter: mint failed; retrying on same session", "gen", gen, "err", err)
 		res, err = sess.Mint(ctx, binding)
 	}
 	if err != nil { // level 2: escalate to a relaunch and re-attest on a fresh session.
+		if ctx.Err() != nil {
+			return browser.MintResult{}, false, ctx.Err()
+		}
 		m.metrics.MintFailures.Add(1)
 		m.metrics.Escalations.Add(1)
 		m.retire(gen, "mint failed twice; relaunching", false)
@@ -475,6 +485,9 @@ func (m *Minter) Mint(ctx context.Context, scope, binding string) (res browser.M
 			return browser.MintResult{}, false, err
 		}
 		if res, err = sess.Mint(ctx, binding); err != nil {
+			if ctx.Err() != nil {
+				return browser.MintResult{}, false, ctx.Err()
+			}
 			m.metrics.MintFailures.Add(1)
 			return browser.MintResult{}, false, fmt.Errorf("minter: mint failed after relaunch: %w", err)
 		}
@@ -566,12 +579,18 @@ func (m *Minter) PlayerContext(ctx context.Context, videoID string) (browser.Pla
 // stop. Terminal unplayable errors are cached, and canceled requests never cause
 // a relaunch.
 func (m *Minter) playerContextStop(ctx context.Context, videoID string, err error) bool {
+	// A canceled or timed-out caller is not a player-context failure. Stop without
+	// counting it or negative-caching, matching Mint's guard. Real failures fall
+	// through and are counted.
+	if ctx.Err() != nil {
+		return true
+	}
 	m.metrics.PlayerContextFailures.Add(1)
 	if errors.Is(err, browser.ErrUnplayable) {
 		m.negCachePut(videoID, err)
 		return true
 	}
-	return ctx.Err() != nil
+	return false
 }
 
 // negCacheGet returns a cached terminal error for videoID until its TTL expires.

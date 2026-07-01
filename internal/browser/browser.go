@@ -577,11 +577,10 @@ func (s *Session) captureIdentity(ctx context.Context, watchURL string) error {
 				break
 			}
 		}
+		// Success breaks out of the loop immediately after filling ident, so reaching
+		// the deadline here always means visitor_data was not captured.
 		if time.Now().After(deadline) {
-			if ident.UA == "" {
-				return fmt.Errorf("waxseal: ytcfg visitor_data not available before deadline")
-			}
-			break
+			return fmt.Errorf("waxseal: ytcfg visitor_data not available before deadline")
 		}
 		// Check cancellation between polls; otherwise a canceled request can wait
 		// until the polling deadline expires. This matches establish,
@@ -723,12 +722,39 @@ func (s *Session) BrowserCookies(ctx context.Context) ([]*http.Cookie, error) {
 		if !isYouTubeCookieDomain(c.Domain) {
 			continue
 		}
-		out = append(out, &http.Cookie{
-			Name: c.Name, Value: c.Value, Domain: c.Domain, Path: c.Path,
-			Secure: c.Secure, HttpOnly: c.HTTPOnly,
-		})
+		out = append(out, httpCookieFromCDP(c))
 	}
 	return out, nil
+}
+
+// cdpSameSite maps a CDP cookie sameSite string to the net/http enum. An unset or
+// unknown value yields the zero SameSite, which emits no SameSite attribute.
+func cdpSameSite(s string) http.SameSite {
+	switch s {
+	case "Strict":
+		return http.SameSiteStrictMode
+	case "Lax":
+		return http.SameSiteLaxMode
+	case "None":
+		return http.SameSiteNoneMode
+	default:
+		return 0
+	}
+}
+
+// httpCookieFromCDP converts one CDP cookie to an *http.Cookie. Expiry and
+// SameSite are preserved so a consumer's jar can persist and inspect the cookie.
+// Chromium reports session cookies with expires=-1 and session=true; those map to
+// a zero Expires value and remain session cookies in a cookiejar.
+func httpCookieFromCDP(c *cdp.Cookie) *http.Cookie {
+	hc := &http.Cookie{
+		Name: c.Name, Value: c.Value, Domain: c.Domain, Path: c.Path,
+		Secure: c.Secure, HttpOnly: c.HTTPOnly, SameSite: cdpSameSite(c.SameSite),
+	}
+	if c.Expires > 0 && !c.Session {
+		hc.Expires = time.Unix(int64(c.Expires), 0).UTC()
+	}
+	return hc
 }
 
 // isYouTubeCookieDomain accepts youtube.com and real subdomains after normalizing
@@ -1088,25 +1114,65 @@ func (s *Session) PlayerContext(ctx context.Context, videoID string) (PlayerCont
 	if err != nil {
 		return PlayerContext{}, err
 	}
+	// The extraction can yield an empty visitor_data, but captureIdentity requires
+	// one for the current guest session. Backfill from that captured identity so the
+	// consumer's GVS token binds to the same session.
+	if raw.VisitorData == "" {
+		raw.VisitorData = s.id.VisitorData
+	}
+	// Filter unselectable formats before validation. If no audio formats remain,
+	// validatePlayerContext returns ErrIncompleteContext.
+	if kept := usableAudioFormats(raw.AudioFormats); len(kept) != len(raw.AudioFormats) {
+		s.log.Warn("waxseal: dropped unusable audio formats", "video_id", videoID, "kept", len(kept), "of", len(raw.AudioFormats))
+		raw.AudioFormats = kept
+	}
 	if err := validatePlayerContext(raw); err != nil {
 		return PlayerContext{}, err
 	}
 	return raw.PlayerContext, nil
 }
 
+// usableAudioFormats keeps only formats a consumer can select: a positive itag
+// (the SABR format selector) and an audio/* mime. The extraction JS filters on the
+// mime alone, so this adds the itag gate a consumer needs and prevents one
+// unselectable entry from rejecting an otherwise streamable context. It returns
+// the input unchanged when every format is usable, allocating only when it drops
+// one.
+func usableAudioFormats(in []AudioFormat) []AudioFormat {
+	for i, f := range in {
+		if f.Itag > 0 && strings.HasPrefix(f.MimeType, "audio/") {
+			continue
+		}
+		// First unusable entry: copy the usable prefix, then filter the remainder.
+		out := make([]AudioFormat, i, len(in)-1)
+		copy(out, in[:i])
+		for _, f := range in[i+1:] {
+			if f.Itag > 0 && strings.HasPrefix(f.MimeType, "audio/") {
+				out = append(out, f)
+			}
+		}
+		return out
+	}
+	return in
+}
+
 // validatePlayerContext checks for the fields downstream consumers need: SABR URL,
-// player_url for n-descrambling, ustreamer config, and at least one audio format.
-// Returning ErrIncompleteContext tells the minter to retry without negative-caching
-// the video or starting a Chromium relaunch loop. The helper keeps the
-// browser-independent cases table-testable.
+// player_url for n-descrambling, ustreamer config, visitor_data (the consumer's GVS
+// token binds to it), and at least one audio format. Returning ErrIncompleteContext
+// tells the minter to retry without negative-caching the video or starting a
+// Chromium relaunch loop. It is a pure structural gate; per-format filtering
+// happens before it in PlayerContext. The helper keeps the browser-independent
+// cases table-testable.
 func validatePlayerContext(raw playerContextRaw) error {
 	switch {
 	case raw.ServerAbrStreamingURL == "":
-		return fmt.Errorf("%w: no serverAbrStreamingUrl (playabilityStatus %q)", ErrIncompleteContext, raw.PlayabilityStatus)
+		return fmt.Errorf("%w: no server_abr_streaming_url (playabilityStatus %q)", ErrIncompleteContext, raw.PlayabilityStatus)
 	case raw.PlayerURL == "":
 		return fmt.Errorf("%w: no player_url (PLAYER_JS_URL missing); consumer cannot descramble n", ErrIncompleteContext)
 	case raw.VideoPlaybackUstreamerConfig == "":
 		return fmt.Errorf("%w: no video_playback_ustreamer_config (required by the consumer)", ErrIncompleteContext)
+	case raw.VisitorData == "":
+		return fmt.Errorf("%w: no visitor_data (consumer's GVS token would bind to a different identity)", ErrIncompleteContext)
 	case len(raw.AudioFormats) == 0:
 		return fmt.Errorf("%w: no audio formats", ErrIncompleteContext)
 	}

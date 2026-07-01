@@ -6,12 +6,15 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/colespringer/waxseal/internal/cdp"
 )
 
 // Close must run dispose once even when called concurrently. Run this test under
@@ -475,6 +478,7 @@ func TestValidatePlayerContext(t *testing.T) {
 		ServerAbrStreamingURL:        "https://r/abr",
 		PlayerURL:                    "https://r/base.js",
 		VideoPlaybackUstreamerConfig: "cfg",
+		VisitorData:                  "vd",
 		AudioFormats:                 []AudioFormat{{Itag: 140}},
 	}
 	if err := validatePlayerContext(playerContextRaw{PlayerContext: full}); err != nil {
@@ -485,6 +489,7 @@ func TestValidatePlayerContext(t *testing.T) {
 		"no abr url":        func(p *PlayerContext) { p.ServerAbrStreamingURL = "" },
 		"no player url":     func(p *PlayerContext) { p.PlayerURL = "" },
 		"no ustreamer cfg":  func(p *PlayerContext) { p.VideoPlaybackUstreamerConfig = "" },
+		"no visitor data":   func(p *PlayerContext) { p.VisitorData = "" },
 		"no audio formats":  func(p *PlayerContext) { p.AudioFormats = nil },
 		"empty audio slice": func(p *PlayerContext) { p.AudioFormats = []AudioFormat{} },
 	} {
@@ -502,5 +507,69 @@ func TestValidatePlayerContext(t *testing.T) {
 				t.Errorf("error must not be ErrUnplayable (so it is not negative-cached): %v", err)
 			}
 		})
+	}
+}
+
+// TestUsableAudioFormats keeps only selectable formats: a positive itag and an
+// audio/* MIME type. If every entry is filtered out, validatePlayerContext should
+// reject the empty list.
+func TestUsableAudioFormats(t *testing.T) {
+	in := []AudioFormat{
+		{Itag: 140, MimeType: "audio/mp4"},  // keep
+		{Itag: 251, MimeType: "audio/webm"}, // keep
+		{Itag: 0, MimeType: "audio/webm"},   // drop: itag <= 0
+		{Itag: -1, MimeType: "audio/mp4"},   // drop: itag <= 0
+		{Itag: 137, MimeType: "video/mp4"},  // drop: not audio/*
+		{Itag: 141, MimeType: ""},           // drop: not audio/*
+	}
+	got := usableAudioFormats(in)
+	if len(got) != 2 {
+		t.Fatalf("kept %d formats, want 2: %+v", len(got), got)
+	}
+	for _, f := range got {
+		if f.Itag <= 0 || !strings.HasPrefix(f.MimeType, "audio/") {
+			t.Errorf("kept an unusable format: %+v", f)
+		}
+	}
+
+	allBad := usableAudioFormats([]AudioFormat{{Itag: 0, MimeType: "video/mp4"}})
+	if len(allBad) != 0 {
+		t.Errorf("all-bad list kept %d, want 0", len(allBad))
+	}
+	err := validatePlayerContext(playerContextRaw{PlayerContext: PlayerContext{
+		ServerAbrStreamingURL: "u", PlayerURL: "p", VideoPlaybackUstreamerConfig: "c", VisitorData: "vd", AudioFormats: allBad,
+	}})
+	if !errors.Is(err, ErrIncompleteContext) {
+		t.Errorf("all-filtered context error = %v, want ErrIncompleteContext", err)
+	}
+}
+
+// TestHTTPCookieFromCDP maps CDP cookies to *http.Cookie values. Session cookies
+// keep a zero Expires value, persistent cookies convert from Unix seconds, flags
+// carry through, and sameSite maps to the net/http enum.
+func TestHTTPCookieFromCDP(t *testing.T) {
+	sessionCk := httpCookieFromCDP(&cdp.Cookie{Name: "YSC", Value: "s", Domain: ".youtube.com", Path: "/", Expires: -1, Session: true})
+	if !sessionCk.Expires.IsZero() {
+		t.Errorf("session cookie Expires = %v, want zero", sessionCk.Expires)
+	}
+
+	expiring := httpCookieFromCDP(&cdp.Cookie{Name: "PREF", Value: "p", Expires: 1750000000, Session: false, Secure: true, HTTPOnly: true})
+	if want := time.Unix(1750000000, 0).UTC(); !expiring.Expires.Equal(want) {
+		t.Errorf("Expires = %v, want %v", expiring.Expires, want)
+	}
+	if !expiring.Secure || !expiring.HttpOnly {
+		t.Errorf("flags not carried: %+v", expiring)
+	}
+
+	for in, want := range map[string]http.SameSite{
+		"Strict": http.SameSiteStrictMode,
+		"Lax":    http.SameSiteLaxMode,
+		"None":   http.SameSiteNoneMode,
+		"":       0,
+		"weird":  0,
+	} {
+		if got := httpCookieFromCDP(&cdp.Cookie{SameSite: in}).SameSite; got != want {
+			t.Errorf("SameSite(%q) = %v, want %v", in, got, want)
+		}
 	}
 }

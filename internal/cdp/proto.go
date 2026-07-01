@@ -73,12 +73,15 @@ type getCookiesResult struct {
 // Cookie is the subset of CDP Network.Cookie WaxSeal reads. Extra fields
 // Chromium sends are ignored.
 type Cookie struct {
-	Name     string `json:"name"`
-	Value    string `json:"value"`
-	Domain   string `json:"domain"`
-	Path     string `json:"path"`
-	Secure   bool   `json:"secure"`
-	HTTPOnly bool   `json:"httpOnly"`
+	Name     string  `json:"name"`
+	Value    string  `json:"value"`
+	Domain   string  `json:"domain"`
+	Path     string  `json:"path"`
+	Secure   bool    `json:"secure"`
+	HTTPOnly bool    `json:"httpOnly"`
+	Expires  float64 `json:"expires"`  // Unix seconds; Chromium sends -1 for session cookies
+	Session  bool    `json:"session"`  // true when the cookie has no persistent expiry
+	SameSite string  `json:"sameSite"` // "Strict", "Lax", or "None"; absent when unset
 }
 
 // NetworkSetUserAgentOverride is the Network.setUserAgentOverride params. Field

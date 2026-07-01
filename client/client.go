@@ -144,6 +144,24 @@ func (c *Client) POToken(ctx context.Context, contentBinding, scope string) (Tok
 	return Token{Value: out.POToken, ExpiresAt: out.ExpiresAt}, nil
 }
 
+// sameSiteFromWire maps the /session same_site string to the net/http enum.
+// WaxSeal's server is the only producer, and it emits Strict, Lax, or None, so
+// the mapping is case-sensitive. An unset or unknown value yields the zero
+// SameSite, which emits no SameSite attribute. This duplicates the server mapper
+// because the client package must not import internal/browser.
+func sameSiteFromWire(s string) http.SameSite {
+	switch s {
+	case "Strict":
+		return http.SameSiteStrictMode
+	case "Lax":
+		return http.SameSiteLaxMode
+	case "None":
+		return http.SameSiteNoneMode
+	default:
+		return 0
+	}
+}
+
 // Session fetches the daemon's guest identity and cookies.
 func (c *Client) Session(ctx context.Context) (*Session, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/session", nil)
@@ -170,6 +188,8 @@ func (c *Client) Session(ctx context.Context) (*Session, error) {
 			Path     string `json:"path"`
 			Secure   bool   `json:"secure"`
 			HTTPOnly bool   `json:"http_only"`
+			Expires  string `json:"expires"`
+			SameSite string `json:"same_site"`
 		} `json:"cookies"`
 		SessionGeneration uint64 `json:"session_generation"`
 	}
@@ -178,10 +198,17 @@ func (c *Client) Session(ctx context.Context) (*Session, error) {
 	}
 	cookies := make([]*http.Cookie, 0, len(out.Cookies))
 	for _, ck := range out.Cookies {
-		cookies = append(cookies, &http.Cookie{
+		hc := &http.Cookie{
 			Name: ck.Name, Value: ck.Value, Domain: ck.Domain, Path: ck.Path,
-			Secure: ck.Secure, HttpOnly: ck.HTTPOnly,
-		})
+			Secure: ck.Secure, HttpOnly: ck.HTTPOnly, SameSite: sameSiteFromWire(ck.SameSite),
+		}
+		// A malformed expiry must not drop an otherwise valid cookie.
+		if ck.Expires != "" {
+			if t, err := time.Parse(time.RFC3339, ck.Expires); err == nil {
+				hc.Expires = t
+			}
+		}
+		cookies = append(cookies, hc)
 	}
 	return &Session{VisitorData: out.VisitorData, UserAgent: out.UserAgent, ClientVersion: out.ClientVersion, Cookies: cookies, SessionGeneration: out.SessionGeneration}, nil
 }
@@ -301,7 +328,8 @@ const (
 	CodeMintFailed = "mint-failed"
 	// CodeVideoUnavailable indicates a terminal playabilityStatus.
 	CodeVideoUnavailable = "video-unavailable"
-	// CodeTimeout indicates that the player-context deadline elapsed.
+	// CodeTimeout indicates that a browser-backed operation's deadline elapsed
+	// (player-context, mint, or session).
 	CodeTimeout = "timeout"
 	// CodePlayerContextFailed indicates a non-terminal player-context failure.
 	CodePlayerContextFailed = "player-context-failed"
