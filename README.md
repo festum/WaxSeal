@@ -111,6 +111,113 @@ Reports are scoped and rate-limited per tenant. After a report-driven recycle,
 another report within `--report-debounce` (default `5m`) is rejected and returns
 `retry_after_seconds`. Stale or future generations are ignored.
 
+A report's disposition is counted in `/metrics`:
+
+- `degradation_reports_accepted`: applied to the current live session.
+- `degradation_reports_rate_limited`: rejected within the `--report-debounce` window.
+- `degradation_reports_rejected_stale`: named a genuinely old or replaced
+  generation.
+- `degradation_reports_already_retired`: named the current generation whose
+  session was already retired by a crash or a prior report. This is a benign
+  no-op, distinct from a stale report.
+
+### Wire reference
+
+The `client` package structs mirror these shapes and keep the JSON tags in sync;
+the field names below are authoritative. A consumer can implement all four
+contracts from this section alone. Optional fields are marked; the streaming
+`n` parameter in `server_abr_streaming_url` stays scrambled and must be
+descrambled with `player_url` before use.
+
+`POST /get_pot` mints or fetches a cached token.
+
+```jsonc
+// request
+{"content_binding": "<video_id | visitor_data>", "scope": "player"}  // scope optional: "player" | "gvs" | "pot" | omitted
+// response
+{
+  "poToken": "MnRV...",
+  "contentBinding": "<echoed content_binding>",
+  "expiresAt": "2026-07-01T18:00:00Z",   // RFC3339; now+6h when the grant lifetime is unknown
+  "warning": "content_binding looks like a URL; ..."  // optional; present only when the binding looks like a URL
+}
+```
+
+`POST /player-context {"video_id":"<id>"}` (or `GET /player-context?video_id=<id>`).
+
+```jsonc
+// response
+{
+  "playability_status": "OK",
+  "player_url": "https://www.youtube.com/s/player/<hash>/player_ias.vflset/en_US/base.js",
+  "server_abr_streaming_url": "https://...&n=<scrambled>",
+  "video_playback_ustreamer_config": "<base64>",
+  "visitor_data": "<base64>",
+  "client_version": "2.YYYYMMDD.NN.NN",
+  "title": "<video title>",
+  "author": "<channel name>",
+  "length_seconds": 634,
+  "audio_formats": [
+    {
+      "itag": 251,
+      "lmt": "1699999999999999",
+      "xtags": "",
+      "mime_type": "audio/webm; codecs=\"opus\"",
+      "bitrate": 130000,
+      "content_length": 10318791,
+      "approx_duration_ms": 634601,
+      "audio_sample_rate": 48000,
+      "audio_channels": 2,
+      "audio_quality": "AUDIO_QUALITY_MEDIUM",
+      "is_drc": false,
+      "audio_track_id": ""     // empty for the default or only track
+    }
+  ],
+  "session_generation": 1
+}
+```
+
+`GET /session` exports the guest identity for the session-adoption path
+(`--session-url` + `--potoken-url`). No request body.
+
+```jsonc
+// response
+{
+  "visitor_data": "<base64>",
+  "user_agent": "Mozilla/5.0 ...",
+  "client_version": "2.YYYYMMDD.NN.NN",
+  "cookies": [
+    {
+      "name": "VISITOR_INFO1_LIVE",
+      "value": "...",
+      "domain": ".youtube.com",
+      "path": "/",
+      "secure": true,
+      "http_only": true,
+      "same_site": "None",          // optional: "Strict" | "Lax" | "None"; omitted when unset
+      "expires": "2035-01-02T03:04:05Z"  // optional RFC3339; omitted for session cookies
+    }
+  ],
+  "cookie_header": "VISITOR_INFO1_LIVE=...; YSC=...",
+  "session_generation": 1
+}
+```
+
+`POST /report` reports a degraded stream.
+
+```jsonc
+// request
+{"session_generation": 1, "video_id": "<id>", "reason": "truncated"}  // video_id, reason optional
+// response
+{
+  "accepted": false,
+  "retired": false,
+  "retirement_pending": false,
+  "generation": 1,
+  "retry_after_seconds": 300   // optional; present only when rate-limited
+}
+```
+
 ### Authentication and tenants
 
 By default the daemon is keyless and single-tenant. Configure isolated browser
@@ -216,7 +323,10 @@ which, and the HTTP 200 guarantee).
 
 **Full per-tenant view**: `{"tenants":N,"per_tenant":{"<label>":{...}}}`. Each
 per-tenant object carries lifetime counters (`mints`, `crashes`,
-`player_contexts`, and so on) plus current state. Detail fields are **always
+`player_contexts`, and so on) plus current state. The consumer-report
+dispositions (`degradation_reports_accepted`, `degradation_reports_rate_limited`,
+`degradation_reports_rejected_stale`, and `degradation_reports_already_retired`)
+are defined under [Session reports](#session-reports). Detail fields are **always
 present** so the schema stays stable across session retirement, crash, and
 recycle. WaxSeal uses sentinel values when a field does not apply:
 

@@ -108,6 +108,10 @@ type minterMetrics struct {
 	DegradationReportsAccepted      atomic.Int64
 	DegradationReportsRejectedStale atomic.Int64 // named an old or replaced generation
 	DegradationReportsRateLimited   atomic.Int64 // rejected by the debounce
+	// DegradationReportsAlreadyRetired counts reports naming the current
+	// generation whose session was already retired by a crash or a prior report.
+	// This is a benign no-op, not a stale report.
+	DegradationReportsAlreadyRetired atomic.Int64
 }
 
 const (
@@ -388,10 +392,24 @@ func (m *Minter) ReportDegraded(gen uint64, videoID, reason string) ReportResult
 	cur := m.gen
 	sinceLast := time.Since(m.lastReportRetireAt)
 	switch {
-	case m.sess == nil || gen != cur:
-		// A report about an already-replaced session does nothing.
+	case gen != cur:
+		// A genuinely old or future generation: the reported session was already
+		// replaced (or never existed). A no-op.
 		m.mu.Unlock()
 		m.metrics.DegradationReportsRejectedStale.Add(1)
+		return ReportResult{Accepted: false, Generation: cur}
+	case m.sess == nil:
+		// The current generation, but its session was already retired (a crash or a
+		// prior report) in the brief window before the next request relaunches. A
+		// benign no-op distinct from a stale report. This case is load-bearing in
+		// its position: a report-driven retire leaves gen unchanged and sets
+		// lastReportRetireAt, so both this predicate and the debounce predicate
+		// (sinceLast < reportDebounce) are true for a re-report of the same gen. It
+		// must precede the pending and debounce cases, or an already-retired report
+		// is miscounted as rate-limited. TestMinterReportDegradedAlreadyRetired pins
+		// the ordering (already_retired == 1, rate_limited == 0).
+		m.mu.Unlock()
+		m.metrics.DegradationReportsAlreadyRetired.Add(1)
 		return ReportResult{Accepted: false, Generation: cur}
 	case m.reportSuspectGen == gen:
 		// Retirement is already queued for the next streaming handoff.
@@ -855,6 +873,7 @@ var lifetimeCounterKeys = []string{
 	"report_driven_recycles",
 	"degradation_reports_accepted",
 	"degradation_reports_rejected_stale",
+	"degradation_reports_already_retired",
 	"degradation_reports_rate_limited",
 }
 
@@ -876,9 +895,10 @@ func (m *Minter) counterValues() map[string]int64 {
 		"launch_failures":                    m.metrics.LaunchFailures.Load(),
 		"streaming_recycles":                 m.metrics.StreamingRecycles.Load(),
 		"report_driven_recycles":             m.metrics.ReportDrivenRecycles.Load(),
-		"degradation_reports_accepted":       m.metrics.DegradationReportsAccepted.Load(),
-		"degradation_reports_rejected_stale": m.metrics.DegradationReportsRejectedStale.Load(),
-		"degradation_reports_rate_limited":   m.metrics.DegradationReportsRateLimited.Load(),
+		"degradation_reports_accepted":        m.metrics.DegradationReportsAccepted.Load(),
+		"degradation_reports_rejected_stale":  m.metrics.DegradationReportsRejectedStale.Load(),
+		"degradation_reports_already_retired": m.metrics.DegradationReportsAlreadyRetired.Load(),
+		"degradation_reports_rate_limited":    m.metrics.DegradationReportsRateLimited.Load(),
 	}
 }
 

@@ -1127,6 +1127,64 @@ func TestPingStrict(t *testing.T) {
 	}
 }
 
+// TestGetPotWarnsOnURLBinding checks that a URL-shaped content_binding still
+// mints (200) but carries an additive warning field, while a bare identifier
+// produces no warning key.
+func TestGetPotWarnsOnURLBinding(t *testing.T) {
+	s := liveServer(t, map[string]string{"K": "alice"}, map[string]*fakePlayerSession{"K": {abrURL: "https://r/ok", vd: "vd"}})
+	post := func(binding string) map[string]any {
+		r := httptest.NewRequest(http.MethodPost, "/get_pot", strings.NewReader(`{"content_binding":"`+binding+`"}`))
+		r.Header.Set("X-API-Key", "K")
+		w := httptest.NewRecorder()
+		s.routes().ServeHTTP(w, r)
+		if w.Code != http.StatusOK {
+			t.Fatalf("binding %q: status = %d, body = %s", binding, w.Code, w.Body)
+		}
+		var resp map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("binding %q: decode: %v", binding, err)
+		}
+		return resp
+	}
+	urlResp := post("https://youtube.com/watch?v=aqz-KE-bpKQ")
+	if warn, ok := urlResp["warning"].(string); !ok || warn == "" {
+		t.Errorf("URL binding: warning = %v (present=%v), want a non-empty string", urlResp["warning"], ok)
+	}
+	bareResp := post("aqz-KE-bpKQ")
+	if v, present := bareResp["warning"]; present {
+		t.Errorf("bare ID: warning = %v, want no warning key", v)
+	}
+}
+
+// TestGetPotZeroExpiryFallsBackToSixHours covers the response-layer expiry
+// sentinel: a mint result with a zero ExpiresAt (the fake session's default)
+// yields an expiresAt about now+6h.
+func TestGetPotZeroExpiryFallsBackToSixHours(t *testing.T) {
+	s := liveServer(t, map[string]string{"K": "alice"}, map[string]*fakePlayerSession{"K": {abrURL: "https://r/ok", vd: "vd"}})
+	before := time.Now()
+	r := httptest.NewRequest(http.MethodPost, "/get_pot", strings.NewReader(`{"content_binding":"aqz-KE-bpKQ"}`))
+	r.Header.Set("X-API-Key", "K")
+	w := httptest.NewRecorder()
+	s.routes().ServeHTTP(w, r)
+	after := time.Now()
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body)
+	}
+	var resp struct {
+		ExpiresAt time.Time `json:"expiresAt"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	// The response formats with RFC3339 (whole-second precision), so allow a small
+	// slack window around now+6h to absorb the truncation and scheduling jitter.
+	const slack = 2 * time.Second
+	lo, hi := before.Add(6*time.Hour-slack), after.Add(6*time.Hour+slack)
+	if resp.ExpiresAt.Before(lo) || resp.ExpiresAt.After(hi) {
+		t.Errorf("expiresAt = %v, want within [%v, %v] (now+6h sentinel)", resp.ExpiresAt, lo, hi)
+	}
+}
+
 func TestGetPotContentBindingTooLong(t *testing.T) {
 	body := `{"content_binding":"` + strings.Repeat("a", browser.MaxContentBindingBytes+1) + `"}`
 	w := postGetPot(body)
@@ -1352,6 +1410,47 @@ func TestHandleReportRateLimited(t *testing.T) {
 	}
 	if ra, _ := resp["retry_after_seconds"].(float64); ra <= 0 {
 		t.Errorf("retry_after_seconds = %v, want > 0", resp["retry_after_seconds"])
+	}
+}
+
+// TestHandleReportAlreadyRetiredMetric drives the already-retired disposition end
+// to end over HTTP: a first report retires the live generation, then a second
+// report for the same still-current generation is a benign no-op that increments
+// degradation_reports_already_retired in /metrics without touching rejected_stale.
+func TestHandleReportAlreadyRetiredMetric(t *testing.T) {
+	sess := &fakePlayerSession{abrURL: "https://r/ok", vd: "vd"}
+	s := liveServer(t, map[string]string{"K": "alice"}, map[string]*fakePlayerSession{"K": sess})
+	report := func() *httptest.ResponseRecorder {
+		r := httptest.NewRequest(http.MethodPost, "/report", strings.NewReader(`{"session_generation":1,"reason":"cap"}`))
+		r.Header.Set("X-API-Key", "K")
+		w := httptest.NewRecorder()
+		s.routes().ServeHTTP(w, r)
+		return w
+	}
+	if w := report(); w.Code != http.StatusOK { // retires gen 1; sess→nil, gen stays 1
+		t.Fatalf("first report status = %d, body = %s", w.Code, w.Body)
+	}
+	if !sess.closed.Load() {
+		t.Fatal("first report should retire the live session")
+	}
+	// Second report for the still-current generation whose session is already gone.
+	w := report()
+	if w.Code != http.StatusOK {
+		t.Fatalf("second report status = %d, body = %s", w.Code, w.Body)
+	}
+	var resp map[string]any
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["accepted"] != false || resp["generation"] != float64(1) {
+		t.Errorf("second report = %v, want accepted=false generation=1", resp)
+	}
+	if got := aggregateCounter(t, s, "degradation_reports_already_retired"); got != 1 {
+		t.Errorf("degradation_reports_already_retired = %v, want 1", got)
+	}
+	if got := aggregateCounter(t, s, "degradation_reports_rejected_stale"); got != 0 {
+		t.Errorf("degradation_reports_rejected_stale = %v, want 0 (current gen, not stale)", got)
+	}
+	if got := aggregateCounter(t, s, "degradation_reports_rate_limited"); got != 0 {
+		t.Errorf("degradation_reports_rate_limited = %v, want 0 (already-retired must not route to debounce)", got)
 	}
 }
 

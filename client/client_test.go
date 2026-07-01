@@ -43,6 +43,38 @@ func TestPOToken(t *testing.T) {
 	}
 }
 
+// TestPOTokenWarning checks that the daemon's optional warning field parses into
+// Token.Warning, and that its absence leaves Token.Warning empty.
+func TestPOTokenWarning(t *testing.T) {
+	withWarning := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"poToken":   "TOK",
+			"expiresAt": "2030-01-01T00:00:00Z",
+			"warning":   "content_binding looks like a URL",
+		})
+	}))
+	defer withWarning.Close()
+	tok, err := client.New(withWarning.URL).POToken(context.Background(), "https://youtube.com/watch?v=x", "player")
+	if err != nil {
+		t.Fatalf("POToken: %v", err)
+	}
+	if tok.Warning != "content_binding looks like a URL" {
+		t.Errorf("Token.Warning = %q, want the daemon's warning", tok.Warning)
+	}
+
+	noWarning := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"poToken": "TOK", "expiresAt": "2030-01-01T00:00:00Z"})
+	}))
+	defer noWarning.Close()
+	tok, err = client.New(noWarning.URL).POToken(context.Background(), "vid", "player")
+	if err != nil {
+		t.Fatalf("POToken (no warning): %v", err)
+	}
+	if tok.Warning != "" {
+		t.Errorf("Token.Warning = %q, want empty when the response has no warning", tok.Warning)
+	}
+}
+
 func TestPOTokenEmptyBindingAndHTTPError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "upstream boom", http.StatusBadGateway)

@@ -837,24 +837,44 @@ func (s *Session) Attest(ctx context.Context) error {
 		s.tokenExpiresAt = time.Now().Add(time.Duration(it.LifetimeSecs) * time.Second)
 	}
 
-	if !it.HasIntegrity() {
-		if !it.HasFallback() {
-			return fmt.Errorf("waxseal: GenerateIT returned no token")
-		}
-		if _, verr := botguard.ValidatePOToken(it.FallbackToken); verr != nil {
-			return fmt.Errorf("waxseal: fallback failed field-6 validation: %w", verr)
-		}
+	fallback, err := classifyAttestation(it)
+	if err != nil {
+		return err
+	}
+	if fallback {
 		s.attestKind = "fallback"
 		s.fallbackToken = it.FallbackToken
 		s.log.Warn("waxseal: only a fallback token was granted (no integrity); IP/session not granting integrity right now")
 		return nil
 	}
+	// Integrity: install the warm minter in the page. This step touches the page,
+	// so it stays in Attest rather than the pure classifier.
 	if _, err = s.page.Context(ctx).Eval(`(tok) => newMinter(tok)`, it.IntegrityToken); err != nil {
 		return fmt.Errorf("waxseal: newMinter: %w", err)
 	}
 	s.attestKind = "integrity"
 	s.log.Info("waxseal: INTEGRITY attestation installed; warm minter ready", "lifetime_secs", it.LifetimeSecs)
 	return nil
+}
+
+// classifyAttestation decides whether attestation must use the fallback token,
+// without touching the page, so the integrity-vs-fallback decision and the
+// fallback field-6 validation are unit testable. An integrity token means the
+// integrity path (fallback=false). Otherwise a fallback token that passes
+// protobuf field-6 validation selects the fallback path (fallback=true); the
+// caller reads the token from it.FallbackToken. Neither token, or a fallback that
+// fails validation, is an error.
+func classifyAttestation(it *botguard.GenerateITResult) (fallback bool, err error) {
+	if it.HasIntegrity() {
+		return false, nil
+	}
+	if !it.HasFallback() {
+		return false, fmt.Errorf("waxseal: GenerateIT returned no token")
+	}
+	if _, verr := botguard.ValidatePOToken(it.FallbackToken); verr != nil {
+		return false, fmt.Errorf("waxseal: fallback failed field-6 validation: %w", verr)
+	}
+	return true, nil
 }
 
 // Mint produces a token bound to identifier from the session's attestation. The

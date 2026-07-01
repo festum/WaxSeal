@@ -22,10 +22,13 @@ type Client struct {
 	hc      *http.Client
 }
 
-// Token is a minted PO token and its expiry.
+// Token is a minted PO token and its expiry. Warning carries a non-fatal
+// advisory from the daemon, such as a content_binding that looks like a URL. It
+// is empty in the normal case.
 type Token struct {
 	Value     string
 	ExpiresAt time.Time // zero == unknown
+	Warning   string
 }
 
 // Session contains the guest identity and youtube.com cookies exported by
@@ -134,6 +137,7 @@ func (c *Client) POToken(ctx context.Context, contentBinding, scope string) (Tok
 	var out struct {
 		POToken   string    `json:"poToken"`
 		ExpiresAt time.Time `json:"expiresAt"`
+		Warning   string    `json:"warning"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return Token{}, fmt.Errorf("waxseal/client: decode /get_pot: %w", err)
@@ -141,7 +145,7 @@ func (c *Client) POToken(ctx context.Context, contentBinding, scope string) (Tok
 	if out.POToken == "" {
 		return Token{}, errors.New("waxseal/client: /get_pot returned an empty poToken")
 	}
-	return Token{Value: out.POToken, ExpiresAt: out.ExpiresAt}, nil
+	return Token{Value: out.POToken, ExpiresAt: out.ExpiresAt, Warning: out.Warning}, nil
 }
 
 // sameSiteFromWire maps the /session same_site string to the net/http enum.

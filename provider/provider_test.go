@@ -1,11 +1,14 @@
 package provider_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/colespringer/waxseal/client"
@@ -57,6 +60,54 @@ func TestProvideNoneAndUnsupported(t *testing.T) {
 	if _, err := p.ProvidePOToken(ctx, potoken.Request{Scope: potoken.ScopeSubtitles, VideoID: "v"}); !errors.Is(err, provider.ErrUnsupportedScope) {
 		t.Errorf("subtitles err = %v, want ErrUnsupportedScope", err)
 	}
+}
+
+// TestProvideLogsDaemonWarning checks that a non-empty warning from /get_pot
+// reaches a WaxTap-mediated caller through the provider's logger, that no warning
+// field logs nothing, and that the default (no WithLogger) discards safely.
+func TestProvideLogsDaemonWarning(t *testing.T) {
+	logged := func(body map[string]any) (p *provider.Provider, buf *bytes.Buffer, done func()) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(body)
+		}))
+		buf = &bytes.Buffer{}
+		p = provider.New(client.New(srv.URL), provider.WithLogger(slog.New(slog.NewTextHandler(buf, nil))))
+		return p, buf, srv.Close
+	}
+
+	t.Run("warning surfaces through the logger", func(t *testing.T) {
+		p, buf, done := logged(map[string]any{"poToken": "TOK", "warning": "content_binding looks like a URL"})
+		defer done()
+		if _, err := p.ProvidePOToken(context.Background(), potoken.Request{Scope: potoken.ScopePlayer, VideoID: "https://youtube.com/watch?v=x"}); err != nil {
+			t.Fatalf("ProvidePOToken: %v", err)
+		}
+		if !strings.Contains(buf.String(), "content_binding looks like a URL") {
+			t.Errorf("log = %q, want the daemon warning surfaced", buf.String())
+		}
+	})
+
+	t.Run("no warning logs nothing", func(t *testing.T) {
+		p, buf, done := logged(map[string]any{"poToken": "TOK"})
+		defer done()
+		if _, err := p.ProvidePOToken(context.Background(), potoken.Request{Scope: potoken.ScopeGVS, VisitorData: "VD"}); err != nil {
+			t.Fatalf("ProvidePOToken: %v", err)
+		}
+		if buf.Len() != 0 {
+			t.Errorf("log = %q, want silence when the daemon returns no warning", buf.String())
+		}
+	})
+
+	t.Run("default logger discards a warning without panicking", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{"poToken": "TOK", "warning": "content_binding looks like a URL"})
+		}))
+		defer srv.Close()
+		p := provider.New(client.New(srv.URL)) // no WithLogger
+		r, err := p.ProvidePOToken(context.Background(), potoken.Request{Scope: potoken.ScopePlayer, VideoID: "v"})
+		if err != nil || r.Token != "TOK" {
+			t.Fatalf("token=%q err=%v, want TOK with the nil-logger default", r.Token, err)
+		}
+	})
 }
 
 func TestProvidePlayerContextMapping(t *testing.T) {

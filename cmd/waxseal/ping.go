@@ -7,10 +7,18 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 )
+
+// hasScheme reports whether s carries a URL scheme. Unlike
+// browser.LooksLikeWatchURL, it does not treat a bare host such as
+// "youtube.com:4416" as a URL, so a legitimate --addr with a youtube.com host is
+// accepted. The --addr guard only ever needs to catch a doubled scheme
+// (http://<addr>).
+func hasScheme(s string) bool { return strings.Contains(s, "://") }
 
 // pingOpts holds ping-subcommand flags.
 type pingOpts struct {
@@ -49,7 +57,7 @@ func runPing(cmd *cobra.Command, p *pingOpts) error {
 	}
 	// --addr is host:port. Reject URL input before building http://<addr>/ping;
 	// otherwise the doubled scheme parses and fails later as an unreachable host.
-	if looksLikeURL(p.addr) {
+	if hasScheme(p.addr) {
 		return &usageError{msg: fmt.Sprintf("invalid --addr %q: use host:port, not a URL", p.addr)}
 	}
 	// Require an explicit host:port. SplitHostPort also rejects bare hosts, extra

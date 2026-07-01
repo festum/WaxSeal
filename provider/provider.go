@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"github.com/colespringer/waxseal/client"
@@ -19,7 +20,8 @@ var ErrUnsupportedScope = errors.New("waxseal/provider: unsupported PO-token sco
 
 // Provider adapts a *client.Client to potoken.Provider.
 type Provider struct {
-	c *client.Client
+	c   *client.Client
+	log *slog.Logger
 }
 
 var (
@@ -27,9 +29,28 @@ var (
 	_ potoken.PlayerContextProvider = (*Provider)(nil)
 )
 
+// Option configures a Provider.
+type Option func(*Provider)
+
+// WithLogger sends the provider's structured logs to l, matching WaxTap's logging
+// convention. The provider logs daemon advisories, such as a content_binding that
+// looks like a URL, at Warn. A nil logger or no option discards logs.
+func WithLogger(l *slog.Logger) Option { return func(p *Provider) { p.log = l } }
+
 // New wraps a WaxSeal client as a WaxTap potoken.Provider. Configure
-// authentication and HTTP behavior on the client before calling New.
-func New(c *client.Client) *Provider { return &Provider{c: c} }
+// authentication and HTTP behavior on the client before calling New. Pass
+// WithLogger to surface daemon warnings to WaxTap-mediated callers; without it,
+// logs are discarded.
+func New(c *client.Client, opts ...Option) *Provider {
+	p := &Provider{c: c}
+	for _, o := range opts {
+		o(p)
+	}
+	if p.log == nil {
+		p.log = slog.New(slog.DiscardHandler)
+	}
+	return p
+}
 
 // ProvidePOToken maps a WaxTap scope to a WaxSeal content_binding and mints the
 // token. ScopeGVS binds visitor_data, ScopePlayer binds video_id, ScopeNone does
@@ -49,6 +70,11 @@ func (p *Provider) ProvidePOToken(ctx context.Context, req potoken.Request) (pot
 	tok, err := p.c.POToken(ctx, binding, scope)
 	if err != nil {
 		return potoken.Response{}, err
+	}
+	if tok.Warning != "" {
+		// Surface the daemon's advisory (for example, a content_binding that looks
+		// like a URL) to WaxTap-mediated callers, who otherwise never see it.
+		p.log.Warn("waxseal/provider: daemon warning", "scope", scope, "warning", tok.Warning)
 	}
 	return potoken.Response{Token: tok.Value, ExpiresAt: tok.ExpiresAt}, nil
 }

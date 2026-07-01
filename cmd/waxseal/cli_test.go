@@ -204,7 +204,7 @@ func TestIsExposedHost(t *testing.T) {
 			t.Errorf("isExposedHost(%q) = true, want false (loopback)", h)
 		}
 	}
-	for _, h := range []string{"0.0.0.0", "::", "[::]", "192.168.1.5", "example.com", ""} {
+	for _, h := range []string{"0.0.0.0", "::", "[::]", "192.168.1.5", "[2001:db8::1]", "example.com", ""} {
 		if !isExposedHost(h) {
 			t.Errorf("isExposedHost(%q) = false, want true (exposed)", h)
 		}
@@ -399,17 +399,66 @@ func TestRenderError(t *testing.T) {
 	}
 }
 
-func TestLooksLikeURL(t *testing.T) {
-	for _, s := range []string{"http://youtube.com", "https://youtu.be/x", "ftp://h", "a://b"} {
-		if !looksLikeURL(s) {
-			t.Errorf("looksLikeURL(%q) = false, want true", s)
+// TestMaybeWarnURLBinding checks that a URL-shaped content-binding warns on the
+// writer (stderr in production) while a bare ID or visitor_data stays silent.
+func TestMaybeWarnURLBinding(t *testing.T) {
+	warns := []string{
+		"https://youtube.com/watch?v=aqz-KE-bpKQ",
+		"youtube.com/watch?v=aqz-KE-bpKQ", // scheme-less paste
+		"youtu.be/aqz-KE-bpKQ",
+	}
+	for _, s := range warns {
+		var b bytes.Buffer
+		maybeWarnURLBinding(&b, s)
+		if !strings.Contains(b.String(), "warning: content-binding") {
+			t.Errorf("maybeWarnURLBinding(%q) = %q, want a warning", s, b.String())
 		}
 	}
-	for _, s := range []string{"exampleVid1", "aqz-KE-bpKQ", "", "abc123"} {
-		if looksLikeURL(s) {
-			t.Errorf("looksLikeURL(%q) = true, want false", s)
+	silent := []string{"aqz-KE-bpKQ", "CgtHQVZQX1lEMUJ3ayiIyLtBjIKCgJVUxIEGgAgVw", ""}
+	for _, s := range silent {
+		var b bytes.Buffer
+		maybeWarnURLBinding(&b, s)
+		if b.Len() != 0 {
+			t.Errorf("maybeWarnURLBinding(%q) wrote %q, want silence", s, b.String())
 		}
 	}
+}
+
+// TestPingAddrSchemeGuard checks the --addr guard uses a scheme-only test, not
+// the broader watch-URL detector. A doubled scheme is a usage error rejected
+// before any network call; a bare host:port with a youtube.com host must pass the
+// guard and fail only at the network call. Swapping hasScheme for
+// browser.LooksLikeWatchURL would wrongly reject the host and regress this.
+func TestPingAddrSchemeGuard(t *testing.T) {
+	if !hasScheme("http://h:1") {
+		t.Error(`hasScheme("http://h:1") = false, want true (a scheme is rejected)`)
+	}
+	if hasScheme("youtube.com:4416") {
+		t.Error(`hasScheme("youtube.com:4416") = true, want false (a host:port is not a URL)`)
+	}
+	// browser.LooksLikeWatchURL disagrees on the host:port, which is exactly why the
+	// guard must not use it.
+	if !browser.LooksLikeWatchURL("youtube.com:4416") {
+		t.Error("expected browser.LooksLikeWatchURL to flag the youtube.com host (guard-separation invariant)")
+	}
+	if got := exitCodeFor(runPingGuard(t, "http://127.0.0.1:4416")); got != 2 {
+		t.Errorf("ping --addr http://127.0.0.1:4416 exit = %d, want 2 (usage error at the scheme guard)", got)
+	}
+	if got := exitCodeFor(runPingGuard(t, "youtube.com:4416")); got == 2 {
+		t.Errorf("ping --addr youtube.com:4416 exit = %d, want it past the scheme guard (not a usage error)", got)
+	}
+}
+
+// runPingGuard runs runPing with an already-cancelled context so a request that
+// clears the address guards fails immediately at the network call instead of
+// dialing. That isolates the guard behavior without a live server.
+func runPingGuard(t *testing.T, addr string) error {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	cmd := &cobra.Command{}
+	cmd.SetContext(ctx)
+	return runPing(cmd, &pingOpts{addr: addr})
 }
 
 // resolveSMA binds the flag before resolving it so Changed reflects command-line

@@ -254,6 +254,13 @@ func (s *Server) handleGetPot(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, CodeInvalidRequest, "content_binding must not contain control characters")
 		return
 	}
+	// A URL-shaped binding is legitimate for the opaque path (it may be
+	// visitor_data), so it is warned, not rejected. The warning is additive on the
+	// 200 response and never blocks minting.
+	warning, warnURL := browser.URLBindingWarningFor("content_binding", req.ContentBinding)
+	if warnURL {
+		s.log.Warn("content_binding looks like a URL", "tenant", label, "binding_len", len(req.ContentBinding))
+	}
 	scope, ok := normalizeScope(req.Scope)
 	if !ok {
 		writeErr(w, http.StatusBadRequest, CodeInvalidRequest, `scope must be "player", "gvs", "pot", or omitted`)
@@ -282,11 +289,15 @@ func (s *Server) handleGetPot(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-POT-Cache", "miss")
 	}
 	s.log.Info("minted", "tenant", label, "binding_len", len(req.ContentBinding), "scope", scope, "kind", res.Kind, "token_len", res.TokenLen, "cached", cached)
-	writeJSON(w, http.StatusOK, map[string]any{
+	resp := map[string]any{
 		"poToken":        res.Token,
 		"contentBinding": req.ContentBinding,
 		"expiresAt":      expires.UTC().Format(time.RFC3339),
-	})
+	}
+	if warning != "" {
+		resp["warning"] = warning
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // handlePlayerContext returns the attested browser's streaming context for a

@@ -1330,6 +1330,38 @@ func TestMinterReportDegradedStaleGen(t *testing.T) {
 	}
 }
 
+// A report for the current generation whose session was already retired is a
+// benign no-op counted as already_retired, distinct from a stale-generation
+// report. retire() clears the suspect mark, so the re-report lands in the
+// no-live-session case rather than the pending or debounce branches.
+func TestMinterReportDegradedAlreadyRetired(t *testing.T) {
+	m, _, _, _ := newStreamingMinter(0, nil)
+	ctx := context.Background()
+	if err := m.Warm(ctx); err != nil { // gen 1
+		t.Fatalf("warm: %v", err)
+	}
+	if res := m.ReportDegraded(1, "vid", "cap"); !res.Retired { // retires gen 1; sess→nil, gen stays 1
+		t.Fatalf("first report = %+v, want Retired", res)
+	}
+	// Report gen 1 again before any request relaunches the session.
+	res := m.ReportDegraded(1, "vid", "cap")
+	if res.Accepted || res.Generation != 1 {
+		t.Fatalf("second report = %+v, want !Accepted, Generation 1", res)
+	}
+	if got := m.metrics.DegradationReportsAlreadyRetired.Load(); got != 1 {
+		t.Errorf("degradation_reports_already_retired = %d, want 1", got)
+	}
+	if got := m.metrics.DegradationReportsRejectedStale.Load(); got != 0 {
+		t.Errorf("degradation_reports_rejected_stale = %d, want 0 (current gen, not stale)", got)
+	}
+	// The sess==nil case must precede the debounce case: a report-driven retire sets
+	// lastReportRetireAt, so this re-report also satisfies the debounce predicate.
+	// A miscount here (rate_limited == 1) would mean the switch was reordered.
+	if got := m.metrics.DegradationReportsRateLimited.Load(); got != 0 {
+		t.Errorf("degradation_reports_rate_limited = %d, want 0 (already-retired must not route to debounce)", got)
+	}
+}
+
 // A second report within the debounce window is rate-limited.
 func TestMinterReportDegradedRateLimited(t *testing.T) {
 	m, _, _, _ := newStreamingMinter(0, func(string) (browser.PlayerContext, error) {
@@ -1663,7 +1695,7 @@ func TestMinterMetricsSnapshotStreamingFields(t *testing.T) {
 	if v, ok := snap["streaming_suspect_video"]; !ok || v != "" {
 		t.Errorf("streaming_suspect_video = %v (present=%v), want \"\" present", v, ok)
 	}
-	for _, k := range []string{"streaming_recycles", "report_driven_recycles", "degradation_reports_accepted", "degradation_reports_rejected_stale", "degradation_reports_rate_limited"} {
+	for _, k := range []string{"streaming_recycles", "report_driven_recycles", "degradation_reports_accepted", "degradation_reports_rejected_stale", "degradation_reports_already_retired", "degradation_reports_rate_limited"} {
 		if _, ok := snap[k]; !ok {
 			t.Errorf("counter %q missing from the metrics snapshot", k)
 		}

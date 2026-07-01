@@ -66,16 +66,12 @@ func wrapUsageErrors(cmd *cobra.Command) {
 	}
 }
 
-// looksLikeURL reports whether s has a URL scheme instead of being a bare video ID.
-func looksLikeURL(s string) bool {
-	return strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://") || strings.Contains(s, "://")
-}
-
 // validateLandingVideo requires a bare video ID and returns a usage error for
-// invalid input.
+// invalid input. A pasted watch link gets the targeted "not a URL" message
+// instead of the generic charset error.
 func validateLandingVideo(video string) error {
 	switch {
-	case looksLikeURL(video):
+	case browser.LooksLikeWatchURL(video):
 		return &usageError{msg: "provide a bare video ID (for example, aqz-KE-bpKQ), not a URL"}
 	case !browser.ValidVideoID(video):
 		return &usageError{msg: "video ID must contain 1 to 64 letters, digits, underscores, or hyphens"}

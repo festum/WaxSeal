@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/colespringer/waxseal/internal/browser"
@@ -66,6 +67,8 @@ func runGenerate(cmd *cobra.Command, g *genOpts) error {
 		fmt.Fprintln(stdout, "{}")
 		return err
 	}
+	// content_binding is opaque, so a URL-shaped value is warned, not rejected.
+	maybeWarnURLBinding(stderr, g.contentBinding)
 	level := "error"
 	if g.verbose {
 		level = "info"
@@ -97,4 +100,16 @@ func runGenerate(cmd *cobra.Command, g *genOpts) error {
 		"contentBinding": g.contentBinding,
 		"expiresAt":      expires.UTC().Format(time.RFC3339),
 	})
+}
+
+// maybeWarnURLBinding writes a one-line warning to w when binding looks like a
+// pasted watch URL. content_binding is opaque and may legitimately be arbitrary
+// (for example visitor_data), so a URL is flagged, not rejected. The warning goes
+// to stderr, never stdout, because stdout stays reserved for the bgutil {}/token
+// contract. It bypasses the logger because the CLI defaults to error level, where
+// a logger.Warn would be silent for a normal `waxseal -c <url>`.
+func maybeWarnURLBinding(w io.Writer, binding string) {
+	if msg, warn := browser.URLBindingWarningFor("content-binding", binding); warn {
+		fmt.Fprintln(w, "waxseal: warning: "+msg)
+	}
 }
