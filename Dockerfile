@@ -3,21 +3,26 @@
 # WaxSeal is a real-browser PO-token service. The image includes Chromium and
 # drives it through the Chrome DevTools Protocol. Chromium runs with
 # --no-sandbox inside the container, so the container boundary provides the
-# isolation. The image uses a non-root user, and compose.yaml drops capabilities
-# and disables privilege escalation.
+# isolation. The image uses a non-root user, and the compose files drop
+# capabilities and disable privilege escalation.
 
 # build
 FROM golang:1.26-bookworm AS build
 WORKDIR /src
 COPY go.mod go.sum ./
-RUN go mod download
+# The RUNs below mount Go's module and build caches so rebuilds reuse them. The
+# caches never land in an image layer, and go.sum still verifies downloads.
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
 COPY . .
 # Version stamping: pass `--build-arg VERSION=1.2.3`. ARG must be declared in this
 # stage for the RUN to see it.
 ARG VERSION=docker
 # Disable CGO for a pure Go binary. The embedded JavaScript bundle does not remove
 # the runtime dependency on Chromium.
-RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
     -o /out/waxseal ./cmd/waxseal
 
 # runtime

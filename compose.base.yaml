@@ -1,0 +1,50 @@
+# Shared WaxSeal service, extended by compose.yaml (standalone) and
+# compose.full.yaml (daemon plus a consumer). Compose does not auto-load this
+# file; it takes effect only through those two.
+#
+# This base publishes no port. compose.yaml adds one for standalone use;
+# compose.full.yaml leaves the daemon unpublished and reachable only by the
+# consumer over a shared network namespace. The port stays out of the base
+# because `extends` concatenates `ports` rather than replacing them, so a port
+# set here could not be dropped downstream.
+#
+# Chromium runs with --no-sandbox inside the container, so the container boundary
+# is the isolation: non-root user, all capabilities dropped, no new privileges.
+# The Dockerfile sets USER, EXPOSE, and the HEALTHCHECK.
+services:
+  waxseal:
+    build: .
+    image: waxseal:latest
+    container_name: waxseal
+    restart: unless-stopped # tini is PID 1 and reaps Chromium child processes
+    shm_size: "1gb" # working space for headless Chromium
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # Cap log growth for a long-running daemon.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # Chromium memory use is spiky. Add a limit sized to your workload if you need
+    # to cap it; set it too low and Chromium crashes under load.
+    #   deploy:
+    #     resources:
+    #       limits:
+    #         memory: 2g
+    #
+    # A read-only rootfs is an option, but Chromium needs a writable HOME for its
+    # profile. Mount a user-owned tmpfs there if you enable it:
+    #   read_only: true
+    #   volumes:
+    #     - type: tmpfs
+    #       target: /home/waxseal
+    #       tmpfs: { mode: 01777 }
+    #     - type: tmpfs
+    #       target: /tmp
+    #       tmpfs: { mode: 01777 }
+    #
+    # Multi-tenant: consumers send X-API-Key: <key>. Uncomment and set your keys.
+    # command: ["server", "--host", "0.0.0.0", "--tenant-keys", "alice=KEYA,bob=KEYB"]

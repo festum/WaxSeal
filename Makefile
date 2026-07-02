@@ -21,10 +21,22 @@ IMAGE       := $(REGISTRY)/$(IMAGE_OWNER)/waxseal
 # :latest.
 PUSH_LATEST ?= 0
 
-.PHONY: all test jsbundle-browser verify-assets release deps clean \
+.PHONY: all help test jsbundle-browser verify-assets release deps clean \
         docker-build docker-login docker-push release-guard
 
 all: jsbundle-browser
+
+# help lists the common targets; run `make help` to print it.
+help:
+	@echo "WaxSeal make targets:"
+	@echo "  test              offline Go test suite"
+	@echo "  jsbundle-browser  rebuild the embedded browser bundle (needs Node)"
+	@echo "  verify-assets     rebuild the bundle, fail if it differs from the committed bytes"
+	@echo "  release           cross-compile into $(DIST)/ for every target platform"
+	@echo "  docker-build      build the runtime image (VERSION=x.y.z to tag a release)"
+	@echo "  docker-push       publish to $(REGISTRY) (PUSH_LATEST=1 also moves :latest)"
+	@echo "  deps              install the Node toolchain for the bundle"
+	@echo "  clean             remove build output"
 
 # test runs the offline suite. The committed bundle means CI and `go test ./...`
 # do not need Node.
@@ -67,9 +79,11 @@ release:
 # :latest with:
 #   PUSH_LATEST=1 make docker-push VERSION=1.0.0
 
-# docker-build builds the runtime image, tagged VERSION and latest.
+# docker-build builds the runtime image, tagged VERSION and latest. BuildKit is
+# required: the Dockerfile carries a syntax directive and mounts build caches.
 docker-build:
-	docker build --build-arg VERSION=$(VERSION) -t $(IMAGE):$(VERSION) -t $(IMAGE):latest .
+	DOCKER_BUILDKIT=1 docker build --build-arg VERSION=$(VERSION) \
+	  -t $(IMAGE):$(VERSION) -t $(IMAGE):latest .
 
 # release-guard refuses to publish the default/empty VERSION, which would tag an
 # unreleased build and (with PUSH_LATEST=1) repoint the public :latest at it.

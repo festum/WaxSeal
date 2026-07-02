@@ -1,30 +1,13 @@
 # Standalone WaxSeal PO-token service. Run with `docker compose up --build`.
 #
-# Headless Chromium runs with --no-sandbox inside the container, so the container
-# boundary is the isolation: non-root user, all caps dropped, no new privileges,
-# read-only rootfs with tmpfs for the only writable paths.
+# Extends the shared service in compose.base.yaml and publishes the daemon's
+# port. Security settings and the read-only, resource-limit, and multi-tenant
+# options live in that base file. To run the daemon next to a consumer on a
+# shared egress IP, use compose.full.yaml.
 services:
   waxseal:
-    build: .
-    image: waxseal:latest
-    container_name: waxseal
-    restart: unless-stopped # tini is PID 1 and reaps Chromium child processes
+    extends:
+      file: compose.base.yaml
+      service: waxseal
     ports:
       - "127.0.0.1:4416:4416" # loopback only; use "0.0.0.0:4416:4416" or a LAN IP to expose
-    shm_size: "1gb" # working space for headless Chromium
-    cap_drop:
-      - ALL
-    # A read-only rootfs is an option, but Chromium needs a writable HOME for its
-    # profile. Mount a user-owned tmpfs there if you enable it:
-    #   read_only: true
-    #   volumes:
-    #     - type: tmpfs
-    #       target: /home/waxseal
-    #       tmpfs: { mode: 01777 }
-    #     - type: tmpfs
-    #       target: /tmp
-    #       tmpfs: { mode: 01777 }
-    security_opt:
-      - no-new-privileges:true
-    # Multi-tenant: consumers send X-API-Key: <key>. Uncomment and set your keys.
-    # command: ["server", "--host", "0.0.0.0", "--tenant-keys", "alice=KEYA,bob=KEYB"]

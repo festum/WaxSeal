@@ -11,3 +11,7 @@ build/js/node_modules
 compose*.yaml
 Dockerfile
 .dockerignore
+# Never copy local env/secret files into the build context.
+.env
+*.env
+.env.*

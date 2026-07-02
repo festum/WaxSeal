@@ -1,36 +1,36 @@
-# WaxSeal and a consumer sharing one egress IP.
-# Run with `docker compose -f compose.full.yaml up`.
+# WaxSeal plus a consumer, sharing one egress IP.
+# Run with:
+#   CONSUMER_IMAGE=your/image:tag docker compose -f compose.full.yaml up
 #
-# WaxSeal is the PO-token daemon in this repository. WaxTap is a library embedded
-# in a consumer application, not a container. WaxBin is the intended consumer but
-# is not built yet, so the `waxbin` service below is a template. Replace its image
-# and command.
+# WaxSeal is the PO-token daemon in this repository. The `consumer` service
+# stands in for whatever application calls the daemon's API (/get_pot for tokens,
+# /player-context for a streaming context, /session to export the attested
+# identity). Replace its image and command with your own.
 #
-# The PO token is bound to the minting host's egress IP, so the consumer must
+# A PO token is bound to the minting host's egress IP, so the consumer must
 # egress the same IP as WaxSeal. Sharing WaxSeal's network namespace
-# (`network_mode: service:waxseal`) enforces this and lets the consumer reach the
-# daemon at 127.0.0.1:4416.
+# (network_mode: service:waxseal) enforces this and lets the consumer reach the
+# daemon at 127.0.0.1:4416. The daemon inherits no published port from
+# compose.base.yaml, so nothing is exposed to the host; the consumer reaches it
+# over the shared namespace.
 services:
   waxseal:
     extends:
-      file: compose.yaml
+      file: compose.base.yaml
       service: waxseal
-    container_name: waxseal
-    ports: [] # not published; the consumer reaches it over the shared network namespace
 
-  # Template for WaxBin or another application that embeds WaxTap.
-  waxbin:
-    image: ${WAXBIN_IMAGE:-waxbin:latest}
-    network_mode: "service:waxseal" # same network namespace, egress IP, and localhost
+  consumer:
+    # Set CONSUMER_IMAGE to your consumer's image; compose fails fast if unset.
+    image: ${CONSUMER_IMAGE:?set CONSUMER_IMAGE to the image that consumes WaxSeal}
+    network_mode: "service:waxseal" # share the egress IP, localhost, and ports
     depends_on:
       waxseal:
-        condition: service_healthy
+        condition: service_healthy # wait for the daemon's HEALTHCHECK to pass
     restart: "no"
-    # Point the embedded WaxTap at the daemon: /get_pot for tokens, /player-context
-    # for the status-1 streaming context, and /session for the visitor_data and
-    # cookies handoff. For example:
+    # Point the consumer at the daemon on loopback. The endpoint paths are stable;
+    # the variable names are whatever your consumer reads. For example:
     #   environment:
-    #     - WAXSEAL_POTOKEN_URL=http://127.0.0.1:4416
-    #     - WAXSEAL_PLAYER_CONTEXT_URL=http://127.0.0.1:4416/player-context
-    #     - WAXSEAL_SESSION_URL=http://127.0.0.1:4416/session
+    #     - POTOKEN_URL=http://127.0.0.1:4416          # POST /get_pot
+    #     - PLAYER_CONTEXT_URL=http://127.0.0.1:4416/player-context
+    #     - SESSION_URL=http://127.0.0.1:4416/session
     # command: ["..."]
