@@ -1,9 +1,9 @@
-# Standalone WaxSeal PO-token service. Run with `docker compose up --build`.
+# Standalone WaxSeal PO-token service. Run with `docker compose up`.
 #
 # Extends the shared service in compose.base.yaml and publishes the daemon's
-# port. Security settings and the read-only, resource-limit, and multi-tenant
-# options live in that base file. To run the daemon next to a consumer on a
-# shared egress IP, use compose.full.yaml.
+# port. The image, security settings, and the read-only, resource-limit, and
+# multi-tenant options live in that base file. To run the daemon next to a
+# consumer on a shared egress IP, use compose.full.yaml.
 services:
   waxseal:
     extends:

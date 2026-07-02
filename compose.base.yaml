@@ -13,8 +13,9 @@
 # The Dockerfile sets USER, EXPOSE, and the HEALTHCHECK.
 services:
   waxseal:
-    build: .
-    image: waxseal:latest
+    # Pull the released image from GHCR. Pin a release with WAXSEAL_VERSION
+    # (default latest), or run `make docker-build` to build and tag it locally.
+    image: ghcr.io/colespringer/waxseal:${WAXSEAL_VERSION:-latest}
     container_name: waxseal
     restart: unless-stopped # tini is PID 1 and reaps Chromium child processes
     shm_size: "1gb" # working space for headless Chromium

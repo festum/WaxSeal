@@ -54,14 +54,15 @@ jobs:
       - working-directory: provider
         run: go build ./... && go vet ./...
 
-  # Cross-compile the pure Go CLI and daemon. Each binary drives an external
-  # Chromium at runtime.
+  # Cross-compile the pure Go CLI and daemon for the supported targets. Each
+  # binary drives an external Chromium at runtime. Windows is excluded: it
+  # compiles, but the CDP pipe transport does not run there.
   cross:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        goos: [linux, darwin, windows]
+        goos: [linux, darwin]
         goarch: [amd64, arm64]
     steps:
       - uses: actions/checkout@v4
@@ -87,9 +88,10 @@ jobs:
       - name: rebuild and diff against the committed bundle
         run: make verify-assets
 
-  # Build the container image. Running it requires Chromium and network access.
+  # Build the container image to verify the Dockerfile. Running it needs Chromium
+  # and network access.
   docker:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: docker compose -f compose.yaml build
+      - run: DOCKER_BUILDKIT=1 docker build .

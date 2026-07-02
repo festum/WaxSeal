@@ -8,34 +8,65 @@ daemon, a CLI, and reusable Go clients.
 A real browser lets BotGuard inspect the actual navigator and reliably produce
 tokens with the **integrity** grade.
 
-> WaxSeal needs a system Chromium at runtime and auto-detects the executable; set
-> `WAXSEAL_CHROME_BIN` to override it. The Go binary cross-compiles normally but
-> is not self-contained.
+> The container image bundles Chromium. To run the Go binary directly instead,
+> the host needs a system Chromium (auto-detected; set `WAXSEAL_CHROME_BIN` to
+> override), since the binary is not self-contained.
 
 ## Quick start
 
+WaxSeal usually runs as a container (example compose file found in repo), and
+the published image bundles Chromium, so the host needs only Docker:
+
 ```sh
-go build ./...
-go test ./...   # offline unit tests; no browser or network
+docker compose up -d  # pulls ghcr.io/colespringer/waxseal and starts on 127.0.0.1:4416
+```
 
-# Start the daemon on 127.0.0.1:4416.
-go run ./cmd/waxseal server
+That pulls the `:latest` tag; pin a release with `WAXSEAL_VERSION`, for example
+`WAXSEAL_VERSION=1.0.0 docker compose up`. To build the image from source instead
+of pulling, run `make docker-build` first; it tags the same name locally.
 
-# Mint a token, export an attested identity, or get a streaming context.
+The container is ready when its healthcheck passes. The daemon binds its socket
+before browser startup but serves only once `/ping` returns `{"ok":true,...}`;
+startup attests the first tenant, caches a GVS token, and runs a full-length
+streaming proof, usually 10-30 seconds. A mint failure stops startup; a failed
+streaming proof is logged and retried by `/player-context` or `/session`. Once
+ready, call the API:
+
+```sh
 curl -s localhost:4416/get_pot -d '{"content_binding":"<video_id>"}'
 curl -s localhost:4416/session
 curl -s localhost:4416/player-context -d '{"video_id":"<video_id>"}'
-
-# Health and metrics.
 curl -s localhost:4416/ping
 curl -s localhost:4416/metrics
 ```
 
-The daemon binds its socket before browser startup but is ready only when `/ping`
-returns `{"ok":true,...}`. Startup attests the first tenant, caches a GVS token,
-and runs a full-length streaming proof, usually 10-30 seconds. A mint failure
-stops startup; a failed streaming proof is logged and retried by
-`/player-context` or `/session`.
+### Running with a consumer
+
+A PO token is bound to the minting host's egress IP, so a consumer that fetches
+media must egress the same IP as WaxSeal. `compose.full.yaml` runs the daemon and
+a consumer in one network namespace to guarantee that; point `CONSUMER_IMAGE` at
+your application, and the daemon stays unpublished:
+
+```sh
+CONSUMER_IMAGE=your/image:tag docker compose -f compose.full.yaml up
+```
+
+Both `compose.yaml` (standalone) and `compose.full.yaml` extend the shared,
+hardened `compose.base.yaml`; see those files for the read-only, resource-limit,
+and multi-tenant options. Publishing beyond loopback requires API keys, described
+under [Authentication and tenants](#authentication-and-tenants).
+
+### From source
+
+Build and run without Docker, on Linux or macOS (the daemon does not run on
+Windows). This path needs Go and a system Chromium:
+
+```sh
+go build ./...
+go run ./cmd/waxseal server   # start the daemon on 127.0.0.1:4416
+```
+
+The CLI also runs one-shot commands, each against a fresh browser:
 
 ```sh
 go run ./cmd/waxseal -c <content_binding>       # one-shot token
@@ -44,9 +75,8 @@ go run ./cmd/waxseal doctor                     # report identity and token grad
 go run ./cmd/waxseal ping                       # check a running daemon
 ```
 
-One-shot generation launches a fresh browser each time; prefer the warm daemon
-for repeated requests. Commands that take `--video` want a bare video ID, not a
-URL.
+Prefer the warm daemon for repeated requests. Commands that take `--video` want a
+bare video ID, not a URL.
 
 ## HTTP API
 

@@ -8,7 +8,7 @@
 
 VERSION           ?= dev
 DIST              := dist
-RELEASE_PLATFORMS := linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64
+RELEASE_PLATFORMS := linux/amd64 linux/arm64 darwin/amd64 darwin/arm64
 
 BROWSER_BUNDLE_OUT := internal/browser/bg_browser_bundle.js
 
@@ -32,7 +32,7 @@ help:
 	@echo "  test              offline Go test suite"
 	@echo "  jsbundle-browser  rebuild the embedded browser bundle (needs Node)"
 	@echo "  verify-assets     rebuild the bundle, fail if it differs from the committed bytes"
-	@echo "  release           cross-compile into $(DIST)/ for every target platform"
+	@echo "  release           build Linux/macOS amd64+arm64 binaries into $(DIST)/"
 	@echo "  docker-build      build the runtime image (VERSION=x.y.z to tag a release)"
 	@echo "  docker-push       publish to $(REGISTRY) (PUSH_LATEST=1 also moves :latest)"
 	@echo "  deps              install the Node toolchain for the bundle"
@@ -61,13 +61,14 @@ verify-assets:
 	  && echo "OK: rebuilt bundle reproduces the committed bytes" \
 	  || { echo "ERROR: rebuilt bundle differs from the committed bytes"; exit 1; }
 
-# release cross-compiles the CLI/daemon for the GOOS/GOARCH matrix into dist/.
+# release builds the CLI/daemon for Linux and macOS (amd64 and arm64) into dist/.
+# Windows is excluded: it compiles, but the CDP pipe transport does not run there.
 # Each binary embeds the JS bundle but requires a system Chromium at runtime.
 release:
 	@mkdir -p $(DIST)
 	@for p in $(RELEASE_PLATFORMS); do \
-	  os=$${p%/*}; arch=$${p#*/}; ext=""; [ "$$os" = "windows" ] && ext=".exe"; \
-	  out=$(DIST)/waxseal-$$os-$$arch$$ext; \
+	  os=$${p%/*}; arch=$${p#*/}; \
+	  out=$(DIST)/waxseal-$$os-$$arch; \
 	  echo "building $$out"; \
 	  CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch go build -trimpath \
 	    -ldflags "-s -w -X main.version=$(VERSION)" -o $$out ./cmd/waxseal || exit 1; \
