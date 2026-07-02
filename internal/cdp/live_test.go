@@ -1,4 +1,4 @@
-//go:build unix
+//go:build unix && live
 
 package cdp
 
@@ -6,6 +6,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"testing"
 	"time"
@@ -29,6 +30,13 @@ func findChrome(t *testing.T) string {
 		if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
 			return p
 		}
+	}
+	// WAXSEAL_REQUIRE_CHROME turns a missing browser into a hard failure. CI sets
+	// it (=1) on the -tags live step so pipe-transport coverage is lost loudly, not
+	// silently, if the runner image ever stops shipping Chromium. It is parsed as a
+	// bool, so an explicit =0/=false (or unset) still skips gracefully.
+	if require, _ := strconv.ParseBool(os.Getenv("WAXSEAL_REQUIRE_CHROME")); require {
+		t.Fatalf("no chromium found and WAXSEAL_REQUIRE_CHROME is set; install Chromium or set WAXSEAL_CHROME_BIN")
 	}
 	t.Skip("no chromium found; set WAXSEAL_CHROME_BIN")
 	return ""

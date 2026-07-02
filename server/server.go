@@ -236,7 +236,9 @@ func (s *Server) handleGetPot(w http.ResponseWriter, r *http.Request) {
 		ContentBinding string `json:"content_binding"`
 		Scope          string `json:"scope"`
 	}
-	if !decodeJSONBody(w, r, &req, false) {
+	// Lenient: /get_pot is the bgutil-compatible endpoint, so a generic yt-dlp
+	// client's extra fields are ignored rather than rejected.
+	if !decodeJSONBody(w, r, &req, false, false) {
 		return
 	}
 	if req.ContentBinding == "" {
@@ -352,7 +354,11 @@ func playerContextVideoID(w http.ResponseWriter, r *http.Request) (string, bool)
 	var req struct {
 		VideoID string `json:"video_id"`
 	}
-	if !decodeJSONBody(w, r, &req, true) {
+	// Lenient: video_id may instead arrive via the query string, and the
+	// required-field check below already turns a typo'd body key into a clear
+	// "video_id is required", so a body-or-query request need not be rejected over
+	// an unmodeled field.
+	if !decodeJSONBody(w, r, &req, true, false) {
 		return "", false
 	}
 	if req.VideoID == "" {
@@ -441,8 +447,9 @@ func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
 	// Browser proof describes playback in the daemon. A consumer report can still
 	// mark the session suspect after a successful proof. /ping deliberately omits
 	// guest identity data. navigator_webdriver remains because it is a
-	// browser-detection health signal. In failure responses these values come
-	// from a zero HealthSnapshot, so they are unknown or last-known state.
+	// browser-detection health signal. In failure responses these values are
+	// zero-valued, except generation, which carries the last-known generation so
+	// /ping stays consistent with /metrics.
 	body := map[string]any{
 		"ok":                         live,
 		"tenant":                     label,
@@ -553,7 +560,7 @@ func (s *Server) handleReport(w http.ResponseWriter, r *http.Request) {
 		VideoID           string `json:"video_id"`
 		Reason            string `json:"reason"`
 	}
-	if !decodeJSONBody(w, r, &req, false) {
+	if !decodeJSONBody(w, r, &req, false, true) {
 		return
 	}
 	if req.SessionGeneration == 0 {
@@ -740,14 +747,35 @@ func decodeErrMsg(err error) string {
 			return "field \"" + typeErr.Field + "\" has the wrong type"
 		}
 	}
+	// DisallowUnknownFields reports an untyped error whose tail is the client's
+	// own key (`json: unknown field "videoId"`). Echo it so typos are actionable.
+	// The name is the caller's, not Go internals, so this leaks no type info. The
+	// prefix is encoding/json's wording. If a Go upgrade or a json/v2 migration
+	// reworded it, TestDecodeRejectsUnknownField drives the real decoder and would
+	// fail instead of letting this fall back to the generic message.
+	if strings.HasPrefix(err.Error(), "json: unknown field ") {
+		return "request body contains " + strings.TrimPrefix(err.Error(), "json: ")
+	}
 	return "request body contains invalid JSON"
 }
 
 // decodeJSONBody decodes exactly one JSON object from r.Body and limits the body
 // to 1 MiB. It writes an invalid-request response on failure. When allowEmpty
 // is true, an empty body is accepted so the caller can use another input source.
-func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any, allowEmpty bool) bool {
+// When strictFields is true, unknown fields are rejected (see below).
+func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any, allowEmpty, strictFields bool) bool {
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	// strictFields rejects unknown fields so a client typo fails with a 400 instead
+	// of being silently dropped. Only /report enables it, because its optional
+	// fields (video_id, reason) would otherwise swallow a typo'd key with no error.
+	// /get_pot stays lenient: it is the bgutil-compatible endpoint for generic
+	// yt-dlp, whose client POSTs extra fields (proxy, bypass_cache, source_address,
+	// and others) that must be ignored. /player-context stays lenient too. Its one
+	// field is required, so a typo already shows up as "video_id is required", and
+	// leniency keeps the body-or-query fallback working.
+	if strictFields {
+		dec.DisallowUnknownFields()
+	}
 	err := dec.Decode(dst)
 	if allowEmpty && errors.Is(err, io.EOF) {
 		return true

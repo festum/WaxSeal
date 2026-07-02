@@ -745,47 +745,81 @@ type HealthSnapshot struct {
 	StreamingSuspect        bool // a consumer reported this generation degraded
 }
 
+// failHealth is the return value for a non-live Health outcome. Every failure
+// path carries the generation so /ping agrees with /metrics, which reads m.gen
+// directly (it is never reset). One helper means a failure path added later
+// cannot forget the generation and report 0.
+func failHealth(gen uint64, err error) (HealthSnapshot, bool, error) {
+	return HealthSnapshot{Generation: gen}, false, err
+}
+
+// isSuperseded reports whether the live session or generation changed since
+// (sess, gen) were read. A concurrent goroutine can swap the session mid-probe.
+// A result from the old session describes a stale generation, so Health retries
+// instead of reporting it.
+func (m *Minter) isSuperseded(sess minterSession, gen uint64) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.sess != sess || m.gen != gen
+}
+
 // Health probes the existing session and returns a consistent snapshot tied to
 // one generation, plus whether a live session was found. It does not call ensure,
 // so it cannot launch, attest, or recycle an expired session. On probe failure it
 // retires the session only when mintMu is available, which prevents /ping from
 // closing a session that is in use.
 //
-// If another goroutine replaces the session during the probe, Health retries once
-// against the current session.
+// If another goroutine replaces the session during the probe, Health retries
+// against the current session. When the session keeps being replaced across both
+// attempts, Health reports no-session rather than a stale probe failure.
 func (m *Minter) Health(ctx context.Context) (HealthSnapshot, bool, error) {
 	for attempt := 0; attempt < 2; attempt++ {
 		m.mu.Lock()
 		sess, gen := m.sess, m.gen
 		m.mu.Unlock()
 		if sess == nil {
-			return HealthSnapshot{}, false, ErrNoSession
+			return failHealth(gen, ErrNoSession)
 		}
 
 		pctx, cancel := context.WithTimeout(ctx, pingProbeTimeout)
 		err := sess.Ping(pctx)
 		cancel()
 		if err == nil {
+			// A ping can succeed against a session that was already replaced
+			// mid-probe. That result describes a stale generation, so retry the
+			// current session (like the failure path below) instead of reporting the
+			// old one as live.
+			if m.isSuperseded(sess, gen) {
+				continue
+			}
 			return m.healthSnapshot(sess, gen), true, nil
 		}
 		// Cancellation does not imply that the browser is dead.
 		if ctx.Err() != nil {
-			return HealthSnapshot{}, false, ctx.Err()
+			return failHealth(gen, ctx.Err())
 		}
-		// Ignore a failure from a session that was replaced during the probe.
-		m.mu.Lock()
-		superseded := m.sess != sess || m.gen != gen
-		m.mu.Unlock()
-		if superseded && attempt == 0 {
+		// A failure from a session that was replaced during the probe says nothing
+		// about the replacement, so retry against it rather than retiring or
+		// reporting a stale error. Guarding on supersession alone (not `attempt`)
+		// lets a session that keeps churning exhaust the loop and fall through to a
+		// soft no-session, instead of returning a misleading probe-failed (503) for
+		// an already-superseded session on the last attempt.
+		if m.isSuperseded(sess, gen) {
 			continue
 		}
 		if m.mintMu.TryLock() {
 			m.retire(gen, "ping probe failed: "+err.Error(), true)
 			m.mintMu.Unlock()
 		}
-		return HealthSnapshot{}, false, err
+		return failHealth(gen, err)
 	}
-	return HealthSnapshot{}, false, ErrNoSession
+	// Reached when the session was superseded on every attempt: report a soft
+	// no-session rather than a stale failure. Re-read the current generation (gen
+	// is out of scope here) so /ping still reports the last-known N, not 0.
+	m.mu.Lock()
+	gen := m.gen
+	m.mu.Unlock()
+	return failHealth(gen, ErrNoSession)
 }
 
 // healthSnapshot builds a HealthSnapshot for the probed (sess, gen). It reads the

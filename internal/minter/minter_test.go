@@ -902,6 +902,48 @@ func TestMinterHealthDeadPingRetires(t *testing.T) {
 	}
 }
 
+// After a retire leaves no live session, Health still reports the last-known
+// generation. This keeps /ping consistent with /metrics in the retired-but-not-
+// relaunched window, where /metrics reads m.gen (N) directly.
+func TestMinterHealthNoSessionCarriesGeneration(t *testing.T) {
+	m, _, _ := newPingMinter(nil)
+	if err := m.Warm(context.Background()); err != nil {
+		t.Fatalf("warm: %v", err)
+	}
+	gen := m.Generation()
+	if gen == 0 {
+		t.Fatal("warm did not advance the generation")
+	}
+	if !m.retire(gen, "test retire", false) {
+		t.Fatal("retire did not retire the live session")
+	}
+	snap, live, err := m.Health(context.Background())
+	if live || !errors.Is(err, ErrNoSession) {
+		t.Fatalf("Health = (live=%v, %v), want (false, ErrNoSession)", live, err)
+	}
+	if snap.Generation != gen {
+		t.Errorf("no-session snapshot generation = %d, want %d (last-known)", snap.Generation, gen)
+	}
+}
+
+// The probe-fail path is the most regression-prone one. It returns an error and
+// retires the session, but the snapshot must still carry the just-failed
+// generation so /ping reports N, not 0.
+func TestMinterHealthDeadPingCarriesGeneration(t *testing.T) {
+	m, _, _ := newPingMinter(func() error { return errors.New("cdp connection closed") })
+	if err := m.Warm(context.Background()); err != nil {
+		t.Fatalf("warm: %v", err)
+	}
+	gen := m.Generation()
+	snap, live, err := m.Health(context.Background())
+	if live || err == nil {
+		t.Fatalf("Health = (live=%v, %v), want (false, the probe error)", live, err)
+	}
+	if snap.Generation != gen {
+		t.Errorf("probe-fail snapshot generation = %d, want %d (the just-failed gen)", snap.Generation, gen)
+	}
+}
+
 // retire counts a crash once for the current generation and ignores stale ones.
 func TestMinterRetireCrashCount(t *testing.T) {
 	m, _, _, _ := newTestMinter(okMint)
@@ -994,6 +1036,93 @@ func TestMinterHealthReprobesAfterRecycle(t *testing.T) {
 	}
 	if sess1.closed.Load() {
 		t.Error("Health retired the superseded session")
+	}
+}
+
+// A successful probe of a session that was replaced mid-probe must not report the
+// stale generation as live. Health re-probes and reports the current session.
+func TestMinterHealthReprobesAfterRecycleOnSuccess(t *testing.T) {
+	m := NewMinter("v", browser.Options{}, 0, 0)
+	sess2 := &fakeSession{
+		id:   browser.Identity{VisitorData: "vd2"},
+		mint: func(string) (browser.MintResult, error) { return browser.MintResult{Lifetime: 3600}, nil },
+	}
+	sess1 := &fakeSession{
+		id:   browser.Identity{VisitorData: "vd1"},
+		mint: func(string) (browser.MintResult, error) { return browser.MintResult{Lifetime: 3600}, nil },
+		ping: func() error {
+			// Replace the session while its probe runs, but still return success, as
+			// if the old browser had not been torn down yet.
+			m.mu.Lock()
+			m.sess = sess2
+			m.gen++
+			m.mu.Unlock()
+			return nil
+		},
+	}
+	m.mu.Lock()
+	m.sess = sess1
+	m.gen = 1
+	m.attestedAt = time.Now()
+	m.mu.Unlock()
+
+	snap, live, err := m.Health(context.Background())
+	if err != nil || !live {
+		t.Fatalf("Health after a superseded success = (live=%v, %v), want (true, nil)", live, err)
+	}
+	if snap.Identity.VisitorData != "vd2" {
+		t.Errorf("identity = %q, want vd2: a stale success must not win over the replacement", snap.Identity.VisitorData)
+	}
+	if snap.Generation != 2 {
+		t.Errorf("generation = %d, want 2 (the current session)", snap.Generation)
+	}
+}
+
+// When the session is superseded on every probe attempt, Health exhausts its
+// retries and reports a soft no-session (carrying the last-known generation)
+// rather than a stale probe-failed error for an already-replaced session.
+func TestMinterHealthPersistentSupersedeReportsNoSession(t *testing.T) {
+	m := NewMinter("v", browser.Options{}, 0, 0)
+	sess3 := &fakeSession{
+		id:   browser.Identity{VisitorData: "vd3"},
+		mint: func(string) (browser.MintResult, error) { return browser.MintResult{Lifetime: 3600}, nil },
+	}
+	// sess2's probe swaps in sess3 and fails, mirroring sess1 (the second supersede).
+	sess2 := &fakeSession{
+		id:   browser.Identity{VisitorData: "vd2"},
+		mint: func(string) (browser.MintResult, error) { return browser.MintResult{Lifetime: 3600}, nil },
+		ping: func() error {
+			m.mu.Lock()
+			m.sess = sess3
+			m.gen++
+			m.mu.Unlock()
+			return errors.New("probed session was recycled again")
+		},
+	}
+	// sess1's probe swaps in sess2 and fails (the first supersede).
+	sess1 := &fakeSession{
+		id:   browser.Identity{VisitorData: "vd1"},
+		mint: func(string) (browser.MintResult, error) { return browser.MintResult{Lifetime: 3600}, nil },
+		ping: func() error {
+			m.mu.Lock()
+			m.sess = sess2
+			m.gen++
+			m.mu.Unlock()
+			return errors.New("probed session was recycled")
+		},
+	}
+	m.mu.Lock()
+	m.sess = sess1
+	m.gen = 1
+	m.attestedAt = time.Now()
+	m.mu.Unlock()
+
+	snap, live, err := m.Health(context.Background())
+	if live || !errors.Is(err, ErrNoSession) {
+		t.Fatalf("Health under persistent supersession = (live=%v, %v), want (false, ErrNoSession)", live, err)
+	}
+	if snap.Generation != m.Generation() {
+		t.Errorf("snapshot generation = %d, want %d (last-known)", snap.Generation, m.Generation())
 	}
 }
 

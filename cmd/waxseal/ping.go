@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -62,13 +63,22 @@ func runPing(cmd *cobra.Command, p *pingOpts) error {
 	}
 	// Require an explicit host:port. SplitHostPort also rejects bare hosts, extra
 	// colons, and unbalanced brackets.
-	if _, _, err := net.SplitHostPort(p.addr); err != nil {
+	_, port, err := net.SplitHostPort(p.addr)
+	if err != nil {
 		return &usageError{msg: fmt.Sprintf("invalid --addr %q: use host:port (%v)", p.addr, err)}
 	}
-	u := "http://" + p.addr + "/ping"
-	if len(q) > 0 {
-		u += "?" + q.Encode()
+	// Validate the port here so an out-of-range, empty, non-numeric, or signed port
+	// is a usage error (exit 2) rather than a plain dial failure (exit 1), like
+	// `waxseal server --port`. Unlike a listener bind, a client dial to port 0 is
+	// meaningless, so require 1-65535 (not bindListener's 0-65535). ParseUint with
+	// bitSize 16 bounds the upper end and rejects the leading '+' that Atoi accepts.
+	if n, err := strconv.ParseUint(port, 10, 16); err != nil || n < 1 {
+		return &usageError{msg: fmt.Sprintf("invalid --addr %q: port must be 1-65535", p.addr)}
 	}
+	// Build the URL with url.URL instead of string concatenation. p.addr is already
+	// validated as host:port above. An empty RawQuery yields no "?", and
+	// NewRequestWithContext still rejects anything malformed that slips through.
+	u := (&url.URL{Scheme: "http", Host: p.addr, Path: "/ping", RawQuery: q.Encode()}).String()
 	ctx, cancel := context.WithTimeout(cmd.Context(), 100*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)

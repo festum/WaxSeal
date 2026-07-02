@@ -16,7 +16,7 @@ produce tokens with the **integrity** grade.
 
 ```sh
 go build ./...
-go test ./...
+go test ./...   # offline unit tests; no browser or network
 
 # Start the daemon on 127.0.0.1:4416.
 go run ./cmd/waxseal server
@@ -85,6 +85,12 @@ sessions do not contain a Google login.
 `session_generation`. The response includes the signed SABR URL, ustreamer
 config, visitor data, client version, player URL, and audio formats. Consumers
 use the player URL to descramble the SABR URL's throttling nonce.
+
+Select each `audio_formats` entry by its `itag`, `lmt`, and `xtags` **together**,
+never by `itag` alone. The same `itag` can appear more than once. A clean track
+and a DRC track both use `itag` 251 and differ only in `xtags`, so an `itag`-only
+selector is ambiguous. An inconsistent tuple makes the SABR server return a
+player-response reload instead of media.
 
 `playability_status` is YouTube's string status, such as `"OK"`. It is not the
 SABR status-1 protection code, which is embedded in the signed SABR URL.
@@ -161,7 +167,7 @@ descrambled with `player_url` before use.
     {
       "itag": 251,
       "lmt": "1699999999999999",
-      "xtags": "",
+      "xtags": "",                          // clean track
       "mime_type": "audio/webm; codecs=\"opus\"",
       "bitrate": 130000,
       "content_length": 10318791,
@@ -171,6 +177,20 @@ descrambled with `player_url` before use.
       "audio_quality": "AUDIO_QUALITY_MEDIUM",
       "is_drc": false,
       "audio_track_id": ""     // empty for the default or only track
+    },
+    {
+      "itag": 251,                          // Same itag as above. Select by the
+      "lmt": "1699999999999999",            // (itag, lmt, xtags) tuple, never by
+      "xtags": "CggKA2RyYxIBMQ",            // itag alone. This is the DRC variant.
+      "mime_type": "audio/webm; codecs=\"opus\"",
+      "bitrate": 130000,
+      "content_length": 10321456,
+      "approx_duration_ms": 634601,
+      "audio_sample_rate": 48000,
+      "audio_channels": 2,
+      "audio_quality": "AUDIO_QUALITY_MEDIUM",
+      "is_drc": true,
+      "audio_track_id": ""
     }
   ],
   "session_generation": 1
@@ -270,10 +290,26 @@ The two response shapes are the full
 
 Errors from recognized endpoints and unknown paths use the JSON envelope
 `{"error":"human-readable message","code":"machine-readable-code"}`. Unknown
-paths return `not-found`. Non-canonical paths, including paths with `.`, `..`,
-or repeated slashes, are 307-redirected to their cleaned form before a handler
-runs. For `video-unavailable`, the optional `details` field contains the
-playability status.
+paths return `not-found`. For `video-unavailable`, the optional `details` field
+contains the playability status.
+
+Two path shapes are handled by the stock `http.ServeMux` before any WaxSeal
+handler runs (the same cleaning that keeps path traversal safe), and they do
+**not** share the JSON envelope:
+
+- **Non-canonical paths** with `.`, `..`, or repeated slashes (for example
+  `//get_pot`) get a **307** redirect to their cleaned form (with a `Location`
+  header). The redirect body is never the JSON envelope. Per Go's `http.Redirect`
+  it is a short `text/html` snippet for **GET/HEAD** and **empty** for other
+  methods, so `GET //ping` returns HTML while `POST //get_pot` returns an empty
+  body. A client that does not follow redirects must not expect JSON here.
+- A **trailing slash** is a *distinct* path, not a non-canonical one. `/get_pot/`
+  does not match `/get_pot`, so it returns the structured **404 JSON**
+  (`not-found`). Contrast `//get_pot`, which is non-canonical and redirects (307)
+  instead.
+
+`/ping` is a further exception to the envelope, for a different reason. See its
+note further down in this section.
 
 | Code | HTTP | Meaning |
 |---|---:|---|
@@ -285,6 +321,20 @@ playability status.
 | `mint-failed`, `player-context-failed` | 502 | Upstream operation failed |
 | `no-session` | 503 | No attested session is available |
 | `timeout` | 504 | Request processing deadline elapsed for `/get_pot`, `/player-context`, or `/session` |
+
+`/report` decodes strictly. An **unknown field**, often a typo such as `raeson`
+for `reason`, is rejected with **400 `invalid-request`** that names the offending
+key. Its `video_id` and `reason` fields are optional, so a lenient decode would
+accept a report that silently lost them, while strict decoding surfaces the typo.
+This assumes the daemon and its clients are version-aligned, which holds for the
+co-released WaxSeal, WaxTap, and WaxBin. **`/get_pot` and `/player-context` stay
+lenient** and ignore unknown fields. `/get_pot` is the bgutil-compatible
+endpoint, and a generic yt-dlp client POSTs extra fields such as `proxy`,
+`bypass_cache`, and `source_address` that must be tolerated. `/player-context`
+reads `video_id` from the body *or* the query string, so an unmodeled body field
+must not block the query fallback (a missing `video_id` still fails clearly as
+`video_id is required`). Duplicate keys stay lenient everywhere, since stock
+`encoding/json` keeps the last value.
 
 `/ping` is the exception: after authentication it returns HTTP 200 by default,
 with either `ok:true` or `ok:false`. An always-present `reason` field
@@ -366,6 +416,13 @@ The `crashes` metric counts unexpected browser loss detected by Chromium events
 or a failed health probe. Session retirement caused by age, a consumer report,
 or operation retries does not increment it.
 
+The per-tenant `--report-debounce` (default `5m`) throttles **all**
+report-driven recycles for a tenant across generations, not just repeated reports
+of one generation. This is intentional anti-relaunch-storm behavior. A burst of
+genuine degradations, including of a freshly-minted *replacement* generation, can
+be rate-limited and return `retry_after_seconds`. Operators whose workloads see
+legitimately bursty degradations may lower `--report-debounce`.
+
 Use `go run ./cmd/waxseal server --help` for configuration options, including
 session recycling, report debounce, bind address, headful mode, and metrics
 access (`--metrics-key`, `--metrics-public`).
@@ -378,10 +435,21 @@ unknown path returns the structured 404 (see [Errors](#errors)).
 ## Development
 
 ```sh
-go test ./...           # offline unit tests
-make deps               # install browser-bundle build dependencies
-make jsbundle-browser   # regenerate internal/browser/bg_browser_bundle.js
+go test ./...                       # offline unit tests; no browser or network
+go test -tags live ./internal/cdp   # real-Chromium CDP pipe-transport tests
+(cd provider && go test -tags e2e ./...)   # provider network e2e; needs WAXSEAL_URL/WAXSEAL_KEY
+make deps                           # install browser-bundle build dependencies
+make jsbundle-browser               # regenerate internal/browser/bg_browser_bundle.js
 ```
+
+`go test ./...` is fully offline and deterministic. It spawns no browser and
+makes no network calls. The real-Chromium CDP tests are gated behind the `live`
+build tag and self-skip when no browser is found (set `WAXSEAL_CHROME_BIN` to
+override the search). CI installs a browser and runs them. The `e2e` tests live
+in the nested `provider/` module, so they must be run from that directory. A
+root-level `go test -tags e2e ./...` does not descend into a nested module and
+silently runs nothing. They need a warm daemon (`WAXSEAL_URL`, optional
+`WAXSEAL_KEY`).
 
 The committed browser bundle means normal Go builds do not require Node. The
 `client` package is a reusable, WaxTap-free HTTP client. The separate
@@ -389,6 +457,28 @@ The committed browser bundle means normal Go builds do not require Node. The
 
 CLI exit codes are `0` for success, `1` for runtime failure, `2` for usage
 errors, `3` for unavailable videos, and `130` for interruption.
+
+### Manual & soak testing
+
+Some coverage is deliberately kept out of `go test ./...` because it needs a
+browser, the network, a display, or a long run. Exercise it on demand:
+
+- **Real-Chromium CDP**: `go test -tags live ./internal/cdp` drives a local
+  Chromium over the pipe transport and needs no network. Set `WAXSEAL_CHROME_BIN`
+  to pick the browser, or `WAXSEAL_REQUIRE_CHROME=1` to fail instead of skip when
+  none is found (CI sets this so it cannot silently lose coverage).
+- **Provider e2e**: run from the nested module with `cd provider && go test -tags
+  e2e ./...` against a warm daemon (`WAXSEAL_URL`, optional `WAXSEAL_KEY`),
+  including the flagship full-length WEB SABR download (`cd provider && go test
+  -tags e2e -run PlayerContextOnlyFullLength ./...`).
+- **Time-based recycling soak**: run the daemon with a short `--streaming-max-age`
+  and stream continuously to watch armed-deadline recycles and
+  `streaming_seconds_until_recycle` over a long window.
+- **Cache-exhaustion loop**: POST `/get_pot` 1000+ times with distinct
+  `content_binding` values to exercise the mint cache and negative-cache eviction
+  at capacity.
+- **Headful mode**: `go run ./cmd/waxseal server --headful` to watch the real
+  browser drive a session (needs a display).
 
 ## License
 

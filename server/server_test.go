@@ -134,6 +134,12 @@ func TestPlayerContextVideoID(t *testing.T) {
 		{name: "body", body: `{"video_id":"VID"}`, wantID: "VID", wantOK: true},
 		{name: "empty body + query", body: "", query: "?video_id=QID", wantID: "QID", wantOK: true},
 		{name: "body wins over query", body: `{"video_id":"BID"}`, query: "?video_id=QID", wantID: "BID", wantOK: true},
+		// Lenient decode: an unmodeled body key does not block the query fallback
+		// (a typo'd body field is ignored, and the query video_id is used).
+		{name: "unknown body field falls through to query", body: `{"videoId":"abc"}`, query: "?video_id=QID", wantID: "QID", wantOK: true},
+		// With no query fallback, a typo'd field still surfaces via the required-field
+		// check instead of being dropped silently.
+		{name: "unknown body field alone is required-error", body: `{"videoId":"abc"}`, wantOK: false, wantCode: http.StatusBadRequest, wantMsg: "video_id is required"},
 		{name: "empty body no query", body: "", wantOK: false, wantCode: http.StatusBadRequest},
 		{name: "empty json no query", body: `{}`, wantOK: false, wantCode: http.StatusBadRequest},
 		{name: "malformed json", body: `{not json`, wantOK: false, wantCode: http.StatusBadRequest},
@@ -493,6 +499,7 @@ func TestDecodeErrMsg(t *testing.T) {
 		{"type mismatch field", &json.UnmarshalTypeError{Field: "content_binding", Value: "number"}, `field "content_binding" has the wrong type`},
 		{"type mismatch nested", &json.UnmarshalTypeError{Field: "a.b", Value: "number"}, "request body contains a field with the wrong type"},
 		{"syntax error", &json.SyntaxError{}, "request body contains malformed JSON"},
+		{"unknown field", errors.New(`json: unknown field "videoId"`), `request body contains unknown field "videoId"`},
 		{"plain error", errors.New("boom"), "request body contains invalid JSON"},
 	}
 	for _, tt := range tests {
@@ -507,17 +514,118 @@ func TestDecodeErrMsg(t *testing.T) {
 	}
 }
 
-// postGetPot sends a request with a valid API key through the full server mux.
-func postGetPot(body string) *httptest.ResponseRecorder {
+// postKeyed sends body to path on a keyed daemon through the full server mux. No
+// live session is needed because the decoder runs right after auth.
+func postKeyed(path, body string) *httptest.ResponseRecorder {
 	s := &Server{
 		tenants: minter.NewTenants(nil, "", map[string]string{"K": "alice"}, browser.Options{}, 0, 0),
 		log:     slog.New(slog.DiscardHandler),
 	}
-	r := httptest.NewRequest(http.MethodPost, "/get_pot", strings.NewReader(body))
+	r := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
 	r.Header.Set("X-API-Key", "K")
 	w := httptest.NewRecorder()
 	s.routes().ServeHTTP(w, r)
 	return w
+}
+
+// TestDecodeRejectsUnknownField checks DisallowUnknownFields on /report, whose
+// optional fields would otherwise swallow a typo'd key with no error. A client
+// typo returns a 400 invalid-request that names the offending key. /get_pot and
+// /player-context are excluded here because they are lenient (see
+// TestGetPotToleratesBgutilFields and TestPlayerContextVideoID).
+func TestDecodeRejectsUnknownField(t *testing.T) {
+	cases := []struct {
+		name, path, body, want string
+	}{
+		{"report camelCase typo", "/report", `{"session_generation":1,"videoId":"x"}`, `request body contains unknown field "videoId"`},
+		{"report extra field", "/report", `{"session_generation":1,"typo":1}`, `request body contains unknown field "typo"`},
+		// Without strict decode, "raeson" would be dropped and the report accepted
+		// with no reason at all.
+		{"report typo'd optional reason", "/report", `{"session_generation":1,"raeson":"truncated"}`, `request body contains unknown field "raeson"`},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			w := postKeyed(tt.path, tt.body)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d (%q)", w.Code, http.StatusBadRequest, w.Body.String())
+			}
+			var env struct {
+				Error string `json:"error"`
+				Code  string `json:"code"`
+			}
+			if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+				t.Fatalf("error body is not JSON: %v (%q)", err, w.Body.String())
+			}
+			if env.Code != CodeInvalidRequest {
+				t.Errorf("code = %q, want %q", env.Code, CodeInvalidRequest)
+			}
+			if env.Error != tt.want {
+				t.Errorf("message = %q, want %q", env.Error, tt.want)
+			}
+		})
+	}
+}
+
+// TestGetPotToleratesBgutilFields checks that /get_pot stays lenient for the
+// bgutil/yt-dlp use case. The plugin's extra request fields are ignored rather
+// than rejected. The request reaches the content_binding required-field check,
+// which proves the decoder accepted the unknown fields, instead of failing as an
+// unknown field.
+func TestGetPotToleratesBgutilFields(t *testing.T) {
+	// The field set the real yt-dlp bgutil HTTP plugin POSTs, with an empty
+	// content_binding so the request stops at the required-field check rather than
+	// attempting a real mint.
+	body := `{"content_binding":"","bypass_cache":false,"challenge":"c","disable_tls_verification":true,"proxy":"http://p","innertube_context":{"client":{}},"source_address":"0.0.0.0"}`
+	w := postGetPot(body)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d (%q)", w.Code, http.StatusBadRequest, w.Body.String())
+	}
+	var env struct {
+		Error string `json:"error"`
+		Code  string `json:"code"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("error body is not JSON: %v (%q)", err, w.Body.String())
+	}
+	if strings.Contains(env.Error, "unknown field") {
+		t.Fatalf("bgutil request rejected as an unknown field: %q", env.Error)
+	}
+	if !strings.HasPrefix(env.Error, "content_binding is required") {
+		t.Errorf("message = %q, want the content_binding-required message", env.Error)
+	}
+}
+
+// TestDecodeSecondObjectStaysGeneric checks that DisallowUnknownFields on the
+// second decode does not leak a field name. On a strict endpoint, a trailing
+// object still returns the generic single-object message rather than "unknown
+// field".
+func TestDecodeSecondObjectStaysGeneric(t *testing.T) {
+	w := postKeyed("/report", `{"session_generation":1} {"typo":1}`)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+	var env struct {
+		Error string `json:"error"`
+		Code  string `json:"code"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("error body is not JSON: %v (%q)", err, w.Body.String())
+	}
+	if env.Code != CodeInvalidRequest {
+		t.Errorf("code = %q, want %q", env.Code, CodeInvalidRequest)
+	}
+	if env.Error != "request body must be a single JSON object" {
+		t.Errorf("message = %q, want the generic single-object message", env.Error)
+	}
+	if strings.Contains(env.Error, "typo") {
+		t.Errorf("message %q leaked the second object's field name", env.Error)
+	}
+}
+
+// postGetPot posts body to /get_pot on a keyed daemon through the full server
+// mux (see postKeyed).
+func postGetPot(body string) *httptest.ResponseRecorder {
+	return postKeyed("/get_pot", body)
 }
 
 func TestGetPotArrayBodyDoesNotLeakType(t *testing.T) {

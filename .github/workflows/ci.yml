@@ -9,9 +9,10 @@ permissions:
   contents: read
 
 jobs:
-  # Build, vet, and run race tests without network access. The committed browser
-  # bundle removes the Node dependency. Live YouTube and BotGuard tests run
-  # manually because they require Chromium and network access.
+  # Build, vet, and run the offline race tests, plus the real-Chromium CDP
+  # pipe-transport tests (-tags live) against a pinned browser. The committed
+  # browser bundle removes the Node dependency. Only the network YouTube and
+  # BotGuard e2e (-tags e2e) still run manually, needing network access.
   test:
     runs-on: ubuntu-latest
     steps:
@@ -23,6 +24,23 @@ jobs:
       - run: go build ./...
       - run: go vet ./...
       - run: go test -race ./...
+      # Real-Chromium CDP live tests. Install Chrome explicitly so a browser is
+      # guaranteed present, not incidental to the ubuntu-latest image. The stable
+      # channel floats. It tracks current Chrome by design (matching what BotGuard
+      # sees in production), so a new stable release can legitimately move these
+      # tests. Pin a version here if deterministic CI matters more. The
+      # WAXSEAL_REQUIRE_CHROME hook makes a missing browser fail loudly instead of
+      # skipping. The tests drive a local Chromium over the pipe transport and need
+      # no network.
+      - id: setup-chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+      - name: CDP live tests (real Chromium, pipe transport)
+        env:
+          WAXSEAL_CHROME_BIN: ${{ steps.setup-chrome.outputs.chrome-path }}
+          WAXSEAL_REQUIRE_CHROME: "1"
+        run: go test -race -tags live ./internal/cdp
 
   # Build and vet the nested WaxTap adapter module separately.
   provider:

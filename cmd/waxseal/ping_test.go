@@ -10,7 +10,7 @@ import (
 )
 
 // Bad --addr values should be usage errors (exit 2), not nil-request panics. URL
-// input is rejected before request construction; the rest fail URL parsing.
+// input is rejected before request construction. The rest fail URL parsing.
 func TestPingCLIInvalidAddr(t *testing.T) {
 	for _, addr := range []string{
 		"http://127.0.0.1:4416", // URL instead of host:port
@@ -30,6 +30,33 @@ func TestPingCLIInvalidAddr(t *testing.T) {
 			}
 			if _, ok := errors.AsType[*usageError](err); !ok {
 				t.Fatalf("addr %q: error %v is not a *usageError", addr, err)
+			}
+			if got := exitCodeFor(err); got != 2 {
+				t.Errorf("addr %q: exit code = %d, want 2", addr, got)
+			}
+		})
+	}
+}
+
+// An out-of-range, zero, empty, non-numeric, or signed port gets the clear
+// "port must be 1-65535" usage message (exit 2), not a generic parse error at
+// dial time. The signed case (:+80) guards the ParseUint-over-Atoi choice.
+func TestPingCLIPortRangeMessage(t *testing.T) {
+	for _, addr := range []string{
+		"127.0.0.1:99999", // out of range
+		"127.0.0.1:0",     // port 0 is meaningless for a client dial
+		"127.0.0.1:",      // empty port
+		"127.0.0.1:http",  // named (non-numeric) port
+		"127.0.0.1:+80",   // leading sign Atoi would accept but a port cannot carry
+	} {
+		t.Run(addr, func(t *testing.T) {
+			c := newPingCmd()
+			c.SetArgs([]string{"--addr", addr})
+			c.SetOut(io.Discard)
+			c.SetErr(io.Discard)
+			err := c.Execute()
+			if err == nil || !strings.Contains(err.Error(), "port must be 1-65535") {
+				t.Fatalf("addr %q: error = %v, want it to contain %q", addr, err, "port must be 1-65535")
 			}
 			if got := exitCodeFor(err); got != 2 {
 				t.Errorf("addr %q: exit code = %d, want 2", addr, got)
