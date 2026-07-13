@@ -13,7 +13,7 @@ RELEASE_PLATFORMS := linux/amd64 linux/arm64 darwin/amd64 darwin/arm64
 BROWSER_BUNDLE_OUT := internal/browser/bg_browser_bundle.js
 
 REGISTRY    ?= ghcr.io
-IMAGE_OWNER ?= colespringer
+IMAGE_OWNER ?= festum
 IMAGE       := $(REGISTRY)/$(IMAGE_OWNER)/waxseal
 
 # PUSH_LATEST controls whether docker-push moves the :latest tag. The default

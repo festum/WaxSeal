@@ -60,5 +60,5 @@ jobs:
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           make docker-build VERSION="$VERSION"
-          docker push "ghcr.io/colespringer/waxseal:$VERSION"
-          docker push "ghcr.io/colespringer/waxseal:latest"
+          docker push "ghcr.io/festum/waxseal:$VERSION"
+          docker push "ghcr.io/festum/waxseal:latest"
