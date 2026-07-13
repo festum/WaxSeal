@@ -11,7 +11,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/colespringer/waxseal/internal/httpx"
+	"github.com/festum/waxseal/internal/httpx"
 )
 
 // Wire constants. WAA requires a WebKit user agent. Other user agents produce

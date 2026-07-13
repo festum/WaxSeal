@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/colespringer/waxseal/client"
-	"github.com/colespringer/waxseal/server"
+	"github.com/festum/waxseal/client"
+	"github.com/festum/waxseal/server"
 )
 
 // recoveryBudget leaves enough time for relaunch, attestation, and establishment.

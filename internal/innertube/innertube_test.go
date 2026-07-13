@@ -8,8 +8,8 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/colespringer/waxseal/internal/botguard"
-	"github.com/colespringer/waxseal/internal/httpx"
+	"github.com/festum/waxseal/internal/botguard"
+	"github.com/festum/waxseal/internal/httpx"
 )
 
 func TestParseBGChallenge(t *testing.T) {

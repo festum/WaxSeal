@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/colespringer/waxseal/internal/cdp"
+	"github.com/festum/waxseal/internal/cdp"
 )
 
 // Close must run dispose once even when called concurrently. Run this test under

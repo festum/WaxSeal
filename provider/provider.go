@@ -10,7 +10,7 @@ import (
 	"log/slog"
 	"strings"
 
-	"github.com/colespringer/waxseal/client"
+	"github.com/festum/waxseal/client"
 	"github.com/colespringer/waxtap/v2/potoken"
 )
 

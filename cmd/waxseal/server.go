@@ -12,9 +12,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/colespringer/waxseal/internal/browser"
-	"github.com/colespringer/waxseal/internal/minter"
-	"github.com/colespringer/waxseal/server"
+	"github.com/festum/waxseal/internal/browser"
+	"github.com/festum/waxseal/internal/minter"
+	"github.com/festum/waxseal/server"
 	"github.com/spf13/cobra"
 )
 
@@ -240,6 +240,10 @@ func runServer(cmd *cobra.Command, o *serverOpts) error {
 	// Validate configuration before binding a socket or launching Chromium.
 	if err := validateLandingVideo(o.video); err != nil {
 		return failStartup(logger, err)
+	}
+	// Log the proof-video list so operators can confirm WAXSEAL_PROOF_VIDEOS.
+	if v, ok := os.LookupEnv("WAXSEAL_PROOF_VIDEOS"); ok && strings.TrimSpace(v) != "" {
+		logger.Info("proof video list overridden via WAXSEAL_PROOF_VIDEOS", "value", v)
 	}
 	streamingMaxAge, err := resolveStreamingMaxAge(cmd, o, logger)
 	if err != nil {

@@ -6,7 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/colespringer/waxseal/internal/browser"
+	"github.com/festum/waxseal/internal/browser"
 	"io"
 	"log/slog"
 	"math/rand/v2"

@@ -1,4 +1,4 @@
-module github.com/colespringer/waxseal
+module github.com/festum/waxseal
 
 go 1.26.3
 

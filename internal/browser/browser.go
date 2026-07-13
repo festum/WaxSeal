@@ -17,15 +17,15 @@ import (
 	"sync"
 	"time"
 
-	"github.com/colespringer/waxseal/internal/botguard"
-	"github.com/colespringer/waxseal/internal/cdp"
-	"github.com/colespringer/waxseal/internal/httpx"
-	"github.com/colespringer/waxseal/internal/innertube"
+	"github.com/festum/waxseal/internal/botguard"
+	"github.com/festum/waxseal/internal/cdp"
+	"github.com/festum/waxseal/internal/httpx"
+	"github.com/festum/waxseal/internal/innertube"
 )
 
 // DefaultVideo is the landing video used to capture the browser identity. It is
 // Blender's Creative Commons movie "Big Buck Bunny."
-const DefaultVideo = "aqz-KE-bpKQ"
+const DefaultVideo = "jNQXAC9IVRw"
 
 // playerContextTimeout bounds how long PlayerContext waits for the player to load
 // a video and expose its status-1 getPlayerResponse result.
@@ -1389,10 +1389,43 @@ type FullLengthProbe struct {
 
 // proofCandidates lists fallback videos for full-length playback checks.
 // Candidates are ordered by preference.
-var proofCandidates = []string{
-	DefaultVideo,  // Big Buck Bunny
-	"R6MlUcmOul8", // Tears of Steel
-	"1UaBgr_sq9A", // NASA
+//
+// The list can be overridden at runtime by setting WAXSEAL_PROOF_VIDEOS to a
+// comma-separated list of YouTube video IDs, e.g.:
+//
+//	WAXSEAL_PROOF_VIDEOS=jNQXAC9IVRw,dQw4w9WgXcQ
+//
+// Invalid or empty entries are silently ignored. When the environment variable
+// is absent or empty the built-in defaults are used.
+var proofCandidates = resolveProofCandidates()
+
+// defaultProofCandidates is the built-in fallback list used when
+// WAXSEAL_PROOF_VIDEOS is not set.
+var defaultProofCandidates = []string{
+	DefaultVideo,  // Me at the zoo (first YT video)
+	"dQw4w9WgXcQ", // Rick Astley
+	"9bZkp7q19f0", // Gangnam Style
+}
+
+// resolveProofCandidates reads WAXSEAL_PROOF_VIDEOS and returns the parsed
+// list, falling back to defaultProofCandidates when the variable is absent or
+// yields no valid IDs.
+func resolveProofCandidates() []string {
+	raw, ok := os.LookupEnv("WAXSEAL_PROOF_VIDEOS")
+	if !ok || strings.TrimSpace(raw) == "" {
+		return defaultProofCandidates
+	}
+	var out []string
+	for _, id := range strings.Split(raw, ",") {
+		id = strings.TrimSpace(id)
+		if ValidVideoID(id) {
+			out = append(out, id)
+		}
+	}
+	if len(out) == 0 {
+		return defaultProofCandidates
+	}
+	return out
 }
 
 // establishFromCandidates tries candidates until one proves full-length

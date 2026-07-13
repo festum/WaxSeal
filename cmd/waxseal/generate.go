@@ -7,7 +7,7 @@ import (
 	"io"
 	"time"
 
-	"github.com/colespringer/waxseal/internal/browser"
+	"github.com/festum/waxseal/internal/browser"
 	"github.com/spf13/cobra"
 )
 

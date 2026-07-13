@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/colespringer/waxseal/internal/browser"
+	"github.com/festum/waxseal/internal/browser"
 	"strings"
 	"sync"
 	"sync/atomic"

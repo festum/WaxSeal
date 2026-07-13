@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 
-	"github.com/colespringer/waxseal/internal/httpx"
+	"github.com/festum/waxseal/internal/httpx"
 )
 
 // GenerateITResult preserves integrity and fallback tokens separately. A valid

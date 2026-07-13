@@ -17,8 +17,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/colespringer/waxseal/internal/browser"
-	"github.com/colespringer/waxseal/internal/minter"
+	"github.com/festum/waxseal/internal/browser"
+	"github.com/festum/waxseal/internal/minter"
 )
 
 // setMetricsKey configures the operator metrics key the same way server.New

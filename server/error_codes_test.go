@@ -3,8 +3,8 @@ package server_test
 import (
 	"testing"
 
-	"github.com/colespringer/waxseal/client"
-	"github.com/colespringer/waxseal/server"
+	"github.com/festum/waxseal/client"
+	"github.com/festum/waxseal/server"
 )
 
 // TestErrorCodeContract keeps the server and client constants aligned with the

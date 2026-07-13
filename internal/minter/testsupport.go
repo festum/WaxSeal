@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/colespringer/waxseal/internal/browser"
+	"github.com/festum/waxseal/internal/browser"
 )
 
 // InjectSessionForTest installs sess as generation 1 for the tenant selected by

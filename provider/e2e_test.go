@@ -15,9 +15,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/colespringer/waxseal/client"
-	"github.com/colespringer/waxseal/provider"
-	"github.com/colespringer/waxseal/server"
+	"github.com/festum/waxseal/client"
+	"github.com/festum/waxseal/provider"
+	"github.com/festum/waxseal/server"
 	waxtap "github.com/colespringer/waxtap/v2"
 	"github.com/colespringer/waxtap/v2/potoken"
 )

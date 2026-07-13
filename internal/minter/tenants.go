@@ -3,7 +3,7 @@ package minter
 import (
 	"context"
 	"errors"
-	"github.com/colespringer/waxseal/internal/browser"
+	"github.com/festum/waxseal/internal/browser"
 	"log/slog"
 	"sync"
 	"time"

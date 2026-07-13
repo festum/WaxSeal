@@ -1,9 +1,9 @@
-module github.com/colespringer/waxseal/provider
+module github.com/festum/waxseal/provider
 
 go 1.26.3
 
 require (
-	github.com/colespringer/waxseal v0.0.0-00010101000000-000000000000
+	github.com/festum/waxseal v0.0.0-00010101000000-000000000000
 	github.com/colespringer/waxtap/v2 v2.0.0
 )
 
@@ -16,4 +16,4 @@ require (
 	google.golang.org/protobuf v1.36.11 // indirect
 )
 
-replace github.com/colespringer/waxseal => ../
+replace github.com/festum/waxseal => ../

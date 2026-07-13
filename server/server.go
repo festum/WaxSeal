@@ -19,8 +19,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/colespringer/waxseal/internal/browser"
-	"github.com/colespringer/waxseal/internal/minter"
+	"github.com/festum/waxseal/internal/browser"
+	"github.com/festum/waxseal/internal/minter"
 )
 
 // Config configures a Server. The zero value is usable: keyless, loopback, a

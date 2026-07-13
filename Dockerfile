@@ -43,12 +43,15 @@ RUN useradd --create-home --uid 10001 waxseal
 COPY --from=build /out/waxseal /usr/local/bin/waxseal
 
 # Link the GHCR package to the source repository.
-LABEL org.opencontainers.image.source="https://github.com/ColeSpringer/WaxSeal" \
+LABEL org.opencontainers.image.source="https://github.com/festum/WaxSeal" \
       org.opencontainers.image.description="YouTube PO-token service running BotGuard in a real headless Chromium" \
       org.opencontainers.image.licenses="MIT"
 
 ENV WAXSEAL_CHROME_BIN=/usr/bin/chromium \
     HOME=/home/waxseal
+# Optional: set WAXSEAL_PROOF_VIDEOS to a comma-separated list of YouTube video
+# IDs to override the built-in proof-video fallback list, e.g.:
+#   -e WAXSEAL_PROOF_VIDEOS=jNQXAC9IVRw,dQw4w9WgXcQ
 USER waxseal
 EXPOSE 4416
 

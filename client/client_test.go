@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/colespringer/waxseal/client"
+	"github.com/festum/waxseal/client"
 )
 
 func TestPOToken(t *testing.T) {

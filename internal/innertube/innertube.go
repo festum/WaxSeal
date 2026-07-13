@@ -13,8 +13,8 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/colespringer/waxseal/internal/botguard"
-	"github.com/colespringer/waxseal/internal/httpx"
+	"github.com/festum/waxseal/internal/botguard"
+	"github.com/festum/waxseal/internal/httpx"
 )
 
 const (

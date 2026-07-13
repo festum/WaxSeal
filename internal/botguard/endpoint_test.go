@@ -8,7 +8,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/colespringer/waxseal/internal/httpx"
+	"github.com/festum/waxseal/internal/httpx"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
