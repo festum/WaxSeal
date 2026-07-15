@@ -36,5 +36,19 @@ jobs:
             --strategy-option=ours \
             -m "chore: sync upstream ColeSpringer/WaxSeal"
 
+      - name: Fix upstream import paths (colespringer → festum)
+        run: |
+          # Replace any lingering upstream module paths introduced by the merge
+          find . -name "*.go" -not -path "./.git/*" \
+            -exec grep -l "github.com/colespringer/waxseal" {} \; \
+            | xargs -r sed -i 's|github.com/colespringer/waxseal|github.com/festum/waxseal|g'
+          # Also fix go.mod / go.sum in subdirectories (e.g. provider/)
+          find . -name "go.mod" -not -path "./.git/*" \
+            -exec sed -i 's|github.com/colespringer/waxseal|github.com/festum/waxseal|g' {} \;
+          if ! git diff --quiet; then
+            git add -A
+            git commit -m "fix: rewrite upstream import paths colespringer→festum after sync"
+          fi
+
       - name: Push to fork
         run: git push origin main
