@@ -1,10 +1,10 @@
 module github.com/festum/waxseal/provider
 
-go 1.26.3
+go 1.26
 
 require (
 	github.com/festum/waxseal v0.0.0-00010101000000-000000000000
-	github.com/colespringer/waxtap/v2 v2.0.0
+	github.com/colespringer/waxtap/v2 v2.0.1
 )
 
 require (
