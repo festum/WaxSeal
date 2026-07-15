@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/colespringer/waxseal/internal/botguard"
+	"github.com/festum/waxseal/internal/botguard"
 )
 
 // TestClassifyAttestation covers the integrity-vs-fallback decision and the
