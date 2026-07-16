@@ -11,7 +11,7 @@ import (
 	"strings"
 
 	"github.com/colespringer/waxseal/client"
-	"github.com/colespringer/waxtap/v2/potoken"
+	"github.com/colespringer/waxtap/v3/potoken"
 )
 
 // ErrUnsupportedScope is returned for a scope WaxSeal does not serve, such as

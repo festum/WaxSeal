@@ -13,7 +13,7 @@ import (
 
 	"github.com/colespringer/waxseal/client"
 	"github.com/colespringer/waxseal/provider"
-	"github.com/colespringer/waxtap/v2/potoken"
+	"github.com/colespringer/waxtap/v3/potoken"
 )
 
 func newProvider(h http.HandlerFunc) (*provider.Provider, func()) {
