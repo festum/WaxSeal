@@ -8,8 +8,8 @@ require (
 )
 
 require (
-	github.com/colespringer/waxflow v0.0.0-20260716152333-d6c56fdb679e // indirect
-	github.com/colespringer/waxlabel v1.0.0 // indirect
+	github.com/colespringer/waxflow v0.0.0-20260717210521-8b85b5ba577e // indirect
+	github.com/colespringer/waxlabel v1.2.0 // indirect
 	github.com/dlclark/regexp2 v1.11.5 // indirect
 	github.com/dop251/goja v0.0.0-20260311135729-065cd970411c // indirect
 	github.com/go-sourcemap/sourcemap v2.1.4+incompatible // indirect
