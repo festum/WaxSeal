@@ -8,7 +8,7 @@ require (
 )
 
 require (
-	github.com/colespringer/waxflow v0.0.0-20260724175608-9ef61dbc2ca8 // indirect
+	github.com/colespringer/waxflow v0.0.0-20260729081043-5ac6bd289b38 // indirect
 	github.com/colespringer/waxlabel v1.2.0 // indirect
 	github.com/dlclark/regexp2 v1.11.5 // indirect
 	github.com/dop251/goja v0.0.0-20260311135729-065cd970411c // indirect
