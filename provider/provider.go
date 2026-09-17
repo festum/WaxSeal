@@ -19,7 +19,7 @@ import (
 	"time"
 
 	"github.com/festum/waxseal/client"
-	"github.com/colespringer/waxtap/v2/potoken"
+	"github.com/festum/waxtap/v2/potoken"
 )
 
 // Endpoint labels and paths. The label names this adapter in the errors WaxTap

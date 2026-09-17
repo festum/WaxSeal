@@ -17,7 +17,7 @@ import (
 
 	"github.com/festum/waxseal/client"
 	"github.com/festum/waxseal/provider"
-	"github.com/colespringer/waxtap/v2/potoken"
+	"github.com/festum/waxtap/v2/potoken"
 )
 
 func newProvider(h http.HandlerFunc) (*provider.Provider, func()) {

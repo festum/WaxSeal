@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/colespringer/waxseal/internal/chromepath"
+	"github.com/festum/waxseal/internal/chromepath"
 )
 
 // These live tests exercise the pipe transport against a real Chromium. They

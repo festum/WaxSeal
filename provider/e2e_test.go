@@ -21,8 +21,8 @@ import (
 	"github.com/festum/waxseal/client"
 	"github.com/festum/waxseal/provider"
 	"github.com/festum/waxseal/server"
-	waxtap "github.com/colespringer/waxtap/v2"
-	"github.com/colespringer/waxtap/v2/potoken"
+	waxtap "github.com/festum/waxtap/v2"
+	"github.com/festum/waxtap/v2/potoken"
 )
 
 // These manual e2e tests require Chromium and network access. Unless WAXSEAL_URL

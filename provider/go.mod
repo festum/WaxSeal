@@ -3,7 +3,7 @@ module github.com/festum/waxseal/provider
 go 1.26
 
 require (
-	github.com/colespringer/waxtap/v2 v2.0.1
+	github.com/festum/waxtap/v2 v2.0.1
 	github.com/festum/waxseal v0.0.0-00010101000000-000000000000
 )
 

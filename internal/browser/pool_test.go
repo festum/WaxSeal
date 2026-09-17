@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/colespringer/waxseal/internal/cdp"
+	"github.com/festum/waxseal/internal/cdp"
 )
 
 // These tests replace newInstance and use partially initialized browserInstance

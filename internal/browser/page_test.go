@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/colespringer/waxseal/internal/cdp"
+	"github.com/festum/waxseal/internal/cdp"
 )
 
 // This file holds the offline page fake and the tests it makes possible. Before

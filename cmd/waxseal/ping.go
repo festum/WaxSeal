@@ -13,7 +13,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/colespringer/waxseal/server"
+	"github.com/festum/waxseal/server"
 )
 
 // hasScheme reports whether s carries a URL scheme. Unlike

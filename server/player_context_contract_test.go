@@ -10,9 +10,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/colespringer/waxseal/client"
-	"github.com/colespringer/waxseal/internal/browser"
-	"github.com/colespringer/waxseal/server"
+	"github.com/festum/waxseal/client"
+	"github.com/festum/waxseal/internal/browser"
+	"github.com/festum/waxseal/server"
 )
 
 // TestPlayerContextShapeContract holds the three descriptions of the
