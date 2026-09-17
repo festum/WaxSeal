@@ -3,13 +3,11 @@ module github.com/festum/waxseal/provider
 go 1.26
 
 require (
-	github.com/festum/waxseal v0.0.0-00010101000000-000000000000
 	github.com/colespringer/waxtap/v2 v2.0.1
+	github.com/festum/waxseal v0.0.0-00010101000000-000000000000
 )
 
 require (
-	github.com/colespringer/waxflow v0.0.0-20260730025520-35107bc1aae3 // indirect
-	github.com/colespringer/waxlabel v1.2.0 // indirect
 	github.com/dlclark/regexp2 v1.11.5 // indirect
 	github.com/dop251/goja v0.0.0-20260311135729-065cd970411c // indirect
 	github.com/go-sourcemap/sourcemap v2.1.4+incompatible // indirect

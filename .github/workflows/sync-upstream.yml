@@ -2,7 +2,6 @@ name: Sync Upstream
 
 on:
   schedule:
-    # Run every Monday at 06:00 UTC
     - cron: "0 6 * * 1"
   workflow_dispatch:
 
@@ -11,8 +10,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      workflows: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
           ref: main
           fetch-depth: 0
@@ -48,10 +48,12 @@ jobs:
         if: steps.check.outputs.behind != '0'
         run: |
           find . -name "*.go" -not -path "./.git/*" \
-            -exec grep -l "github.com/colespringer/waxseal" {} \; \
-            | xargs -r sed -i 's|github.com/colespringer/waxseal|github.com/festum/waxseal|g'
+            -exec grep -l "github.com/colespringer" {} \; \
+            | xargs -r sed -i 's|github.com/colespringer|github.com/festum|g'
           find . -name "go.mod" -not -path "./.git/*" \
-            -exec sed -i 's|github.com/colespringer/waxseal|github.com/festum/waxseal|g' {} \;
+            -exec sed -i 's|github.com/colespringer|github.com/festum|g' {} \;
+          find . -name "go.sum" -not -path "./.git/*" \
+            -exec sed -i 's|github.com/colespringer|github.com/festum|g' {} \;
           if ! git diff --quiet; then
             git add -A
             git commit -m "fix: rewrite upstream import paths colespringer→festum after sync"
