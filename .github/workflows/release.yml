@@ -1,62 +1,135 @@
 name: Release
 
-# Fires when a version tag is pushed. `gh release create vX.Y.Z` (which creates
-# and pushes the tag) is enough to trigger this; the jobs below attach the
-# binaries and publish the image. VERSION strips the leading `v` so it matches
+# Fires when a version tag is pushed. The normal flow is to write the notes by
+# hand into a draft (`gh release create vX.Y.Z --draft --notes-file ...`), which
+# reserves the tag without creating it, and then publish: publishing is what
+# pushes the tag and triggers this workflow, whose jobs attach the binaries and
+# publish the image, each with a GitHub build provenance attestation. The tag
+# name is passed to make as VERSION, and the Makefile drops its leading `v` for
 # the image tag and the -X main.version stamp (v1.2.3 -> 1.2.3).
 on:
   push:
     tags:
       - 'v*'
 
+# Each job adds the write scopes it needs; everything else starts read-only.
+permissions:
+  contents: read
+
+# A re-run for the same tag queues behind the run in progress instead of racing
+# it for the same release assets and image tags.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  # Build the version-stamped Linux and macOS binaries and attach them, plus a
-  # SHA256SUMS manifest, to the release for the tag. The release is created with
-  # generated notes if it does not exist yet; an existing release (for example
-  # one created by hand with written notes) keeps its body and just gains the
-  # assets. The binaries embed the committed JS bundle but need a system Chromium
-  # at runtime.
+  # Build the version-stamped Linux, macOS, and Windows binaries and attach them,
+  # plus a SHA256SUMS manifest, to the release for the tag. Normally the release is
+  # already there, published by hand with written notes, and it keeps its body
+  # and just gains the assets. Only if none exists (a tag pushed straight with
+  # `git push`) is one created here, as a draft with an empty body, so a human
+  # writes the notes and publishes it; this workflow never publishes a release
+  # on its own. The binaries embed the committed JS bundle but need a system
+  # Chromium or Chrome at runtime. RELEASE_PLATFORMS in the Makefile is the list;
+  # the cross job in ci.yml runs the same `make release` on every push.
   binaries:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
-      contents: write
+      contents: write      # upload the assets, and create the fallback draft
+      id-token: write      # sign the attestation as this workflow
+      attestations: write  # store the attestation on GitHub
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-          cache: true
+          # A release builds from clean module and build caches, so nothing
+          # restored from an earlier run can reach a published binary.
+          cache: false
       - name: build release binaries
-        run: make release VERSION="${GITHUB_REF_NAME#v}"
+        run: make release VERSION="$GITHUB_REF_NAME"
+      # Not a pipe into tee: a run step with no shell set runs `bash -e` without
+      # pipefail, which would let a sha256sum failure pass as tee's success.
       - name: checksums
         working-directory: dist
-        run: sha256sum waxseal-* > SHA256SUMS.txt && cat SHA256SUMS.txt
+        run: |
+          sha256sum waxseal-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          { echo '```'; cat SHA256SUMS.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - name: publish binaries to the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" \
-            --generate-notes --verify-tag || true
+          # The create has to be guarded rather than run unconditionally behind
+          # `|| true`. A draft release does not own its tag, so the API accepts
+          # a second draft carrying a tag name another release already uses, and
+          # `gh release create --draft` therefore succeeds against an existing
+          # release instead of failing. Unguarded, it left an empty duplicate
+          # draft beside the real v1.2.0. The pre-1.2.0 spelling of this step
+          # was not --draft, so the create did fail and `|| true` was enough.
+          #
+          # The count comes from `gh release list` rather than `gh release
+          # view`: list reports drafts as well as published releases, so a
+          # re-run of this job cannot pile a second draft onto one it created
+          # earlier. Nothing here swallows a failure any more, since a create
+          # that fails leaves the upload below nowhere to put the assets.
+          existing=$(gh release list --limit 100 --json tagName \
+            --jq '[.[] | select(.tagName == env.GITHUB_REF_NAME)] | length')
+          if [ "$existing" -eq 0 ]; then
+            gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" \
+              --draft --notes "" --verify-tag
+          fi
           gh release upload "$GITHUB_REF_NAME" \
             dist/waxseal-* dist/SHA256SUMS.txt --clobber
+      # Provenance for every binary: the commit, workflow, and runner that built
+      # it. `gh attestation verify <file> --repo ColeSpringer/WaxSeal` checks a
+      # download against it.
+      - name: attest the binaries
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/waxseal-*
 
-  # Build and push the runtime image (VERSION and latest) to GHCR with the
-  # built-in token. This does not reuse `make docker-push`: that target's login
-  # and scope checks are written for a human's gh OAuth token, which the Actions
-  # GITHUB_TOKEN is not. `make docker-build` has no such checks. Single platform
-  # (linux/amd64), matching the manual release; add buildx for multi-arch later.
+  # One per-architecture tag per platform, each built, smoke-tested, and pushed
+  # on its own native runner by `make docker-push-authed`; the `manifest` job
+  # assembles the plain VERSION tag from them. The authed variant exists because
+  # `make docker-push` checks a human's gh OAuth scopes, which the Actions token
+  # cannot pass, so the login happens here instead.
+  #
+  # The smoke test matters here and not only in CI: CI never sees a tag push, and
+  # this build resolves `apt-get install chromium` fresh, so without it a release
+  # could publish an image no workflow ever started.
   image:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
     permissions:
-      packages: write
+      contents: read       # check out the source
+      packages: write      # push the per-arch tag to GHCR, and its attestation beside it
+      id-token: write      # sign the attestation as this workflow
+      attestations: write  # store the attestation on GitHub
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: log in to GHCR
         env:
           GH_TOKEN: ${{ github.token }}
           ACTOR: ${{ github.actor }}
         run: echo "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
-      - name: build and push
+      - name: build, smoke-test, and push the per-arch tag
+        run: make docker-push-authed VERSION="$GITHUB_REF_NAME"
+      # A per-arch tag resolves to its own manifest, not to the multi-arch one the
+      # manifest job attests, so a pull pinned to one platform gets its own
+      # attestation here. The Makefile names the image and the tag, so the
+      # workflow cannot attest a different reference than it pushed.
+      - name: resolve the pushed digest
+        id: pushed
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           make docker-build VERSION="$VERSION"

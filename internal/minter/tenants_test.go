@@ -17,7 +17,7 @@ import (
 // identity isolation is observable.
 func newTestTenants(keys map[string]string) (*Tenants, *int64) {
 	var calls int64
-	tn := NewTenants(nil, "v", keys, browser.Options{}, 0, 0)
+	tn := NewTenants(nil, "v", keys, browser.Options{}, 0, 0, 0)
 	tn.newSession = func(context.Context, string) (minterSession, error) {
 		n := atomic.AddInt64(&calls, 1)
 		return &fakeSession{
@@ -191,5 +191,125 @@ func TestTenantsConcurrent(t *testing.T) {
 	wg.Wait()
 	if got := atomic.LoadInt64(calls); got != 3 {
 		t.Errorf("session creations = %d, want 3 (one per tenant, single-flighted)", got)
+	}
+}
+
+// A request that outlives the shutdown drain still resolves its key, so it must
+// get a Minter (not a spurious 401), but that Minter must refuse to launch
+// against a pool that is already closed. A lazily created one is born closed.
+func TestTenantsCloseIsTerminal(t *testing.T) {
+	tn, calls := newTestTenants(map[string]string{"KEYA": "alice", "KEYB": "bob"})
+	ctx := context.Background()
+	if err := tn.WarmOne(ctx, "KEYA"); err != nil {
+		t.Fatalf("WarmOne: %v", err)
+	}
+	tn.Close()
+
+	// An existing tenant: its Minter was closed by Close itself.
+	if err := tn.WarmOne(ctx, "KEYA"); !errors.Is(err, ErrClosed) {
+		t.Errorf("WarmOne on an existing tenant after Close = %v, want ErrClosed", err)
+	}
+	// A tenant created after Close: valid key, resolvable, but cannot launch.
+	m, label, err := tn.Minter("KEYB")
+	if err != nil {
+		t.Fatalf("Minter(KEYB) after Close = %v, want a resolvable tenant", err)
+	}
+	if label != "bob" {
+		t.Errorf("label = %q, want bob", label)
+	}
+	if err := m.Warm(ctx); !errors.Is(err, ErrClosed) {
+		t.Errorf("Warm on a tenant created after Close = %v, want ErrClosed", err)
+	}
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Errorf("newSession calls = %d, want 1 (only the pre-Close warm)", got)
+	}
+	// The post-shutdown tenant is served but not registered. Shutdown has already
+	// torn down every registered Minter and will not run again, so registering it
+	// would leak it and count a tenant the daemon never ran. Close still leaves
+	// the tenants that did run in place, so metrics report the run.
+	snap := tn.MetricsSnapshot()
+	if n, _ := snap["tenants"].(int); n != 1 {
+		t.Errorf("tenants = %v, want 1 after Close (alice ran; bob never did)", snap["tenants"])
+	}
+	if _, ok := snap["per_tenant"].(map[string]any)["alice"]; !ok {
+		t.Error("per_tenant lost alice, whose run metrics shutdown should still report")
+	}
+}
+
+// fakeProber is a BrowserProber with fixed answers, for the seam tests.
+type fakeProber struct {
+	rec       browser.Recovery
+	err       error
+	probes    int64
+	relaunchs int64
+}
+
+func (f *fakeProber) Health(context.Context) (browser.Recovery, error) { return f.rec, f.err }
+func (f *fakeProber) ProbeFailures() int64                             { return f.probes }
+func (f *fakeProber) RelaunchFailures() int64                          { return f.relaunchs }
+
+// A registry built without a pool has no browser to lose: the check answers
+// and the counters read zero, so handler tests need no pool to run a probe.
+func TestTenantsBrowserHealthWithoutPool(t *testing.T) {
+	tn := NewTenants(nil, "v", map[string]string{"K": "alice"}, browser.Options{}, 0, 0, 0)
+	rec, err := tn.BrowserHealth(context.Background())
+	if err != nil || rec != browser.RecoveryNone {
+		t.Errorf("BrowserHealth with no pool = (%v, %v), want (RecoveryNone, nil)", rec, err)
+	}
+	if got := tn.BrowserProbeFailures(); got != 0 {
+		t.Errorf("BrowserProbeFailures with no pool = %d, want 0", got)
+	}
+	if got := tn.BrowserRelaunchFailures(); got != 0 {
+		t.Errorf("BrowserRelaunchFailures with no pool = %d, want 0", got)
+	}
+}
+
+// Dependent packages install a prober to drive a probe through every browser
+// outcome without Chromium; the registry forwards the check and the counters
+// to it, so a handler test can assert that a response moved a counter.
+func TestTenantsBrowserProberSeam(t *testing.T) {
+	tn := NewTenants(nil, "v", nil, browser.Options{}, 0, 0, 0)
+	want := errors.New("waxseal: relaunch chromium: exec: no such file")
+	tn.SetBrowserProberForTest(&fakeProber{rec: browser.RecoveryTornDown, err: want, probes: 3, relaunchs: 2})
+	if rec, err := tn.BrowserHealth(context.Background()); !errors.Is(err, want) || rec != browser.RecoveryTornDown {
+		t.Errorf("BrowserHealth = (%v, %v), want the installed prober's answer", rec, err)
+	}
+	if got := tn.BrowserProbeFailures(); got != 3 {
+		t.Errorf("BrowserProbeFailures = %d, want 3", got)
+	}
+	if got := tn.BrowserRelaunchFailures(); got != 2 {
+		t.Errorf("BrowserRelaunchFailures = %d, want 2", got)
+	}
+}
+
+// Both /metrics views carry the daemon-wide browser counters at top level. They
+// count browsers lost and launches failed, not per-tenant events, so they are
+// not among the summed aggregate counters and appear in the redacted view as
+// themselves.
+func TestTenantsMetricsCarryBrowserCounters(t *testing.T) {
+	tn := NewTenants(nil, "v", map[string]string{"K": "alice"}, browser.Options{}, 0, 0, 0)
+	tn.SetBrowserProberForTest(&fakeProber{probes: 3, relaunchs: 2})
+	full, redacted := tn.MetricsSnapshot(), tn.AggregateMetricsSnapshot()
+	want := map[string]int64{"browser_probe_failures": 3, "browser_relaunch_failures": 2}
+	for name, snap := range map[string]map[string]any{"full": full, "redacted": redacted} {
+		for k, w := range want {
+			v, ok := snap[k]
+			if !ok {
+				t.Errorf("%s view lacks %s", name, k)
+				continue
+			}
+			if v != w {
+				t.Errorf("%s view %s = %v (%T), want int64 %d", name, k, v, v, w)
+			}
+		}
+	}
+	agg, ok := redacted["aggregate"].(map[string]int64)
+	if !ok {
+		t.Fatalf("aggregate is %T, want map[string]int64", redacted["aggregate"])
+	}
+	for k := range want {
+		if _, summed := agg[k]; summed {
+			t.Errorf("%s is listed under aggregate, where every key is a per-tenant sum", k)
+		}
 	}
 }

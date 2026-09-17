@@ -1,12 +1,14 @@
 package minter
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/festum/waxseal/internal/browser"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -16,17 +18,30 @@ import (
 // fakeSession is an in-memory minterSession for testing the Minter's reliability
 // logic without a browser.
 type fakeSession struct {
-	mint         func(identifier string) (browser.MintResult, error)
-	playerCtx    func(videoID string) (browser.PlayerContext, error)
-	ping         func() error // nil reports a healthy browser
-	establishErr error
-	cookies      []*http.Cookie
-	cookiesErr   error
-	id           browser.Identity // zero value reports a default visitor_data
-	established  bool
-	lastProbe    browser.FullLengthProbe
-	lastProbeAt  time.Time
-	closed       atomic.Bool
+	mint            func(identifier string) (browser.MintResult, error)
+	playerCtx       func(videoID string) (browser.PlayerContext, error)
+	ping            func() error // nil reports a healthy browser
+	establishErr    error
+	establishBlocks bool // EnsureEstablished blocks until ctx is done, honouring cancellation
+	// onEstablish, when set, runs inside EnsureEstablished after the call is
+	// counted and its result is returned, so a test can act mid-proof (retire the
+	// session the way the crash watcher does) and then fail the proof.
+	onEstablish func() error
+	cookies     []*http.Cookie
+	cookiesErr  error
+	// cookiesFn, when set, replaces the static cookies/cookiesErr pair.
+	cookiesFn   func() ([]*http.Cookie, error)
+	id          browser.Identity // zero value reports a default visitor_data
+	established bool
+	lastProbe   browser.FullLengthProbe
+	lastProbeAt time.Time
+	closed      atomic.Bool
+
+	// proofMu guards the establishment bookkeeping, which a player-context call
+	// writes while a concurrent health probe reads it.
+	proofMu    sync.Mutex
+	proofCalls int  // EnsureEstablished invocations
+	provedOnce bool // set by a successful EnsureEstablished
 }
 
 func (f *fakeSession) Mint(_ context.Context, id string) (browser.MintResult, error) {
@@ -42,7 +57,37 @@ func (f *fakeSession) PlayerContext(ctx context.Context, videoID string) (browse
 	}
 	return f.playerCtx(videoID)
 }
-func (f *fakeSession) EnsureEstablished(context.Context) error { return f.establishErr }
+
+// EnsureEstablished mirrors the real session: it proves once and reports the
+// configured error every time when proving fails. establishBlocks simulates a
+// proof still in flight when the caller's context ends, matching the real
+// session's cancellation behavior.
+func (f *fakeSession) EnsureEstablished(ctx context.Context) error {
+	if f.establishBlocks {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	f.proofMu.Lock()
+	defer f.proofMu.Unlock()
+	f.proofCalls++
+	if f.onEstablish != nil {
+		if err := f.onEstablish(); err != nil {
+			return err
+		}
+	}
+	if f.establishErr != nil {
+		return f.establishErr
+	}
+	f.provedOnce = true
+	return nil
+}
+
+// proofCount reports how many times EnsureEstablished was invoked.
+func (f *fakeSession) proofCount() int {
+	f.proofMu.Lock()
+	defer f.proofMu.Unlock()
+	return f.proofCalls
+}
 
 // Ping gives cancellation precedence over the configured result.
 func (f *fakeSession) Ping(ctx context.Context) error {
@@ -62,13 +107,31 @@ func (f *fakeSession) Identity() browser.Identity {
 	return f.id
 }
 func (f *fakeSession) BrowserCookies(context.Context) ([]*http.Cookie, error) {
+	if f.cookiesFn != nil {
+		return f.cookiesFn()
+	}
 	return f.cookies, f.cookiesErr
 }
-func (f *fakeSession) Established() bool { return f.established }
+func (f *fakeSession) Established() bool {
+	f.proofMu.Lock()
+	defer f.proofMu.Unlock()
+	return f.established || f.provedOnce
+}
 func (f *fakeSession) LastProof() (browser.FullLengthProbe, time.Time) {
 	return f.lastProbe, f.lastProbeAt
 }
 func (f *fakeSession) Close() { f.closed.Store(true) }
+
+// newBareMinter builds a browserless Minter with the mint-to-establishment
+// separation disabled, so tests that do not measure the spacing itself never
+// wait it out. The attestation pre-mint still runs, which is why several tests
+// below count one more mint than the request they make. A test that measures the
+// separation sets mintSeparation itself before its first call.
+func newBareMinter(streamingMaxAge, reportDebounce time.Duration) *Minter {
+	m := NewMinter("v", browser.Options{}, streamingMaxAge, reportDebounce, 0)
+	m.mintSeparation = 0
+	return m
+}
 
 // newTestMinter returns a Minter whose launcher records each created session and
 // uses the supplied per-mint behaviour.
@@ -83,7 +146,7 @@ func newTestMinterFull(mint func(id string) (browser.MintResult, error), playerC
 	var launches int64
 	var sessions []*fakeSession
 	var smu sync.Mutex
-	m := NewMinter("v", browser.Options{}, 0, 0)
+	m := newBareMinter(0, 0)
 	m.launch = func(context.Context) (minterSession, error) {
 		atomic.AddInt64(&launches, 1)
 		fs := &fakeSession{mint: mint, playerCtx: playerCtx}
@@ -102,7 +165,7 @@ func TestMinterSingleFlightAttestation(t *testing.T) {
 	var once sync.Once
 	launchStarted := make(chan struct{})
 	release := make(chan struct{})
-	m := NewMinter("v", browser.Options{}, 0, 0)
+	m := newBareMinter(0, 0)
 	m.launch = func(context.Context) (minterSession, error) {
 		atomic.AddInt64(&launches, 1)
 		once.Do(func() { close(launchStarted) })
@@ -143,9 +206,13 @@ func TestMinterCacheNoReattest(t *testing.T) {
 	})
 	ctx := context.Background()
 
+	// The very first request asks for the session's own visitor_data, which the
+	// attestation pre-mint already minted and cached. Mint re-checks the cache
+	// after the launch it triggers, so this is served from the pre-mint instead
+	// of minting a second, redundant token.
 	r1, c1, err := m.Mint(ctx, "gvs", "vd")
-	if err != nil || c1 {
-		t.Fatalf("first mint: cached=%v err=%v, want cached=false", c1, err)
+	if err != nil || !c1 {
+		t.Fatalf("first mint: cached=%v err=%v, want cached=true (served by the pre-mint)", c1, err)
 	}
 	r2, c2, err := m.Mint(ctx, "gvs", "vd")
 	if err != nil || !c2 {
@@ -154,15 +221,16 @@ func TestMinterCacheNoReattest(t *testing.T) {
 	if r1.Token != r2.Token {
 		t.Errorf("cached token = %q, want same as first %q", r2.Token, r1.Token)
 	}
+	// One mint, not two: the pre-mint alone satisfied both requests above.
 	if got := atomic.LoadInt64(&mints); got != 1 {
-		t.Errorf("mints = %d, want 1 (second served from cache)", got)
+		t.Errorf("mints = %d, want 1 (the pre-mint; both requests asked for the pre-minted binding)", got)
 	}
-	// A different binding mints again, but still on the one attestation.
+	// A different scope and binding mints again, but still on the one attestation.
 	if _, c3, _ := m.Mint(ctx, "player", "vid"); c3 {
 		t.Errorf("new binding should not be a cache hit")
 	}
 	if got := atomic.LoadInt64(&mints); got != 2 {
-		t.Errorf("mints = %d, want 2", got)
+		t.Errorf("mints = %d, want 2 (pre-mint + the player/vid binding)", got)
 	}
 	if got := atomic.LoadInt64(launches); got != 1 {
 		t.Errorf("launches = %d, want 1 (never re-attest for cache/new-binding)", got)
@@ -259,8 +327,14 @@ func TestMinterStreamingRecycleNotOnTokenOnly(t *testing.T) {
 // then a relaunch (re-attest) on a fresh session; the old session is closed.
 func TestMinterEscalationLadder(t *testing.T) {
 	var attempt int64
+	// Attempt 1 is the pre-mint at attestation; 2 and 3 are the request's mint and
+	// its in-place retry; 4 is the relaunch's own pre-mint. Mint does not recheck
+	// the cache after a relaunch, so attempt 4 failing or succeeding cannot change
+	// which attempt serves the request; it is still made to fail here so the
+	// sequence stays unambiguous, and the request's own post-relaunch mint (5) is
+	// visibly the one that produces the token this test asserts on.
 	m, launches, sessions, smu := newTestMinter(func(string) (browser.MintResult, error) {
-		if n := atomic.AddInt64(&attempt, 1); n <= 2 {
+		if n := atomic.AddInt64(&attempt, 1); n <= 4 {
 			return browser.MintResult{}, fmt.Errorf("transient failure %d", n)
 		}
 		return browser.MintResult{Kind: "integrity", Token: "ok", Lifetime: 3600}, nil
@@ -309,7 +383,7 @@ func TestMinterCrashKeepsCacheThenRelaunchInvalidates(t *testing.T) {
 	})
 	ctx := context.Background()
 
-	if _, _, err := m.Mint(ctx, "gvs", "vd"); err != nil { // gen 1, cached
+	if _, _, err := m.Mint(ctx, "gvs", "vd"); err != nil { // gen 1; served by the pre-mint
 		t.Fatalf("first mint: %v", err)
 	}
 	_, gen, err := m.ensure(ctx)
@@ -341,18 +415,26 @@ func TestMinterCrashKeepsCacheThenRelaunchInvalidates(t *testing.T) {
 		t.Errorf("launches = %d, want 2 (cache miss after crash relaunches)", got)
 	}
 
-	// The generation bump clears older entries from the cache, so only the token
-	// minted after the relaunch remains.
+	// The generation bump clears older entries from the cache, so it holds only
+	// what generation 2 produced: the relaunch's pre-mint, cached under both the
+	// gvs and pot scopes, and the binding this request asked for. Three entries,
+	// not two: the pre-mint fix added the second scope.
 	m.mu.Lock()
 	cacheLen := len(m.cache)
 	m.mu.Unlock()
-	if cacheLen != 1 {
-		t.Errorf("cache size after relaunch = %d, want 1 (old entries cleared)", cacheLen)
+	if cacheLen != 3 {
+		t.Errorf("cache size after relaunch = %d, want 3 (old entries cleared; pre-mint under two scopes + new binding)", cacheLen)
 	}
 
-	// The generation-1 gvs/vd entry is stale after the relaunch.
-	if _, cached, _ := m.Mint(ctx, "gvs", "vd"); cached {
-		t.Errorf("old-generation cache entry should be invalidated by the relaunch")
+	// The generation-1 gvs/vd entry is stale after the relaunch. The relaunch's
+	// own pre-mint refilled that key, so the served token must be the new one
+	// (tok2, the generation-2 pre-mint), never the generation-1 token (tok1).
+	r, cached, _ := m.Mint(ctx, "gvs", "vd")
+	if !cached {
+		t.Errorf("gvs/vd should be served from the relaunch's pre-mint")
+	}
+	if r.Token != "tok2" {
+		t.Errorf("gvs/vd token = %q, want tok2; the old-generation entry should be invalidated by the relaunch", r.Token)
 	}
 }
 
@@ -494,8 +576,14 @@ func TestMinterPlayerContextUnplayableNegativeCache(t *testing.T) {
 	if got := atomic.LoadInt64(&calls); got != 1 {
 		t.Errorf("session PlayerContext calls = %d, want 1 (second served from negative cache)", got)
 	}
-	if got := m.metrics.PlayerContextFailures.Load(); got != 2 {
-		t.Errorf("player_context_failures = %d, want 2", got)
+	// The two refusals are counted apart: one real attempt against the browser,
+	// one served from the negative cache. A caller looping on one unplayable video
+	// must not be able to move the failure counter an operator alerts on.
+	if got := m.metrics.PlayerContextFailures.Load(); got != 1 {
+		t.Errorf("player_context_failures = %d, want 1 (the attempt that reached the browser)", got)
+	}
+	if got := m.metrics.PlayerContextNegativeCacheHits.Load(); got != 1 {
+		t.Errorf("player_context_negative_cache_hits = %d, want 1", got)
 	}
 }
 
@@ -656,7 +744,7 @@ func TestMinterPlayerContextIncompleteNoRelaunch(t *testing.T) {
 // result is still cached (evicting an older one) instead of dropped, so the map stays
 // bounded and the newest unplayable id is the one kept.
 func TestMinterNegCacheBoundedEvicts(t *testing.T) {
-	m := NewMinter("v", browser.Options{}, 0, 0)
+	m := newBareMinter(0, 0)
 	for i := 0; i < minterNegCacheMax; i++ {
 		m.negCachePut(fmt.Sprintf("vid%05d", i), browser.ErrUnplayable)
 	}
@@ -676,7 +764,7 @@ func TestMinterNegCacheBoundedEvicts(t *testing.T) {
 // matching cachePut. The old code ran the eviction path on any insert, dropping an
 // unrelated entry on a refresh. Each refresh must leave the cache full.
 func TestMinterNegCacheRefreshNoEvict(t *testing.T) {
-	m := NewMinter("v", browser.Options{}, 0, 0)
+	m := newBareMinter(0, 0)
 	for i := 0; i < minterNegCacheMax; i++ {
 		m.negCachePut(fmt.Sprintf("vid%05d", i), browser.ErrUnplayable)
 	}
@@ -695,7 +783,7 @@ func TestMinterNegCacheRefreshNoEvict(t *testing.T) {
 // existing token rather than dropping the new one. The positive cache stays
 // bounded and retains the latest insert.
 func TestMinterCacheBoundedEvicts(t *testing.T) {
-	m := NewMinter("v", browser.Options{}, 0, 0)
+	m := newBareMinter(0, 0)
 	m.gen = 1 // production never caches at gen 0
 	for i := 0; i < minterCacheMax; i++ {
 		m.cachePut(fmt.Sprintf("gvs|vd%05d", i), browser.MintResult{Lifetime: 3600}, m.gen)
@@ -723,7 +811,7 @@ func TestMinterCacheBoundedEvicts(t *testing.T) {
 // freshly minted token from replacing a longer-lived token by map iteration
 // order.
 func TestMinterCacheEvictsNearestExpiry(t *testing.T) {
-	m := NewMinter("v", browser.Options{}, 0, 0)
+	m := newBareMinter(0, 0)
 	m.gen = 1
 	now := time.Now()
 	m.cache["gvs|soonest"] = cachedToken{gen: m.gen, expiry: now.Add(time.Minute)} // least remaining life
@@ -749,7 +837,7 @@ func TestMinterCacheEvictsNearestExpiry(t *testing.T) {
 // from the current generation, a new insert reclaims them during pruning. It
 // should not count as a live-token eviction.
 func TestMinterCachePutReclaimsExpired(t *testing.T) {
-	m := NewMinter("v", browser.Options{}, 0, 0)
+	m := newBareMinter(0, 0)
 	m.gen = 1
 	past := time.Now().Add(-time.Hour)
 	for i := 0; i < minterCacheMax; i++ {
@@ -773,7 +861,7 @@ func TestMinterCachePutReclaimsExpired(t *testing.T) {
 // TestMinterCacheGetEvictsExpired: cacheGet deletes an expired entry from the
 // current generation on access, reclaiming it before the next session recycle.
 func TestMinterCacheGetEvictsExpired(t *testing.T) {
-	m := NewMinter("v", browser.Options{}, 0, 0)
+	m := newBareMinter(0, 0)
 	m.gen = 1
 	m.cache["gvs|vd"] = cachedToken{gen: m.gen, expiry: time.Now().Add(-time.Minute)} // current gen, expired
 	if _, ok := m.cacheGet("gvs|vd"); ok {
@@ -784,10 +872,192 @@ func TestMinterCacheGetEvictsExpired(t *testing.T) {
 	}
 }
 
+// agedMint is a mint that always succeeds with a whole 12h grant whose token
+// expires expiresIn from now, so Lifetime and ExpiresAt disagree the way they do
+// late in a session's life.
+func agedMint(expiresIn time.Duration) func(string) (browser.MintResult, error) {
+	return func(id string) (browser.MintResult, error) {
+		return browser.MintResult{
+			Kind: "integrity", Token: "tok", TokenLen: 3, Identifier: id,
+			Lifetime:  12 * 60 * 60, // the whole grant, frozen at attest time
+			ExpiresAt: time.Now().Add(expiresIn),
+		}, nil
+	}
+}
+
+// TestCachePutRespectsTokenExpiry pins that a cache entry never outlives the
+// token it holds. Lifetime is the whole grant measured from attest time, so on
+// its own it would extend the entry past ExpiresAt.
+func TestCachePutRespectsTokenExpiry(t *testing.T) {
+	m, _, _, _ := newTestMinter(agedMint(time.Hour))
+	res, _, err := m.Mint(context.Background(), "pot", "vd")
+	if err != nil {
+		t.Fatalf("mint: %v", err)
+	}
+	m.mu.Lock()
+	c, ok := m.cache[cacheKey("pot", "vd")]
+	m.mu.Unlock()
+	if !ok {
+		t.Fatal("entry not cached")
+	}
+	if c.expiry.After(res.ExpiresAt) {
+		t.Fatalf("cache entry outlives the token by %v", c.expiry.Sub(res.ExpiresAt))
+	}
+}
+
+// TestCachePutSkipsAlreadyExpiredToken pins that a token with no usable life
+// left is not cached at all, so a later hit cannot serve it.
+func TestCachePutSkipsAlreadyExpiredToken(t *testing.T) {
+	m, _, _, _ := newTestMinter(agedMint(-30 * time.Minute))
+	if _, _, err := m.Mint(context.Background(), "pot", "vd"); err != nil {
+		t.Fatalf("mint: %v", err)
+	}
+	m.mu.Lock()
+	_, ok := m.cache[cacheKey("pot", "vd")]
+	m.mu.Unlock()
+	if ok {
+		t.Fatal("an expired token was cached")
+	}
+}
+
+// TestCacheHitsDoNotBypassMaxAge pins that a workload which only ever hits the
+// cache still recycles a session past maxAge. The recycle lives in ensure(),
+// which the cache fast path skips.
+func TestCacheHitsDoNotBypassMaxAge(t *testing.T) {
+	m, launches, _, _ := newTestMinter(agedMint(12 * time.Hour))
+	if _, _, err := m.Mint(context.Background(), "pot", "vd"); err != nil {
+		t.Fatalf("first mint: %v", err)
+	}
+	m.mu.Lock()
+	m.maxAge = 11 * time.Hour
+	m.attestedAt = time.Now().Add(-48 * time.Hour)
+	m.mu.Unlock()
+	_, cached, err := m.Mint(context.Background(), "pot", "vd")
+	if err != nil {
+		t.Fatalf("second mint: %v", err)
+	}
+	if got := atomic.LoadInt64(launches); got != 2 {
+		t.Fatalf("launches = %d, want 2 (the aged session was never recycled)", got)
+	}
+	// Only the post-ensure recheck can report a hit here, and it reaches the fresh
+	// generation's pre-mint. Gating that lookup on session age too would mint a
+	// second, redundant token and still show two launches.
+	if !cached {
+		t.Error("cached = false, want true (the recycled session's pre-mint should serve this request)")
+	}
+}
+
+// TestSessionPastMaxAgeKeysOnAttestation pins the two behaviours that keep
+// sessionPastMaxAge separate from ensure's own teardown predicate. During a
+// relaunch m.sess is nil while the generation has not yet bumped, so the aged
+// generation's entries are still servable and an aged attestation must still
+// report past the bound. A Minter that has never attested is past no bound.
+func TestSessionPastMaxAgeKeysOnAttestation(t *testing.T) {
+	m, launches, _, _ := newTestMinter(okMint)
+	if m.sessionPastMaxAge() {
+		t.Fatal("a Minter that has never attested reports past max age")
+	}
+	m.mu.Lock()
+	m.gen = 7
+	m.maxAge = time.Hour
+	m.attestedAt = time.Now().Add(-2 * time.Hour)
+	m.sess = nil // the relaunch window: session gone, generation not yet bumped
+	m.cache[cacheKey("pot", "vd")] = cachedToken{
+		res:    browser.MintResult{Token: "aged"},
+		expiry: time.Now().Add(time.Hour),
+		gen:    m.gen,
+	}
+	m.mu.Unlock()
+	if !m.sessionPastMaxAge() {
+		t.Fatal("an aged attestation reports fresh while m.sess is nil")
+	}
+	res, _, err := m.Mint(context.Background(), "pot", "vd")
+	if err != nil {
+		t.Fatalf("mint: %v", err)
+	}
+	if res.Token == "aged" {
+		t.Error("Mint served the aged generation's cached token during the relaunch window")
+	}
+	if got := atomic.LoadInt64(launches); got != 1 {
+		t.Errorf("launches = %d, want 1 (the aged attestation must force a fresh one)", got)
+	}
+}
+
+// TestGrantExpiryRecyclesSession pins that a session whose attested grant has run
+// down is recycled before the next mint, so the daemon never mints a token it
+// could not serve. The grant is what expires here, not the attestation: maxAge is
+// untouched and far from reached.
+func TestGrantExpiryRecyclesSession(t *testing.T) {
+	m, launches, _, _ := newTestMinter(agedMint(12 * time.Hour))
+	if _, _, err := m.Mint(context.Background(), "pot", "vd"); err != nil {
+		t.Fatalf("first mint: %v", err)
+	}
+	if got := atomic.LoadInt64(launches); got != 1 {
+		t.Fatalf("launches after the first mint = %d, want 1", got)
+	}
+	// Run the recorded grant down to inside the margin, leaving the attestation
+	// young: this is a generation aging into its expiry, which is the one case the
+	// recycle converges on, because the replacement gets a whole fresh grant.
+	m.mu.Lock()
+	m.grantExpiresAt = time.Now().Add(time.Minute)
+	m.mu.Unlock()
+	if _, _, err := m.Mint(context.Background(), "pot", "vd"); err != nil {
+		t.Fatalf("second mint: %v", err)
+	}
+	if got := atomic.LoadInt64(launches); got != 2 {
+		t.Fatalf("launches = %d, want 2 (a session past its grant was never recycled)", got)
+	}
+	m.mu.Lock()
+	grant := m.grantExpiresAt
+	m.mu.Unlock()
+	if time.Until(grant) < time.Hour {
+		t.Errorf("grantExpiresAt = %v, want the replacement's own full grant", grant)
+	}
+}
+
+// TestShortGrantDoesNotRelaunchForever pins the floor under the grant recycle. An
+// attestation whose tokens are already inside the cache margin when it issues
+// them bounds nothing, because its replacement arrives just as exhausted. Without
+// the floor the first such attestation makes every later request tear down a
+// healthy session and re-attest, forever, and nothing but attestations moves to
+// show it.
+func TestShortGrantDoesNotRelaunchForever(t *testing.T) {
+	m, launches, _, _ := newTestMinter(agedMint(minterCacheMargin - time.Minute))
+	for i := 0; i < 5; i++ {
+		if _, _, err := m.Mint(context.Background(), "pot", fmt.Sprintf("vd%d", i)); err != nil {
+			t.Fatalf("mint %d: %v", i, err)
+		}
+	}
+	if got := atomic.LoadInt64(launches); got != 1 {
+		t.Errorf("launches = %d, want 1: a grant that is exhausted on arrival must not recycle the session", got)
+	}
+	m.mu.Lock()
+	grant := m.grantExpiresAt
+	m.mu.Unlock()
+	if !grant.IsZero() {
+		t.Errorf("grantExpiresAt = %v, want zero: an unusable grant bounds nothing", grant)
+	}
+}
+
+// TestGrantZeroExpiryKeepsSession pins that a mint result with no attested expiry
+// records no grant, so the session stays bounded by maxAge alone and repeated
+// requests keep the one attestation.
+func TestGrantZeroExpiryKeepsSession(t *testing.T) {
+	m, launches, _, _ := newTestMinter(okMint) // Lifetime only, zero ExpiresAt
+	for i := 0; i < 3; i++ {
+		if _, _, err := m.Mint(context.Background(), "pot", fmt.Sprintf("vd%d", i)); err != nil {
+			t.Fatalf("mint %d: %v", i, err)
+		}
+	}
+	if got := atomic.LoadInt64(launches); got != 1 {
+		t.Errorf("launches = %d, want 1 (a result with no attested expiry must not recycle)", got)
+	}
+}
+
 // TestMinterCloseClearsCaches: Close releases both cache maps so a retained
 // reference to a closed Minter does not hold token entries.
 func TestMinterCloseClearsCaches(t *testing.T) {
-	m := NewMinter("v", browser.Options{}, 0, 0)
+	m := newBareMinter(0, 0)
 	m.cache["gvs|vd"] = cachedToken{gen: 1, expiry: time.Now().Add(time.Hour)}
 	m.negCache["vid"] = negEntry{err: browser.ErrUnplayable, expiry: time.Now().Add(time.Hour)}
 	m.Close() // session-less: no browser to tear down
@@ -830,7 +1100,7 @@ func TestMinterNegCacheSurvivesRecycle(t *testing.T) {
 func newPingMinter(ping func() error) (*Minter, *[]*fakeSession, *sync.Mutex) {
 	var sessions []*fakeSession
 	var smu sync.Mutex
-	m := NewMinter("v", browser.Options{}, 0, 0)
+	m := newBareMinter(0, 0)
 	m.launch = func(context.Context) (minterSession, error) {
 		fs := &fakeSession{
 			mint: func(string) (browser.MintResult, error) { return browser.MintResult{Lifetime: 3600}, nil },
@@ -883,22 +1153,70 @@ func TestMinterHealthLivePing(t *testing.T) {
 	}
 }
 
-// A failed health probe retires the idle session and counts the browser loss.
+// A health probe that fails twice retires the idle session and counts the
+// browser loss.
 func TestMinterHealthDeadPingRetires(t *testing.T) {
-	m, sessions, smu := newPingMinter(func() error { return errors.New("cdp connection closed") })
+	var probes int64
+	m, sessions, smu := newPingMinter(func() error {
+		atomic.AddInt64(&probes, 1)
+		return errors.New("cdp connection closed")
+	})
 	if err := m.Warm(context.Background()); err != nil {
 		t.Fatalf("warm: %v", err)
 	}
 	if _, _, err := m.Health(context.Background()); err == nil {
 		t.Fatal("Health = nil, want the probe error")
 	}
+	if got := atomic.LoadInt64(&probes); got != 2 {
+		t.Errorf("probes = %d, want 2: a failure is confirmed before anything is retired", got)
+	}
 	if got := m.metrics.Crashes.Load(); got != 1 {
 		t.Errorf("crashes = %d, want 1 (an unresponsive /ping counts as browser loss)", got)
+	}
+	if got := m.metrics.ProbeFailures.Load(); got != 1 {
+		t.Errorf("probe_failures = %d, want 1 (one probe-failed response)", got)
 	}
 	smu.Lock()
 	defer smu.Unlock()
 	if !(*sessions)[0].closed.Load() {
 		t.Error("failed probe did not retire the idle session")
+	}
+}
+
+// One transient probe failure must not destroy a warm generation. The image's
+// HEALTHCHECK runs `waxseal ping --strict` every 30 seconds, so acting on a
+// single failure would forge a browser-death signal on a healthy daemon.
+func TestMinterHealthTransientPingRecoversOnConfirmation(t *testing.T) {
+	var probes int64
+	m, sessions, smu := newPingMinter(func() error {
+		if atomic.AddInt64(&probes, 1) == 1 {
+			return context.DeadlineExceeded // the failure mode this guards
+		}
+		return nil
+	})
+	if err := m.Warm(context.Background()); err != nil {
+		t.Fatalf("warm: %v", err)
+	}
+	snap, live, err := m.Health(context.Background())
+	if err != nil || !live {
+		t.Fatalf("Health = (%v, live=%v), want the recovered session", err, live)
+	}
+	if snap.Generation != 1 {
+		t.Errorf("generation = %d, want 1 (the original session)", snap.Generation)
+	}
+	if got := atomic.LoadInt64(&probes); got != 2 {
+		t.Errorf("probes = %d, want 2 (the failure plus its confirmation)", got)
+	}
+	if got := m.metrics.Crashes.Load(); got != 0 {
+		t.Errorf("crashes = %d, want 0", got)
+	}
+	if got := m.metrics.ProbeFailures.Load(); got != 0 {
+		t.Errorf("probe_failures = %d, want 0", got)
+	}
+	smu.Lock()
+	defer smu.Unlock()
+	if (*sessions)[0].closed.Load() {
+		t.Error("a probe that recovered on confirmation retired the session")
 	}
 }
 
@@ -965,7 +1283,9 @@ func TestMinterRetireCrashCount(t *testing.T) {
 	}
 }
 
-// A failed probe must not retire a session while its page is in use.
+// A confirmed probe failure must not retire a session while its page is in use,
+// and must report the benign busy state rather than probe-failed: nothing was
+// acted on, so three of these must not mark a healthy container unhealthy.
 func TestMinterHealthDeadPingHeldMintMuNoRetire(t *testing.T) {
 	m, sessions, smu := newPingMinter(func() error { return errors.New("cdp connection closed") })
 	if err := m.Warm(context.Background()); err != nil {
@@ -974,8 +1294,14 @@ func TestMinterHealthDeadPingHeldMintMuNoRetire(t *testing.T) {
 	m.mintMu.Lock() // Hold the page lock during the probe.
 	_, _, err := m.Health(context.Background())
 	m.mintMu.Unlock()
-	if err == nil {
-		t.Fatal("Health = nil, want the probe error")
+	if !errors.Is(err, ErrProbeBusy) {
+		t.Fatalf("Health = %v, want ErrProbeBusy", err)
+	}
+	if got := m.metrics.ProbeFailures.Load(); got != 0 {
+		t.Errorf("probe_failures = %d, want 0 (nothing was retired)", got)
+	}
+	if got := m.metrics.Crashes.Load(); got != 0 {
+		t.Errorf("crashes = %d, want 0 (nothing was retired)", got)
 	}
 	smu.Lock()
 	defer smu.Unlock()
@@ -1004,7 +1330,7 @@ func TestMinterHealthCanceledCtxNoRetire(t *testing.T) {
 
 // Health retries when the probed session is replaced concurrently.
 func TestMinterHealthReprobesAfterRecycle(t *testing.T) {
-	m := NewMinter("v", browser.Options{}, 0, 0)
+	m := newBareMinter(0, 0)
 	sess2 := &fakeSession{
 		id:   browser.Identity{VisitorData: "vd2"},
 		mint: func(string) (browser.MintResult, error) { return browser.MintResult{Lifetime: 3600}, nil },
@@ -1042,7 +1368,7 @@ func TestMinterHealthReprobesAfterRecycle(t *testing.T) {
 // A successful probe of a session that was replaced mid-probe must not report the
 // stale generation as live. Health re-probes and reports the current session.
 func TestMinterHealthReprobesAfterRecycleOnSuccess(t *testing.T) {
-	m := NewMinter("v", browser.Options{}, 0, 0)
+	m := newBareMinter(0, 0)
 	sess2 := &fakeSession{
 		id:   browser.Identity{VisitorData: "vd2"},
 		mint: func(string) (browser.MintResult, error) { return browser.MintResult{Lifetime: 3600}, nil },
@@ -1082,7 +1408,7 @@ func TestMinterHealthReprobesAfterRecycleOnSuccess(t *testing.T) {
 // retries and reports a soft no-session (carrying the last-known generation)
 // rather than a stale probe-failed error for an already-replaced session.
 func TestMinterHealthPersistentSupersedeReportsNoSession(t *testing.T) {
-	m := NewMinter("v", browser.Options{}, 0, 0)
+	m := newBareMinter(0, 0)
 	sess3 := &fakeSession{
 		id:   browser.Identity{VisitorData: "vd3"},
 		mint: func(string) (browser.MintResult, error) { return browser.MintResult{Lifetime: 3600}, nil },
@@ -1171,8 +1497,9 @@ func TestMinterSelfTestMintFailuresCounted(t *testing.T) {
 	if err := m.SelfTest(context.Background()); err == nil {
 		t.Fatal("SelfTest = nil, want a persistent mint failure")
 	}
-	if got := m.metrics.MintFailures.Load(); got != int64(selfTestMintAttempts) {
-		t.Errorf("mint_failures = %d, want %d (one per attempt)", got, selfTestMintAttempts)
+	// One per attempt, plus the pre-mint attestation makes before the self-test.
+	if want := int64(selfTestMintAttempts) + 1; m.metrics.MintFailures.Load() != want {
+		t.Errorf("mint_failures = %d, want %d (one per attempt, plus the pre-mint)", m.metrics.MintFailures.Load(), want)
 	}
 }
 
@@ -1197,7 +1524,7 @@ func TestMinterSelfTestMintRetrySucceeds(t *testing.T) {
 
 // SelfTest logs establishment failures instead of returning them.
 func TestMinterSelfTestEstablishmentWarnOnly(t *testing.T) {
-	m := NewMinter("v", browser.Options{}, 0, 0)
+	m := newBareMinter(0, 0)
 	m.launch = func(context.Context) (minterSession, error) {
 		return &fakeSession{
 			mint: func(string) (browser.MintResult, error) {
@@ -1214,7 +1541,7 @@ func TestMinterSelfTestEstablishmentWarnOnly(t *testing.T) {
 // SessionSnapshot returns identity and cookies after establishment.
 func TestMinterSessionSnapshot(t *testing.T) {
 	wantCookie := &http.Cookie{Name: "VISITOR_INFO1_LIVE", Value: "abc"}
-	m := NewMinter("v", browser.Options{}, 0, 0)
+	m := newBareMinter(0, 0)
 	m.launch = func(context.Context) (minterSession, error) {
 		return &fakeSession{
 			id:      browser.Identity{VisitorData: "vd-snap"},
@@ -1236,7 +1563,7 @@ func TestMinterSessionSnapshot(t *testing.T) {
 
 // SessionSnapshot must not export a session that failed establishment.
 func TestMinterSessionSnapshotEstablishmentError(t *testing.T) {
-	m := NewMinter("v", browser.Options{}, 0, 0)
+	m := newBareMinter(0, 0)
 	m.launch = func(context.Context) (minterSession, error) {
 		return &fakeSession{
 			id:           browser.Identity{VisitorData: "vd"},
@@ -1251,7 +1578,7 @@ func TestMinterSessionSnapshotEstablishmentError(t *testing.T) {
 
 // SessionSnapshot returns cookie-read failures.
 func TestMinterSessionSnapshotCookieError(t *testing.T) {
-	m := NewMinter("v", browser.Options{}, 0, 0)
+	m := newBareMinter(0, 0)
 	m.launch = func(context.Context) (minterSession, error) {
 		return &fakeSession{
 			id:         browser.Identity{VisitorData: "vd"},
@@ -1274,7 +1601,7 @@ func newStreamingMinter(streamingMaxAge time.Duration, playerCtx func(videoID st
 	var launches int64
 	var sessions []*fakeSession
 	var smu sync.Mutex
-	m := NewMinter("v", browser.Options{}, streamingMaxAge, 0)
+	m := newBareMinter(streamingMaxAge, 0)
 	m.launch = func(context.Context) (minterSession, error) {
 		atomic.AddInt64(&launches, 1)
 		fs := &fakeSession{mint: okMint, playerCtx: playerCtx}
@@ -1472,6 +1799,11 @@ func TestMinterReportDegradedAlreadyRetired(t *testing.T) {
 	if res := m.ReportDegraded(1, "vid", "cap"); !res.Retired { // retires gen 1; sess→nil, gen stays 1
 		t.Fatalf("first report = %+v, want Retired", res)
 	}
+	// Drain the report budget so the rate-limit predicate is also true for the
+	// re-report, which is what makes the case ordering below observable.
+	m.mu.Lock()
+	m.reportTokens = 0
+	m.mu.Unlock()
 	// Report gen 1 again before any request relaunches the session.
 	res := m.ReportDegraded(1, "vid", "cap")
 	if res.Accepted || res.Generation != 1 {
@@ -1483,16 +1815,19 @@ func TestMinterReportDegradedAlreadyRetired(t *testing.T) {
 	if got := m.metrics.DegradationReportsRejectedStale.Load(); got != 0 {
 		t.Errorf("degradation_reports_rejected_stale = %d, want 0 (current gen, not stale)", got)
 	}
-	// The sess==nil case must precede the debounce case: a report-driven retire sets
-	// lastReportRetireAt, so this re-report also satisfies the debounce predicate.
-	// A miscount here (rate_limited == 1) would mean the switch was reordered.
+	// The sess==nil case must precede the rate-limit case: with the budget drained
+	// above, this re-report also satisfies the rate-limit predicate. A miscount
+	// here (rate_limited == 1) would mean the switch was reordered.
 	if got := m.metrics.DegradationReportsRateLimited.Load(); got != 0 {
 		t.Errorf("degradation_reports_rate_limited = %d, want 0 (already-retired must not route to debounce)", got)
 	}
 }
 
-// A second report within the debounce window is rate-limited.
-func TestMinterReportDegradedRateLimited(t *testing.T) {
+// Report-driven recycles allow a burst of ReportBurst before rate-limiting, so
+// a consumer whose bulk-enumeration throttle escape rotates identities several
+// times in one run is never declined mid-sequence. The report after the burst
+// is rate-limited with a positive retry hint.
+func TestMinterReportBurstThenRateLimited(t *testing.T) {
 	m, _, _, _ := newStreamingMinter(0, func(string) (browser.PlayerContext, error) {
 		return browser.PlayerContext{ServerAbrStreamingURL: "https://r/ok", VisitorData: "vd"}, nil
 	})
@@ -1500,18 +1835,23 @@ func TestMinterReportDegradedRateLimited(t *testing.T) {
 	if err := m.Warm(ctx); err != nil { // gen 1
 		t.Fatalf("warm: %v", err)
 	}
-	if res := m.ReportDegraded(1, "vid", "cap"); !res.Retired { // retires gen 1, starts debounce
-		t.Fatalf("first report = %+v, want Retired", res)
+	for gen := uint64(1); gen <= ReportBurst; gen++ {
+		if res := m.ReportDegraded(gen, "vid", "cap"); !res.Retired {
+			t.Fatalf("report %d = %+v, want Retired (within the burst allowance)", gen, res)
+		}
+		if _, g, err := m.PlayerContext(ctx, "vid"); err != nil || g != gen+1 { // relaunch
+			t.Fatalf("relaunch %d: gen=%d err=%v, want gen=%d", gen, g, err, gen+1)
+		}
 	}
-	if _, gen, err := m.PlayerContext(ctx, "vid"); err != nil || gen != 2 { // relaunch, gen 2 live
-		t.Fatalf("relaunch: gen=%d err=%v, want gen=2", gen, err)
-	}
-	res := m.ReportDegraded(2, "vid", "cap") // within debounce
+	res := m.ReportDegraded(ReportBurst+1, "vid", "cap") // budget spent
 	if res.Accepted || res.RetryAfterSeconds <= 0 {
-		t.Fatalf("within-debounce report = %+v, want !Accepted and RetryAfterSeconds>0", res)
+		t.Fatalf("report past the burst = %+v, want !Accepted and RetryAfterSeconds>0", res)
 	}
 	if got := m.metrics.DegradationReportsRateLimited.Load(); got != 1 {
 		t.Errorf("degradation_reports_rate_limited = %d, want 1", got)
+	}
+	if got := m.metrics.ReportDrivenRecycles.Load(); got != ReportBurst {
+		t.Errorf("report_driven_recycles = %d, want %d", got, ReportBurst)
 	}
 }
 
@@ -1593,9 +1933,47 @@ func TestMinterReportDuplicateWhilePending(t *testing.T) {
 	}
 }
 
-// A deferred report-driven retirement starts the debounce window.
-func TestMinterReportDeferredStartsDebounce(t *testing.T) {
+// TestReportDuplicatePendingIsCounted pins that a repeat report for a generation
+// whose retirement is already queued is counted. Summing the report dispositions
+// must equal the number of reports received.
+func TestReportDuplicatePendingIsCounted(t *testing.T) {
+	// startBlockingPlayerContext parks a goroutine inside mintMu so the first
+	// report defers retirement and leaves the suspect mark set.
 	m, _, _, release, done := startBlockingPlayerContext(t)
+	defer func() { release(); <-done }()
+
+	for i := 0; i < 3; i++ {
+		res := m.ReportDegraded(1, "vid", "cap")
+		if !res.Accepted || !res.RetirementPending {
+			t.Fatalf("report %d = %+v, want Accepted && RetirementPending", i+1, res)
+		}
+	}
+	if got := m.metrics.DegradationReportsAccepted.Load(); got != 1 {
+		t.Errorf("degradation_reports_accepted = %d, want 1", got)
+	}
+	if got := m.metrics.DegradationReportsDuplicatePending.Load(); got != 2 {
+		t.Errorf("degradation_reports_duplicate_pending = %d, want 2", got)
+	}
+	if got := m.metrics.DegradationReportsRejectedStale.Load(); got != 0 {
+		t.Errorf("degradation_reports_rejected_stale = %d, want 0", got)
+	}
+	if got := m.metrics.DegradationReportsAlreadyRetired.Load(); got != 0 {
+		t.Errorf("degradation_reports_already_retired = %d, want 0", got)
+	}
+	if got := m.metrics.DegradationReportsRateLimited.Load(); got != 0 {
+		t.Errorf("degradation_reports_rate_limited = %d, want 0", got)
+	}
+}
+
+// A deferred report-driven retirement spends report budget just like an
+// immediate one. With a single token left, the handoff's deferred retire
+// consumes it, so the next report is rate-limited.
+func TestMinterReportDeferredConsumesBudget(t *testing.T) {
+	m, _, _, release, done := startBlockingPlayerContext(t)
+
+	m.mu.Lock()
+	m.reportTokens = 1 // the deferred retire below spends the last token
+	m.mu.Unlock()
 
 	if res := m.ReportDegraded(1, "vid", "cap"); !res.RetirementPending {
 		t.Fatalf("report while busy = %+v, want RetirementPending", res)
@@ -1609,7 +1987,7 @@ func TestMinterReportDeferredStartsDebounce(t *testing.T) {
 	}
 	res := m.ReportDegraded(2, "vid", "cap")
 	if res.Accepted || res.RetryAfterSeconds <= 0 {
-		t.Fatalf("report after a deferred retire = %+v, want rate limited (the deferred path must start the debounce)", res)
+		t.Fatalf("report after a deferred retire = %+v, want rate limited (the deferred path must spend report budget)", res)
 	}
 	if got := m.metrics.DegradationReportsRateLimited.Load(); got != 1 {
 		t.Errorf("degradation_reports_rate_limited = %d, want 1", got)
@@ -1652,11 +2030,11 @@ func TestMinterReportConcurrentAtMostOnce(t *testing.T) {
 	}
 }
 
-// A report that loses the retire race to another goroutine must not arm the
-// debounce. lastReportRetireAt advances only when this report actually recycled
+// A report that loses the retire race to another goroutine must not spend
+// report budget. A token is consumed only when this report actually recycled
 // the session. Running several rounds makes the race show up without relying on
 // timing.
-func TestMinterReportNoopRetireDoesNotArmDebounce(t *testing.T) {
+func TestMinterReportNoopRetireDoesNotSpendBudget(t *testing.T) {
 	for round := 0; round < 200; round++ {
 		m, _, _, _ := newStreamingMinter(0, nil)
 		if err := m.Warm(context.Background()); err != nil { // gen 1
@@ -1670,11 +2048,13 @@ func TestMinterReportNoopRetireDoesNotArmDebounce(t *testing.T) {
 		wg.Wait()
 
 		m.mu.Lock()
-		armed := !m.lastReportRetireAt.IsZero()
+		spent := m.reportTokens < ReportBurst
 		m.mu.Unlock()
-		// The debounce is armed only when this report's own retire succeeded.
-		if armed != res.Retired {
-			t.Fatalf("round %d: debounce armed=%v but report Retired=%v (a no-op retire must not arm the debounce)", round, armed, res.Retired)
+		// Budget is spent only when this report's own retire succeeded. Refill
+		// cannot mask a spend here: it tops out at ReportBurst, and a consumed
+		// token cannot re-accrue within a test round under the 5m default.
+		if spent != res.Retired {
+			t.Fatalf("round %d: budget spent=%v but report Retired=%v (a no-op retire must not spend report budget)", round, spent, res.Retired)
 		}
 	}
 }
@@ -1729,7 +2109,7 @@ func TestMinterRetireClearsSuspect(t *testing.T) {
 // PlayerContext returns the generation that produced its context.
 func TestMinterGenerationIdentifiesContext(t *testing.T) {
 	var n int64
-	m := NewMinter("v", browser.Options{}, 0, 0)
+	m := newBareMinter(0, 0)
 	m.launch = func(context.Context) (minterSession, error) {
 		k := atomic.AddInt64(&n, 1)
 		return &fakeSession{
@@ -1757,7 +2137,7 @@ func TestMinterGenerationIdentifiesContext(t *testing.T) {
 // Health does not combine fields from different generations.
 func TestMinterHealthSnapshotSingleGeneration(t *testing.T) {
 	var n int64
-	m := NewMinter("v", browser.Options{}, 0, 0)
+	m := newBareMinter(0, 0)
 	m.launch = func(context.Context) (minterSession, error) {
 		k := atomic.AddInt64(&n, 1)
 		return &fakeSession{
@@ -1931,7 +2311,7 @@ func TestMetricsSnapshotNullEncoding(t *testing.T) {
 // TestCounterKeysAligned keeps counterValues and lifetimeCounterKeys in sync.
 // Per-tenant metrics and the redacted aggregate both rely on that shared key set.
 func TestCounterKeysAligned(t *testing.T) {
-	m := NewMinter("v", browser.Options{}, 0, 0)
+	m := NewMinter("v", browser.Options{}, 0, 0, 0)
 	cv := m.counterValues()
 	if len(cv) != len(lifetimeCounterKeys) {
 		t.Errorf("counterValues has %d keys, lifetimeCounterKeys has %d", len(cv), len(lifetimeCounterKeys))
@@ -2047,39 +2427,43 @@ func TestMinterMetricsRecycleSecondsClampedAtZero(t *testing.T) {
 	}
 }
 
-// ReportDebounce controls when a subsequent report is accepted.
+// ReportDebounce controls how fast spent report budget refills: one token per
+// window, so with the budget drained a report is accepted only once a full
+// window has passed.
 func TestMinterReportDebounceConfigurable(t *testing.T) {
-	m := NewMinter("v", browser.Options{}, 0, 250*time.Millisecond)
+	m := newBareMinter(0, 250*time.Millisecond)
 	m.launch = func(context.Context) (minterSession, error) { return &fakeSession{mint: okMint}, nil }
 	ctx := context.Background()
 	if err := m.Warm(ctx); err != nil { // gen 1
 		t.Fatalf("warm: %v", err)
 	}
-	// A report 200ms after retirement is within the 250ms window.
+	// 200ms of refill on a drained budget is 0.8 tokens under a 250ms window.
 	m.mu.Lock()
-	m.lastReportRetireAt = time.Now().Add(-200 * time.Millisecond)
+	m.reportTokens = 0
+	m.reportRefillAt = time.Now().Add(-200 * time.Millisecond)
 	m.mu.Unlock()
 	if res := m.ReportDegraded(1, "vid", "cap"); res.Accepted {
-		t.Fatalf("report 200ms after a retire = %+v, want rate limited under a 250ms debounce", res)
+		t.Fatalf("report 200ms after draining the budget = %+v, want rate limited under a 250ms debounce", res)
 	}
-	// A report 300ms after retirement is outside the configured window.
+	// 300ms of refill is a full token.
 	m.mu.Lock()
-	m.lastReportRetireAt = time.Now().Add(-300 * time.Millisecond)
+	m.reportTokens = 0
+	m.reportRefillAt = time.Now().Add(-300 * time.Millisecond)
 	m.mu.Unlock()
 	if res := m.ReportDegraded(1, "vid", "cap"); !res.Accepted {
-		t.Fatalf("report 300ms after a retire = %+v, want accepted under a 250ms debounce", res)
+		t.Fatalf("report 300ms after draining the budget = %+v, want accepted under a 250ms debounce", res)
 	}
 }
 
 // NewMinter falls back to the default debounce when given a non-positive window.
 func TestMinterReportDebounceDefaultsWhenUnset(t *testing.T) {
-	if m := NewMinter("v", browser.Options{}, 0, 0); m.reportDebounce != DefaultReportDebounce {
+	if m := NewMinter("v", browser.Options{}, 0, 0, 0); m.reportDebounce != DefaultReportDebounce {
 		t.Errorf("reportDebounce = %v, want default %v", m.reportDebounce, DefaultReportDebounce)
 	}
-	if m := NewMinter("v", browser.Options{}, 0, -time.Second); m.reportDebounce != DefaultReportDebounce {
+	if m := NewMinter("v", browser.Options{}, 0, -time.Second, 0); m.reportDebounce != DefaultReportDebounce {
 		t.Errorf("reportDebounce (negative) = %v, want default %v", m.reportDebounce, DefaultReportDebounce)
 	}
-	if m := NewMinter("v", browser.Options{}, 0, 90*time.Second); m.reportDebounce != 90*time.Second {
+	if m := NewMinter("v", browser.Options{}, 0, 90*time.Second, 0); m.reportDebounce != 90*time.Second {
 		t.Errorf("reportDebounce = %v, want 90s", m.reportDebounce)
 	}
 }
@@ -2095,6 +2479,9 @@ func TestMinterMintCancelNoEscalationNoRetire(t *testing.T) {
 	if err := m.Warm(context.Background()); err != nil {
 		t.Fatalf("warm: %v", err)
 	}
+	// The attestation pre-mint fails against this always-failing fake, so the
+	// canceled request is measured against what Warm left behind, not against zero.
+	afterWarm := m.metrics.MintFailures.Load()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // the caller has gone away
 
@@ -2102,8 +2489,8 @@ func TestMinterMintCancelNoEscalationNoRetire(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Mint = %v, want context.Canceled", err)
 	}
-	if got := m.metrics.MintFailures.Load(); got != 0 {
-		t.Errorf("mint_failures = %d, want 0 (a canceled caller is not a mint failure)", got)
+	if got := m.metrics.MintFailures.Load(); got != afterWarm {
+		t.Errorf("mint_failures = %d, want %d (a canceled caller is not a mint failure)", got, afterWarm)
 	}
 	if got := m.metrics.Escalations.Load(); got != 0 {
 		t.Errorf("escalations = %d, want 0 (no relaunch on cancel)", got)
@@ -2116,4 +2503,2657 @@ func TestMinterMintCancelNoEscalationNoRetire(t *testing.T) {
 	if (*sessions)[0].closed.Load() {
 		t.Error("a canceled mint must not retire/relaunch the session")
 	}
+}
+
+// The attestation mints the visitor's GVS token before publishing the session,
+// so the token a consumer streams with is already old when the first context is
+// established. PlayerContext is what launches here because it never mints on its
+// own, so every mint the fake records comes from the pre-mint.
+// TestEnsurePremintsGVSToken checks the attestation pre-mint under both
+// launchers a cold request can take: a player-context call, and a /get_pot mint
+// whose own binding happens to be the pre-minted one. Either way, exactly one
+// fake mint runs, and both the gvs and pot scopes hit it.
+func TestEnsurePremintsGVSToken(t *testing.T) {
+	newPremintMinter := func() (m *Minter, launches, mints *int64, bindings *[]string, bmu *sync.Mutex) {
+		mints = new(int64)
+		bindings = new([]string)
+		bmu = new(sync.Mutex)
+		m, launches, _, _ = newTestMinterFull(func(id string) (browser.MintResult, error) {
+			atomic.AddInt64(mints, 1)
+			bmu.Lock()
+			*bindings = append(*bindings, id)
+			bmu.Unlock()
+			return browser.MintResult{Kind: "integrity", Token: "pre-" + id, TokenLen: 6, Identifier: id, Lifetime: 3600}, nil
+		}, nil)
+		return m, launches, mints, bindings, bmu
+	}
+
+	checkPremint := func(t *testing.T, m *Minter, launches, mints *int64, bindings *[]string, bmu *sync.Mutex) {
+		t.Helper()
+		if got := atomic.LoadInt64(launches); got != 1 {
+			t.Fatalf("launches = %d, want 1", got)
+		}
+		if got := atomic.LoadInt64(mints); got != 1 {
+			t.Fatalf("fake mints = %d, want 1 (the pre-mint at attestation)", got)
+		}
+		bmu.Lock()
+		gotBinding := (*bindings)[0]
+		bmu.Unlock()
+		if gotBinding != "vd" {
+			t.Errorf("pre-mint bound to %q, want the session visitor_data %q", gotBinding, "vd")
+		}
+		if r, ok := m.cacheGet(cacheKey("gvs", "vd")); !ok || r.Token != "pre-vd" {
+			t.Errorf("cache[gvs|vd] = (%q, ok=%v), want the pre-minted token", r.Token, ok)
+		}
+		// The pre-mint also fills the default (pot) scope: scope only namespaces
+		// the cache, and the token is identical either way.
+		if r, ok := m.cacheGet(cacheKey("pot", "vd")); !ok || r.Token != "pre-vd" {
+			t.Errorf("cache[pot|vd] = (%q, ok=%v), want the pre-minted token", r.Token, ok)
+		}
+		m.mu.Lock()
+		lastMint := m.lastMintAt
+		m.mu.Unlock()
+		if lastMint.IsZero() {
+			t.Error("lastMintAt is zero after a successful pre-mint")
+		}
+		if got := m.metrics.Mints.Load(); got != 1 {
+			t.Errorf("mints metric = %d, want 1 (the pre-mint counts like any mint)", got)
+		}
+	}
+
+	t.Run("player-context launcher", func(t *testing.T) {
+		m, launches, mints, bindings, bmu := newPremintMinter()
+		ctx := context.Background()
+		if _, _, err := m.PlayerContext(ctx, "vid"); err != nil {
+			t.Fatalf("player-context: %v", err)
+		}
+		checkPremint(t, m, launches, mints, bindings, bmu)
+		// The consumer's own token request is then served from the pre-minted entry.
+		if _, cached, err := m.Mint(ctx, "gvs", "vd"); err != nil || !cached {
+			t.Errorf("gvs/vd after the pre-mint: cached=%v err=%v, want cached=true", cached, err)
+		}
+		if got := atomic.LoadInt64(mints); got != 1 {
+			t.Errorf("fake mints = %d, want 1 (the consumer request hit the pre-minted entry)", got)
+		}
+	})
+
+	t.Run("mint launcher", func(t *testing.T) {
+		m, launches, mints, bindings, bmu := newPremintMinter()
+		ctx := context.Background()
+		// A cold /get_pot for the session's own visitor_data is what triggers the
+		// launch here. Mint re-checks the cache after ensure returns, so it must
+		// serve the pre-mint's entry rather than minting a second, redundant token
+		// and overwriting it.
+		r, cached, err := m.Mint(ctx, "gvs", "vd")
+		if err != nil {
+			t.Fatalf("mint: %v", err)
+		}
+		if !cached {
+			t.Error("cached = false, want true: the pre-mint should have filled this entry before Mint minted again")
+		}
+		if r.Token != "pre-vd" {
+			t.Errorf("token = %q, want the pre-minted token pre-vd", r.Token)
+		}
+		checkPremint(t, m, launches, mints, bindings, bmu)
+	})
+}
+
+// A failed pre-mint still publishes the session: the next token request mints on
+// demand.
+func TestEnsurePremintFailureStillPublishes(t *testing.T) {
+	var attempt int64
+	m, launches, _, _ := newTestMinterFull(func(string) (browser.MintResult, error) {
+		if atomic.AddInt64(&attempt, 1) == 1 {
+			return browser.MintResult{}, errors.New("pre-mint failed")
+		}
+		return browser.MintResult{Kind: "integrity", Token: "later", Lifetime: 3600}, nil
+	}, nil)
+	ctx := context.Background()
+
+	if _, _, err := m.PlayerContext(ctx, "vid"); err != nil {
+		t.Fatalf("player-context after a failed pre-mint: %v", err)
+	}
+	if got := atomic.LoadInt64(launches); got != 1 {
+		t.Errorf("launches = %d, want 1 (a failed pre-mint must not fail the launch)", got)
+	}
+	if got := m.metrics.MintFailures.Load(); got != 1 {
+		t.Errorf("mint_failures = %d, want 1 (the pre-mint attempt)", got)
+	}
+	m.mu.Lock()
+	lastMint := m.lastMintAt
+	m.mu.Unlock()
+	if !lastMint.IsZero() {
+		t.Error("lastMintAt is set after a failed pre-mint, want zero")
+	}
+	if r, cached, err := m.Mint(ctx, "gvs", "vd"); err != nil || cached || r.Token != "later" {
+		t.Errorf("gvs/vd after a failed pre-mint = (%q, cached=%v, %v), want a fresh mint", r.Token, cached, err)
+	}
+
+	// SelfTest's own fallback mint, taken when a failed pre-mint left the gvs
+	// entry missing, caches under both scopes too, matching the pre-mint's dual
+	// write. A fresh minter here isolates the scenario: SelfTest itself must be
+	// what triggers the launch, or the gvs entry would already be filled by the
+	// time SelfTest checks for it.
+	var attempt2 int64
+	m2, _, _, _ := newTestMinterFull(func(string) (browser.MintResult, error) {
+		if atomic.AddInt64(&attempt2, 1) == 1 {
+			return browser.MintResult{}, errors.New("pre-mint failed")
+		}
+		return browser.MintResult{Kind: "integrity", Token: "later", Lifetime: 3600}, nil
+	}, nil)
+	if err := m2.SelfTest(ctx); err != nil {
+		t.Fatalf("self-test after a failed pre-mint: %v", err)
+	}
+	if r, ok := m2.cacheGet(cacheKey("gvs", "vd")); !ok || r.Token != "later" {
+		t.Errorf("cache[gvs|vd] after self-test's fallback mint = (%q, ok=%v), want the fallback-minted token", r.Token, ok)
+	}
+	if r, ok := m2.cacheGet(cacheKey("pot", "vd")); !ok || r.Token != "later" {
+		t.Errorf("cache[pot|vd] after self-test's fallback mint = (%q, ok=%v), want the fallback-minted token", r.Token, ok)
+	}
+}
+
+// A cache miss is counted only for a request that actually pays for an in-page
+// mint. A request served by the pre-mint counts as a hit only, and a request
+// whose launch fails is counted by launch_failures alone, not also as a miss.
+func TestMintCacheMissCountedOnlyOnGenuineMiss(t *testing.T) {
+	// Served by the pre-mint: no miss, one hit.
+	m, _, _, _ := newTestMinter(okMint)
+	if _, cached, err := m.Mint(context.Background(), "gvs", "vd"); err != nil || !cached {
+		t.Fatalf("mint: cached=%v err=%v, want cached=true (served by the pre-mint)", cached, err)
+	}
+	if got := m.metrics.CacheMisses.Load(); got != 0 {
+		t.Errorf("cache_misses = %d, want 0 (the pre-mint served the request)", got)
+	}
+	if got := m.metrics.CacheHits.Load(); got != 1 {
+		t.Errorf("cache_hits = %d, want 1", got)
+	}
+
+	// A failed launch: no miss, one launch failure.
+	failing := newBareMinter(0, 0)
+	failing.launch = func(context.Context) (minterSession, error) {
+		return nil, errors.New("launch failed")
+	}
+	if _, _, err := failing.Mint(context.Background(), "gvs", "vd"); err == nil {
+		t.Fatal("mint returned a nil error, want the launch failure")
+	}
+	if got := failing.metrics.CacheMisses.Load(); got != 0 {
+		t.Errorf("cache_misses = %d, want 0 (the launch failed before any mint was attempted)", got)
+	}
+	if got := failing.metrics.LaunchFailures.Load(); got != 1 {
+		t.Errorf("launch_failures = %d, want 1", got)
+	}
+
+	// A genuine miss: the pre-mint's binding differs from the request's, so the
+	// request pays for its own in-page mint and this is the only case that counts
+	// a cache miss.
+	m2, _, _, _ := newTestMinter(okMint)
+	if _, cached, err := m2.Mint(context.Background(), "player", "vid2"); err != nil || cached {
+		t.Fatalf("mint: cached=%v err=%v, want a fresh mint", cached, err)
+	}
+	if got := m2.metrics.CacheMisses.Load(); got != 1 {
+		t.Errorf("cache_misses = %d, want 1", got)
+	}
+}
+
+// A context establishment waits out the window since the last in-page mint, and
+// a mint older than the window does not hold it back.
+func TestPlayerContextWaitsForMintSeparation(t *testing.T) {
+	ctx := context.Background()
+
+	held, _, _, _ := newTestMinterFull(okMint, nil)
+	if err := held.Warm(ctx); err != nil {
+		t.Fatalf("warm: %v", err)
+	}
+	held.mintSeparation = 50 * time.Millisecond
+	held.mu.Lock()
+	held.lastMintAt = time.Now()
+	held.mu.Unlock()
+
+	start := time.Now()
+	if _, _, err := held.PlayerContext(ctx, "vid"); err != nil {
+		t.Fatalf("player-context: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed < 50*time.Millisecond {
+		t.Errorf("player-context returned after %v, want at least the 50ms separation", elapsed)
+	}
+	if got := held.metrics.SeparationWaits.Load(); got != 1 {
+		t.Errorf("separation_waits = %d, want 1", got)
+	}
+
+	// A five second window with a ten second old mint and proof: no wait. The
+	// first call proves the session, so the second one reads the marks below
+	// rather than a proof it just performed.
+	free, _, _, _ := newTestMinterFull(okMint, nil)
+	if err := free.Warm(ctx); err != nil {
+		t.Fatalf("warm: %v", err)
+	}
+	if _, _, err := free.PlayerContext(ctx, "vid"); err != nil {
+		t.Fatalf("first player-context: %v", err)
+	}
+	free.mintSeparation = 5 * time.Second
+	free.mu.Lock()
+	free.lastMintAt = time.Now().Add(-10 * time.Second)
+	free.lastProofAt = time.Now().Add(-10 * time.Second)
+	free.mu.Unlock()
+
+	start = time.Now()
+	if _, _, err := free.PlayerContext(ctx, "vid"); err != nil {
+		t.Fatalf("player-context: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("player-context took %v, want no wait for a mint older than the window", elapsed)
+	}
+	if got := free.metrics.SeparationWaits.Load(); got != 0 {
+		t.Errorf("separation_waits = %d, want 0 (the mint was already outside the window)", got)
+	}
+}
+
+// The same spacing applies the other way round: a mint waits out the window
+// since the last establishment.
+func TestMintWaitsAfterEstablishment(t *testing.T) {
+	ctx := context.Background()
+
+	held, _, _, _ := newTestMinter(okMint)
+	if err := held.Warm(ctx); err != nil {
+		t.Fatalf("warm: %v", err)
+	}
+	held.mintSeparation = 50 * time.Millisecond
+	held.mu.Lock()
+	held.lastEstablishAt = time.Now()
+	held.mu.Unlock()
+
+	start := time.Now()
+	if _, cached, err := held.Mint(ctx, "player", "vid"); err != nil || cached {
+		t.Fatalf("mint: cached=%v err=%v, want a fresh mint", cached, err)
+	}
+	if elapsed := time.Since(start); elapsed < 50*time.Millisecond {
+		t.Errorf("mint returned after %v, want at least the 50ms separation", elapsed)
+	}
+	if got := held.metrics.SeparationWaits.Load(); got != 1 {
+		t.Errorf("separation_waits = %d, want 1", got)
+	}
+
+	free, _, _, _ := newTestMinter(okMint)
+	if err := free.Warm(ctx); err != nil {
+		t.Fatalf("warm: %v", err)
+	}
+	free.mintSeparation = 5 * time.Second
+	free.mu.Lock()
+	free.lastEstablishAt = time.Now().Add(-10 * time.Second)
+	free.mu.Unlock()
+
+	start = time.Now()
+	if _, cached, err := free.Mint(ctx, "player", "vid"); err != nil || cached {
+		t.Fatalf("mint: cached=%v err=%v, want a fresh mint", cached, err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("mint took %v, want no wait for an establishment older than the window", elapsed)
+	}
+	if got := free.metrics.SeparationWaits.Load(); got != 0 {
+		t.Errorf("separation_waits = %d, want 0 (the establishment was already outside the window)", got)
+	}
+}
+
+// A failed sess.PlayerContext attempt still arms the mint gate: the page was
+// touched even though the attempt never succeeded, so a following cache-miss
+// mint waits out the separation window just as it would after a successful
+// context.
+func TestFailedPlayerContextArmsMintGate(t *testing.T) {
+	ctx := context.Background()
+	failing := errors.New("player-context failed")
+	m, _, _, _ := newTestMinterFull(okMint, func(string) (browser.PlayerContext, error) {
+		return browser.PlayerContext{}, failing
+	})
+	// mintSeparation stays 0 (newBareMinter's default) through the failing call,
+	// so its own internal waits do not slow this test down; only the effect on a
+	// later mint is under test.
+	if _, _, err := m.PlayerContext(ctx, "vid"); err == nil {
+		t.Fatal("player-context = nil error, want the configured failure")
+	}
+	m.mintSeparation = 50 * time.Millisecond
+
+	start := time.Now()
+	if _, cached, err := m.Mint(ctx, "player", "vid2"); err != nil || cached {
+		t.Fatalf("mint: cached=%v err=%v, want a fresh mint", cached, err)
+	}
+	if elapsed := time.Since(start); elapsed < 50*time.Millisecond {
+		t.Errorf("mint returned after %v, want at least the 50ms separation from the failed player-context attempt", elapsed)
+	}
+	if got := m.metrics.SeparationWaits.Load(); got != 1 {
+		t.Errorf("separation_waits = %d, want 1", got)
+	}
+}
+
+// A caller that goes away during a separation wait gets the context error, and
+// neither the establishment nor the mint it was waiting for happens.
+func TestSeparationWaitHonoursContext(t *testing.T) {
+	var pcCalls, mintCalls int64
+	countingMint := func(string) (browser.MintResult, error) {
+		atomic.AddInt64(&mintCalls, 1)
+		return browser.MintResult{Kind: "integrity", Token: "t", Lifetime: 3600}, nil
+	}
+
+	// The establishment side.
+	pcSide, _, _, _ := newTestMinterFull(countingMint, func(string) (browser.PlayerContext, error) {
+		atomic.AddInt64(&pcCalls, 1)
+		return browser.PlayerContext{ServerAbrStreamingURL: "https://r/ok", VisitorData: "vd"}, nil
+	})
+	if err := pcSide.Warm(context.Background()); err != nil {
+		t.Fatalf("warm: %v", err)
+	}
+	pcSide.mintSeparation = time.Minute
+	pcSide.mu.Lock()
+	pcSide.lastMintAt = time.Now()
+	pcSide.mu.Unlock()
+	afterWarm := atomic.LoadInt64(&mintCalls)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+	}()
+	if _, _, err := pcSide.PlayerContext(ctx, "vid"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("player-context err = %v, want context.Canceled", err)
+	}
+	if got := atomic.LoadInt64(&pcCalls); got != 0 {
+		t.Errorf("session player-context calls = %d, want 0 (the wait was abandoned)", got)
+	}
+	if got := atomic.LoadInt64(&mintCalls); got != afterWarm {
+		t.Errorf("fake mints = %d, want %d (no mint during an abandoned wait)", got, afterWarm)
+	}
+
+	// The mint side.
+	atomic.StoreInt64(&mintCalls, 0)
+	mintSide, _, _, _ := newTestMinter(countingMint)
+	if err := mintSide.Warm(context.Background()); err != nil {
+		t.Fatalf("warm: %v", err)
+	}
+	mintSide.mintSeparation = time.Minute
+	mintSide.mu.Lock()
+	mintSide.lastEstablishAt = time.Now()
+	mintSide.mu.Unlock()
+	afterWarm = atomic.LoadInt64(&mintCalls)
+
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		cancel2()
+	}()
+	if _, _, err := mintSide.Mint(ctx2, "player", "vid"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("mint err = %v, want context.Canceled", err)
+	}
+	if got := atomic.LoadInt64(&mintCalls); got != afterWarm {
+		t.Errorf("fake mints = %d, want %d (no mint during an abandoned wait)", got, afterWarm)
+	}
+}
+
+// The self-test reuses the token the attestation already minted instead of
+// spending a second in-page mint on the same binding.
+func TestSelfTestSkipsMintWhenPreminted(t *testing.T) {
+	var mints int64
+	m, _, _, _ := newTestMinter(func(id string) (browser.MintResult, error) {
+		atomic.AddInt64(&mints, 1)
+		return browser.MintResult{Kind: "integrity", Token: "tok-" + id, Lifetime: 3600}, nil
+	})
+	if err := m.SelfTest(context.Background()); err != nil {
+		t.Fatalf("SelfTest: %v", err)
+	}
+	if got := atomic.LoadInt64(&mints); got != 1 {
+		t.Errorf("fake mints = %d, want 1 (the pre-mint; the self-test reused it)", got)
+	}
+	if got := m.metrics.Mints.Load(); got != 1 {
+		t.Errorf("mints metric = %d, want 1", got)
+	}
+}
+
+// TestSelfTestPrewarmsBothVisitorDataScopes pins that the startup token is
+// reachable to a scope-less client. Scope only namespaces the cache, so the same
+// token serves both keys, whether it came from the pre-mint at attestation or
+// from the self-test's own fallback mint.
+func TestSelfTestPrewarmsBothVisitorDataScopes(t *testing.T) {
+	assertBothScopes := func(t *testing.T, m *Minter) {
+		t.Helper()
+		gvs, ok := m.cacheGet(cacheKey("gvs", "vd"))
+		if !ok {
+			t.Fatal("cacheGet(gvs|vd) missed, want a hit")
+		}
+		pot, ok := m.cacheGet(cacheKey("pot", "vd"))
+		if !ok {
+			t.Fatal("cacheGet(pot|vd) missed, want a hit")
+		}
+		if gvs.Token != pot.Token {
+			t.Errorf("gvs token %q != pot token %q, want the same token under both scopes", gvs.Token, pot.Token)
+		}
+	}
+
+	t.Run("premint succeeds", func(t *testing.T) {
+		m, _, _, _ := newTestMinter(func(id string) (browser.MintResult, error) {
+			return browser.MintResult{Kind: "integrity", Token: "tok-" + id, Lifetime: 3600}, nil
+		})
+		if err := m.SelfTest(context.Background()); err != nil {
+			t.Fatalf("SelfTest: %v", err)
+		}
+		assertBothScopes(t, m)
+	})
+
+	t.Run("premint fails, self-test mints", func(t *testing.T) {
+		// The first mint call is the attestation pre-mint inside ensure(); make it
+		// fail so the entry is missing when SelfTest checks the cache, forcing the
+		// fallback mint. The fallback's own first attempt then succeeds.
+		var calls int64
+		m, _, _, _ := newTestMinter(func(id string) (browser.MintResult, error) {
+			if atomic.AddInt64(&calls, 1) == 1 {
+				return browser.MintResult{}, errors.New("premint broken")
+			}
+			return browser.MintResult{Kind: "integrity", Token: "tok-" + id, Lifetime: 3600}, nil
+		})
+		if err := m.SelfTest(context.Background()); err != nil {
+			t.Fatalf("SelfTest: %v", err)
+		}
+		assertBothScopes(t, m)
+	})
+}
+
+// resetMintSeparationWarnOnces clears the process-wide once-guards on
+// mintSeparationFromEnv's warnings, so a test can observe a warning fire again
+// regardless of which subtest, or which other test in the package, already
+// triggered it first.
+func resetMintSeparationWarnOnces() {
+	mintSeparationUnparseableOnce = sync.Once{}
+	mintSeparationLargeOnce = sync.Once{}
+}
+
+// WAXSEAL_MINT_SEPARATION overrides the default; anything but a positive
+// duration keeps it. A value past mintSeparationWarn is still accepted, but logs
+// a warning, since a wait that long risks the per-request budget. Each subtest
+// resets the warning once-guards first so it observes its own first call, the
+// same way a process's very first tenant would.
+func TestMintSeparationOverride(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		env      string
+		want     time.Duration
+		wantWarn string // substring the warn log must contain; "" means don't check
+	}{
+		{"unset", "", defaultMintSeparation, ""},
+		{"valid", "3s", 3 * time.Second, ""},
+		{"valid sub-second", "250ms", 250 * time.Millisecond, ""},
+		{"unparseable", "soon", defaultMintSeparation, ""},
+		{"bare number", "12", defaultMintSeparation, ""},
+		{"zero", "0s", defaultMintSeparation, ""},
+		{"negative", "-5s", defaultMintSeparation, ""},
+		{"large", "90s", 90 * time.Second, "make first contexts time out"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(mintSeparationEnv, tc.env)
+			resetMintSeparationWarnOnces()
+			var logs bytes.Buffer
+			log := slog.New(slog.NewTextHandler(&logs, nil))
+			got := NewMinter("v", browser.Options{Logger: log}, 0, 0, 0).mintSeparation
+			if got != tc.want {
+				t.Errorf("%s=%q gave mintSeparation %v, want %v", mintSeparationEnv, tc.env, got, tc.want)
+			}
+			if tc.wantWarn != "" && !strings.Contains(logs.String(), tc.wantWarn) {
+				t.Errorf("%s=%q logged %q, want a warning containing %q", mintSeparationEnv, tc.env, logs.String(), tc.wantWarn)
+			}
+		})
+	}
+}
+
+// The unparseable-value and large-value warnings each log at most once per
+// process: a fleet of tenants that share one bad WAXSEAL_MINT_SEPARATION must not
+// repeat the identical warning once per tenant constructor.
+func TestMintSeparationWarnOncePerProcess(t *testing.T) {
+	t.Setenv(mintSeparationEnv, "90s")
+	resetMintSeparationWarnOnces()
+	var logs bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&logs, nil))
+
+	NewMinter("v1", browser.Options{Logger: log}, 0, 0, 0)
+	NewMinter("v2", browser.Options{Logger: log}, 0, 0, 0)
+	NewMinter("v3", browser.Options{Logger: log}, 0, 0, 0)
+
+	if got := strings.Count(logs.String(), "make first contexts time out"); got != 1 {
+		t.Errorf("large-value warning logged %d times across three tenant constructors, want 1", got)
+	}
+}
+
+// A positive mintSeparation passed to NewMinter (as server.Config.MintSeparation
+// reaches it) overrides WAXSEAL_MINT_SEPARATION outright: the env value is never
+// consulted, so no env-parsing warning fires either. A non-positive constructor
+// value keeps the env-derived fallback, matching every existing caller that
+// passes 0.
+func TestMintSeparationConstructorOverride(t *testing.T) {
+	t.Setenv(mintSeparationEnv, "3s")
+	resetMintSeparationWarnOnces()
+	var logs bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&logs, nil))
+
+	overridden := NewMinter("v", browser.Options{Logger: log}, 0, 0, 20*time.Second)
+	if overridden.mintSeparation != 20*time.Second {
+		t.Errorf("mintSeparation = %v, want the constructor override 20s", overridden.mintSeparation)
+	}
+
+	fallback := NewMinter("v", browser.Options{Logger: log}, 0, 0, 0)
+	if fallback.mintSeparation != 3*time.Second {
+		t.Errorf("mintSeparation = %v, want the env-derived 3s when the constructor value is non-positive", fallback.mintSeparation)
+	}
+}
+
+// The daemon proves full-length streaming once per browser session before it
+// hands out any context, so a consumer's context is never the session's first
+// establishment. The proof does not repeat on later requests.
+func TestPlayerContextProvesBeforeFirstContext(t *testing.T) {
+	var proofsWhenContextTaken []int
+	fs := &fakeSession{mint: okMint}
+	fs.playerCtx = func(string) (browser.PlayerContext, error) {
+		proofsWhenContextTaken = append(proofsWhenContextTaken, fs.proofCount())
+		return browser.PlayerContext{ServerAbrStreamingURL: "https://r/ok", VisitorData: "vd"}, nil
+	}
+	var launches int64
+	m := newBareMinter(0, 0)
+	m.launch = func(context.Context) (minterSession, error) {
+		atomic.AddInt64(&launches, 1)
+		return fs, nil
+	}
+	ctx := context.Background()
+
+	if _, _, err := m.PlayerContext(ctx, "vid"); err != nil {
+		t.Fatalf("first player-context: %v", err)
+	}
+	if _, _, err := m.PlayerContext(ctx, "vid2"); err != nil {
+		t.Fatalf("second player-context: %v", err)
+	}
+	if got := fs.proofCount(); got != 1 {
+		t.Errorf("EnsureEstablished calls = %d, want 1 (the session proves once)", got)
+	}
+	if len(proofsWhenContextTaken) != 2 {
+		t.Fatalf("session player-context calls = %d, want 2", len(proofsWhenContextTaken))
+	}
+	if proofsWhenContextTaken[0] != 1 {
+		t.Errorf("proofs completed when the first context was taken = %d, want 1 (the proof runs first)", proofsWhenContextTaken[0])
+	}
+	if got := atomic.LoadInt64(&launches); got != 1 {
+		t.Errorf("launches = %d, want 1", got)
+	}
+	m.mu.Lock()
+	lastEstablish := m.lastEstablishAt
+	m.mu.Unlock()
+	if lastEstablish.IsZero() {
+		t.Error("lastEstablishAt is zero after the proof; the mint gate would not see it")
+	}
+	if got := m.metrics.UnprovenRejections.Load(); got != 0 {
+		t.Errorf("unproven_rejections = %d, want 0", got)
+	}
+}
+
+// A session that cannot prove full-length streaming produces no context: the
+// request is refused without relaunching, without asking the page for a context,
+// and without marking the video unplayable.
+func TestPlayerContextRefusesWhenProofFails(t *testing.T) {
+	var pcCalls int64
+	fs := &fakeSession{
+		mint:         okMint,
+		establishErr: errors.New("full-length proof failed"),
+		playerCtx: func(string) (browser.PlayerContext, error) {
+			atomic.AddInt64(&pcCalls, 1)
+			return browser.PlayerContext{ServerAbrStreamingURL: "https://r/ok", VisitorData: "vd"}, nil
+		},
+	}
+	var launches int64
+	m := newBareMinter(0, 0)
+	m.launch = func(context.Context) (minterSession, error) {
+		atomic.AddInt64(&launches, 1)
+		return fs, nil
+	}
+	ctx := context.Background()
+
+	_, _, err := m.PlayerContext(ctx, "vid")
+	if !errors.Is(err, ErrUnproven) {
+		t.Fatalf("err = %v, want ErrUnproven", err)
+	}
+	if got := m.metrics.UnprovenRejections.Load(); got != 1 {
+		t.Errorf("unproven_rejections = %d, want 1", got)
+	}
+	if got := atomic.LoadInt64(&pcCalls); got != 0 {
+		t.Errorf("session player-context calls = %d, want 0 (an unproven session hands out nothing)", got)
+	}
+	if got := atomic.LoadInt64(&launches); got != 1 {
+		t.Errorf("launches = %d, want 1 (a failed proof must not relaunch)", got)
+	}
+	if fs.closed.Load() {
+		t.Error("a failed proof must not retire the session")
+	}
+	if got := m.metrics.Escalations.Load(); got != 0 {
+		t.Errorf("escalations = %d, want 0", got)
+	}
+
+	// A repeat request inside the cool-down is refused at once, without another
+	// proof attempt: the video itself is not negative-cached, but the
+	// session-level proof cool-down still applies.
+	if _, _, err := m.PlayerContext(ctx, "vid"); !errors.Is(err, ErrUnproven) {
+		t.Fatalf("second request err = %v, want ErrUnproven", err)
+	}
+	if got := fs.proofCount(); got != 1 {
+		t.Errorf("EnsureEstablished calls = %d, want 1 (the cool-down must refuse without re-proving)", got)
+	}
+	if got := m.metrics.UnprovenRejections.Load(); got != 2 {
+		t.Errorf("unproven_rejections = %d, want 2 (both refused requests)", got)
+	}
+}
+
+// The window is measured from the last in-page mint or proof playback, whichever
+// is later, so a proof holds the next context back even when the mint is already
+// old.
+func TestPlayerContextWaitsAfterProof(t *testing.T) {
+	ctx := context.Background()
+
+	held, _, _, _ := newTestMinterFull(okMint, nil)
+	if err := held.Warm(ctx); err != nil {
+		t.Fatalf("warm: %v", err)
+	}
+	// The first call proves the session, so the second one reads the marks set
+	// below instead of a proof it just performed.
+	if _, _, err := held.PlayerContext(ctx, "vid"); err != nil {
+		t.Fatalf("first player-context: %v", err)
+	}
+	held.mintSeparation = 50 * time.Millisecond
+	held.mu.Lock()
+	held.lastMintAt = time.Now().Add(-time.Hour) // an anchor on the mint alone would not wait
+	held.lastProofAt = time.Now()
+	held.mu.Unlock()
+
+	start := time.Now()
+	if _, _, err := held.PlayerContext(ctx, "vid2"); err != nil {
+		t.Fatalf("player-context: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed < 50*time.Millisecond {
+		t.Errorf("player-context returned after %v, want at least the 50ms separation from the proof", elapsed)
+	}
+	if got := held.metrics.SeparationWaits.Load(); got != 1 {
+		t.Errorf("separation_waits = %d, want 1", got)
+	}
+
+	// A context handed out earlier does not extend the window: with the mint and
+	// the proof both old, a preceding handoff must not cause a wait.
+	free, _, _, _ := newTestMinterFull(okMint, nil)
+	if err := free.Warm(ctx); err != nil {
+		t.Fatalf("warm: %v", err)
+	}
+	if _, _, err := free.PlayerContext(ctx, "vid"); err != nil {
+		t.Fatalf("first player-context: %v", err)
+	}
+	free.mintSeparation = 5 * time.Second
+	free.mu.Lock()
+	free.lastMintAt = time.Now().Add(-10 * time.Second)
+	free.lastProofAt = time.Now().Add(-10 * time.Second)
+	free.lastEstablishAt = time.Now() // the handoff just performed
+	free.mu.Unlock()
+
+	start = time.Now()
+	if _, _, err := free.PlayerContext(ctx, "vid2"); err != nil {
+		t.Fatalf("player-context: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("player-context took %v, want no wait: a context handoff does not extend the window", elapsed)
+	}
+	if got := free.metrics.SeparationWaits.Load(); got != 0 {
+		t.Errorf("separation_waits = %d, want 0", got)
+	}
+}
+
+// A second SessionSnapshot call on an already-proved session neither waits nor
+// moves lastProofAt. The real EnsureEstablished short-circuits on an
+// already-proved session without playing anything, so treating that as a fresh
+// proof would move the separation anchor for free and force every later call to
+// wait for no reason.
+func TestSecondSessionSnapshotSkipsPhantomProof(t *testing.T) {
+	ctx := context.Background()
+	m, _, sessions, smu := newTestMinter(okMint)
+
+	if _, _, _, err := m.SessionSnapshot(ctx); err != nil {
+		t.Fatalf("first session snapshot: %v", err)
+	}
+	m.mu.Lock()
+	firstProof := m.lastProofAt
+	m.mu.Unlock()
+	if firstProof.IsZero() {
+		t.Fatal("lastProofAt is zero after the first snapshot")
+	}
+	smu.Lock()
+	fs := (*sessions)[0]
+	smu.Unlock()
+	if got := fs.proofCount(); got != 1 {
+		t.Fatalf("EnsureEstablished calls after the first snapshot = %d, want 1", got)
+	}
+
+	// A window well clear of the immediately preceding call makes the timing
+	// unambiguous: a phantom re-proof would wait almost the whole window because
+	// the first call's mark is still fresh.
+	m.mintSeparation = 300 * time.Millisecond
+
+	start := time.Now()
+	if _, _, _, err := m.SessionSnapshot(ctx); err != nil {
+		t.Fatalf("second session snapshot: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+		t.Errorf("second session snapshot took %v, want no wait: the session was already proved", elapsed)
+	}
+	if got := m.metrics.SeparationWaits.Load(); got != 0 {
+		t.Errorf("separation_waits = %d, want 0", got)
+	}
+	if got := fs.proofCount(); got != 1 {
+		t.Errorf("EnsureEstablished calls after the second snapshot = %d, want 1 (an already-proved session must not be re-proved)", got)
+	}
+	m.mu.Lock()
+	secondProof := m.lastProofAt
+	m.mu.Unlock()
+	if !secondProof.Equal(firstProof) {
+		t.Errorf("lastProofAt moved from %v to %v; a short-circuited establishment must not move it", firstProof, secondProof)
+	}
+}
+
+// A second SelfTest call on an already-proved session does not call
+// EnsureEstablished again or move lastProofAt, for the same reason as
+// SessionSnapshot above.
+func TestSelfTestSecondCallSkipsPhantomProof(t *testing.T) {
+	m, _, sessions, smu := newTestMinter(okMint)
+	ctx := context.Background()
+
+	if err := m.SelfTest(ctx); err != nil {
+		t.Fatalf("first self-test: %v", err)
+	}
+	m.mu.Lock()
+	firstProof := m.lastProofAt
+	m.mu.Unlock()
+	if firstProof.IsZero() {
+		t.Fatal("lastProofAt is zero after the first self-test")
+	}
+	smu.Lock()
+	fs := (*sessions)[0]
+	smu.Unlock()
+	if got := fs.proofCount(); got != 1 {
+		t.Fatalf("EnsureEstablished calls after the first self-test = %d, want 1", got)
+	}
+
+	if err := m.SelfTest(ctx); err != nil {
+		t.Fatalf("second self-test: %v", err)
+	}
+	if got := fs.proofCount(); got != 1 {
+		t.Errorf("EnsureEstablished calls after the second self-test = %d, want 1 (an already-proved session must not be re-proved)", got)
+	}
+	m.mu.Lock()
+	secondProof := m.lastProofAt
+	m.mu.Unlock()
+	if !secondProof.Equal(firstProof) {
+		t.Errorf("lastProofAt moved from %v to %v; a short-circuited establishment must not move it", firstProof, secondProof)
+	}
+}
+
+// A session whose proof fails is refused immediately on every request inside
+// the cool-down, without paying another proof attempt.
+func TestPlayerContextProofCooldownRefusesWithoutReproving(t *testing.T) {
+	fs := &fakeSession{mint: okMint, establishErr: errors.New("full-length proof failed")}
+	m := newBareMinter(0, 0)
+	m.launch = func(context.Context) (minterSession, error) { return fs, nil }
+	ctx := context.Background()
+
+	// The first request fails the proof and starts the cool-down.
+	if _, _, err := m.PlayerContext(ctx, "vid"); !errors.Is(err, ErrUnproven) {
+		t.Fatalf("first request err = %v, want ErrUnproven", err)
+	}
+	if got := fs.proofCount(); got != 1 {
+		t.Fatalf("EnsureEstablished calls after the first request = %d, want 1", got)
+	}
+
+	// A second request inside the cool-down is refused without another proof
+	// attempt or a relaunch.
+	if _, _, err := m.PlayerContext(ctx, "vid"); !errors.Is(err, ErrUnproven) {
+		t.Fatalf("second request err = %v, want ErrUnproven", err)
+	}
+	if got := fs.proofCount(); got != 1 {
+		t.Errorf("EnsureEstablished calls after the second request = %d, want 1 (the cool-down must refuse without re-proving)", got)
+	}
+	if got := m.metrics.UnprovenRejections.Load(); got != 2 {
+		t.Errorf("unproven_rejections = %d, want 2", got)
+	}
+	if got := m.metrics.Escalations.Load(); got != 0 {
+		t.Errorf("escalations = %d, want 0 (the cool-down must not relaunch)", got)
+	}
+	if fs.closed.Load() {
+		t.Error("a cool-down refusal must not retire the session")
+	}
+}
+
+// The cool-down warning logs once per window, not once per refused request: a
+// burst of repeated refusals against the same recorded failure must not flood
+// the log at warn level. Every refusal still counts toward unproven_rejections.
+func TestProofCooldownWarnOncePerWindow(t *testing.T) {
+	var logs bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&logs, nil))
+	fs := &fakeSession{mint: okMint, establishErr: errors.New("full-length proof failed")}
+	m := NewMinter("v", browser.Options{Logger: log}, 0, 0, 0)
+	m.mintSeparation = 0
+	m.launch = func(context.Context) (minterSession, error) { return fs, nil }
+	ctx := context.Background()
+
+	// The first request fails the proof and starts the cool-down.
+	if _, _, err := m.PlayerContext(ctx, "vid"); !errors.Is(err, ErrUnproven) {
+		t.Fatalf("first request err = %v, want ErrUnproven", err)
+	}
+
+	// Three more requests land inside the same cool-down window.
+	for i := 0; i < 3; i++ {
+		if _, _, err := m.PlayerContext(ctx, "vid"); !errors.Is(err, ErrUnproven) {
+			t.Fatalf("repeat request %d err = %v, want ErrUnproven", i, err)
+		}
+	}
+	if got := m.metrics.UnprovenRejections.Load(); got != 4 {
+		t.Errorf("unproven_rejections = %d, want 4 (every refusal counts)", got)
+	}
+	if got := strings.Count(logs.String(), "proof cool-down"); got != 1 {
+		t.Errorf("cool-down warning logged %d times across 4 refusals in the same window, want 1", got)
+	}
+}
+
+// A second proof failure on the same generation, once the cool-down has passed,
+// relaunches the session exactly once and re-proves on the new session, like the
+// mint and player-context ladders' second level.
+func TestPlayerContextProofSecondFailureRelaunchesAfterCooldown(t *testing.T) {
+	var launches int64
+	m := newBareMinter(0, 0)
+	m.launch = func(context.Context) (minterSession, error) {
+		n := atomic.AddInt64(&launches, 1)
+		if n == 1 {
+			return &fakeSession{mint: okMint, establishErr: errors.New("full-length proof failed")}, nil
+		}
+		return &fakeSession{mint: okMint}, nil // the relaunched session proves cleanly
+	}
+	ctx := context.Background()
+
+	if _, _, err := m.PlayerContext(ctx, "vid"); !errors.Is(err, ErrUnproven) {
+		t.Fatalf("first request err = %v, want ErrUnproven", err)
+	}
+	if got := atomic.LoadInt64(&launches); got != 1 {
+		t.Fatalf("launches = %d, want 1", got)
+	}
+	gen1 := m.Generation()
+	preSecond := m.metrics.UnprovenRejections.Load()
+
+	// Move the recorded failure outside the cool-down so the next request
+	// retries the proof instead of refusing on sight.
+	m.mu.Lock()
+	m.proofFailedAt = time.Now().Add(-proofRetryCooldown - time.Second)
+	m.mu.Unlock()
+
+	pc, gen2, err := m.PlayerContext(ctx, "vid")
+	if err != nil {
+		t.Fatalf("second request after the cool-down: %v", err)
+	}
+	if pc.ServerAbrStreamingURL == "" {
+		t.Error("second request returned an empty context")
+	}
+	if gen2 == gen1 {
+		t.Errorf("generation = %d, want a new generation after the second failure relaunched", gen2)
+	}
+	if got := atomic.LoadInt64(&launches); got != 2 {
+		t.Errorf("launches = %d, want 2 (exactly one relaunch)", got)
+	}
+	if got := m.metrics.Escalations.Load(); got != 1 {
+		t.Errorf("escalations = %d, want 1", got)
+	}
+	// The second request is served, not refused: its retry against generation 1
+	// fails and triggers the relaunch, but that failure is never itself returned
+	// to a caller, and the relaunched session's own proof succeeds.
+	// unproven_rejections counts refused requests, not proof attempts, so it
+	// stays exactly where the first request's refusal left it.
+	if got := m.metrics.UnprovenRejections.Load(); got != preSecond {
+		t.Errorf("unproven_rejections = %d, want %d (unchanged: the second request was served)", got, preSecond)
+	}
+}
+
+// A successful proof clears the recorded failure state, so a session that
+// recovers is not treated as still on cool-down, and its next failure (if any)
+// starts a fresh count rather than relaunching immediately.
+func TestPlayerContextProofSuccessClearsCooldown(t *testing.T) {
+	fs := &fakeSession{mint: okMint, establishErr: errors.New("full-length proof failed")}
+	m := newBareMinter(0, 0)
+	m.launch = func(context.Context) (minterSession, error) { return fs, nil }
+	ctx := context.Background()
+
+	if _, _, err := m.PlayerContext(ctx, "vid"); !errors.Is(err, ErrUnproven) {
+		t.Fatalf("first request err = %v, want ErrUnproven", err)
+	}
+	m.mu.Lock()
+	failGen := m.proofFailGen
+	m.mu.Unlock()
+	if failGen == 0 {
+		t.Fatal("proofFailGen is 0 after a failed proof")
+	}
+
+	// The session recovers, and the next request, past the cool-down, proves
+	// successfully.
+	fs.establishErr = nil
+	m.mu.Lock()
+	m.proofFailedAt = time.Now().Add(-proofRetryCooldown - time.Second)
+	m.mu.Unlock()
+
+	if _, _, err := m.PlayerContext(ctx, "vid"); err != nil {
+		t.Fatalf("second request: %v", err)
+	}
+	m.mu.Lock()
+	failGen, failedAt := m.proofFailGen, m.proofFailedAt
+	m.mu.Unlock()
+	if failGen != 0 || !failedAt.IsZero() {
+		t.Errorf("proof-failure state = (gen=%d, at=%v), want cleared after a successful proof", failGen, failedAt)
+	}
+	if got := m.metrics.Escalations.Load(); got != 0 {
+		t.Errorf("escalations = %d, want 0 (a successful proof past the cool-down must not relaunch)", got)
+	}
+	if got := fs.proofCount(); got != 2 {
+		t.Errorf("EnsureEstablished calls = %d, want 2 (the failed attempt and the successful retry)", got)
+	}
+}
+
+// A caller that goes away while the session is proving gets the context error,
+// and the proof is not counted as a failure: it was abandoned, not failed, so no
+// cool-down starts.
+func TestEnsureProvenHonoursContextDuringProof(t *testing.T) {
+	fs := &fakeSession{mint: okMint, establishBlocks: true}
+	m := newBareMinter(0, 0)
+	m.launch = func(context.Context) (minterSession, error) { return fs, nil }
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+	}()
+	if _, _, err := m.PlayerContext(ctx, "vid"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("player-context err = %v, want context.Canceled", err)
+	}
+	if got := m.metrics.UnprovenRejections.Load(); got != 0 {
+		t.Errorf("unproven_rejections = %d, want 0 (an abandoned proof is not a failure)", got)
+	}
+	if got := m.metrics.Escalations.Load(); got != 0 {
+		t.Errorf("escalations = %d, want 0", got)
+	}
+	if fs.closed.Load() {
+		t.Error("an abandoned proof must not retire the session")
+	}
+	m.mu.Lock()
+	failGen := m.proofFailGen
+	m.mu.Unlock()
+	if failGen != 0 {
+		t.Errorf("proofFailGen = %d, want 0 (an abandoned proof must not start the cool-down)", failGen)
+	}
+}
+
+// A self-test whose proof fails starts the same cool-down a first
+// player-context failure would, so the very next player-context request is
+// refused on sight instead of paying for another proof attempt against a
+// session that just failed one.
+func TestSelfTestFailureStartsCooldown(t *testing.T) {
+	fs := &fakeSession{mint: okMint, establishErr: errors.New("full-length proof failed")}
+	m := newBareMinter(0, 0)
+	m.launch = func(context.Context) (minterSession, error) { return fs, nil }
+	ctx := context.Background()
+
+	if err := m.SelfTest(ctx); err != nil {
+		t.Fatalf("SelfTest = %v, want nil after a logged establishment failure", err)
+	}
+	if got := fs.proofCount(); got != 1 {
+		t.Fatalf("EnsureEstablished calls after self-test = %d, want 1", got)
+	}
+
+	if _, _, err := m.PlayerContext(ctx, "vid"); !errors.Is(err, ErrUnproven) {
+		t.Fatalf("player-context err = %v, want ErrUnproven", err)
+	}
+	if got := fs.proofCount(); got != 1 {
+		t.Errorf("EnsureEstablished calls after player-context = %d, want 1 (the cool-down must refuse without another proof attempt)", got)
+	}
+	if got := m.metrics.UnprovenRejections.Load(); got != 1 {
+		t.Errorf("unproven_rejections = %d, want 1", got)
+	}
+}
+
+// A self-test failure never claims the failure streak's relaunch (it records
+// through recordProofFailure with claimRelaunch=false), so it counts only as the
+// generation's first failure. Once the cool-down has passed, the next
+// PlayerContext failure on that same generation is graded as the second failure
+// and relaunches exactly once, the same ladder a PlayerContext-only failure
+// streak follows.
+func TestSelfTestFailureThenPlayerContextRelaunchesAfterCooldown(t *testing.T) {
+	var launches int64
+	m := newBareMinter(0, 0)
+	m.launch = func(context.Context) (minterSession, error) {
+		n := atomic.AddInt64(&launches, 1)
+		if n == 1 {
+			return &fakeSession{mint: okMint, establishErr: errors.New("full-length proof failed")}, nil
+		}
+		return &fakeSession{mint: okMint}, nil // the relaunched session proves cleanly
+	}
+	ctx := context.Background()
+
+	if err := m.SelfTest(ctx); err != nil {
+		t.Fatalf("SelfTest = %v, want nil after a logged establishment failure", err)
+	}
+	gen1 := m.Generation()
+	if got := atomic.LoadInt64(&launches); got != 1 {
+		t.Fatalf("launches after self-test = %d, want 1", got)
+	}
+	if got := m.metrics.Escalations.Load(); got != 0 {
+		t.Fatalf("escalations after self-test = %d, want 0 (a self-test failure must not relaunch)", got)
+	}
+
+	// Move the recorded failure outside the cool-down so the next request
+	// retries the proof instead of refusing on sight.
+	m.mu.Lock()
+	m.proofFailedAt = time.Now().Add(-proofRetryCooldown - time.Second)
+	m.mu.Unlock()
+
+	pc, gen2, err := m.PlayerContext(ctx, "vid")
+	if err != nil {
+		t.Fatalf("player-context after the cool-down: %v", err)
+	}
+	if pc.ServerAbrStreamingURL == "" {
+		t.Error("player-context returned an empty context")
+	}
+	if gen2 == gen1 {
+		t.Errorf("generation = %d, want a new generation: the self-test failure's second failure must relaunch", gen2)
+	}
+	if got := atomic.LoadInt64(&launches); got != 2 {
+		t.Errorf("launches = %d, want 2 (exactly one relaunch)", got)
+	}
+	if got := m.metrics.Escalations.Load(); got != 1 {
+		t.Errorf("escalations = %d, want 1", got)
+	}
+}
+
+// Publishing a new generation clears the previous session's mint, proof, and
+// establishment marks, and any pending proof-failure cool-down: none of that
+// history describes the fresh page. The relaunch's own pre-mint then sets
+// lastMintAt again, so that mark alone is not left zero along with the rest.
+func TestEnsureResetsMarksOnNewGeneration(t *testing.T) {
+	m, launches, _, _ := newTestMinter(okMint)
+	ctx := context.Background()
+
+	if err := m.Warm(ctx); err != nil { // gen 1
+		t.Fatalf("warm: %v", err)
+	}
+	// Give generation 1 a full set of marks and a recorded proof failure, as a
+	// live session accumulates over time.
+	m.mu.Lock()
+	oldMint := time.Now().Add(-time.Hour)
+	m.lastMintAt = oldMint
+	m.lastProofAt = time.Now().Add(-time.Hour)
+	m.lastEstablishAt = time.Now().Add(-time.Hour)
+	m.proofFailGen = m.gen
+	m.proofFailedAt = time.Now().Add(-time.Hour)
+	gen1 := m.gen
+	m.mu.Unlock()
+
+	if !m.retire(gen1, "test", false) {
+		t.Fatal("retire(gen1) returned false, want true")
+	}
+	if _, _, err := m.ensure(ctx); err != nil {
+		t.Fatalf("ensure (relaunch): %v", err)
+	}
+	if got := atomic.LoadInt64(launches); got != 2 {
+		t.Fatalf("launches = %d, want 2", got)
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.gen == gen1 {
+		t.Fatal("generation did not advance")
+	}
+	if m.lastMintAt.IsZero() || m.lastMintAt.Equal(oldMint) {
+		t.Errorf("lastMintAt = %v, want the new generation's pre-mint time, not zero or the old generation's mark", m.lastMintAt)
+	}
+	if !m.lastProofAt.IsZero() {
+		t.Errorf("lastProofAt = %v, want zero on a fresh generation", m.lastProofAt)
+	}
+	if !m.lastEstablishAt.IsZero() {
+		t.Errorf("lastEstablishAt = %v, want zero on a fresh generation", m.lastEstablishAt)
+	}
+	if m.proofFailGen != 0 {
+		t.Errorf("proofFailGen = %d, want 0 on a fresh generation", m.proofFailGen)
+	}
+	if !m.proofFailedAt.IsZero() {
+		t.Errorf("proofFailedAt = %v, want zero on a fresh generation", m.proofFailedAt)
+	}
+}
+
+// If the relaunched session's own proof also fails inside ensureProven, the
+// request is refused with ErrUnproven rather than looping: the ladder relaunches
+// exactly once, and the fresh generation's own failure starts its own cool-down
+// independent of the generation it replaced.
+func TestPlayerContextProofSecondFailureRelaunchAlsoFails(t *testing.T) {
+	var launches int64
+	m := newBareMinter(0, 0)
+	m.launch = func(context.Context) (minterSession, error) {
+		atomic.AddInt64(&launches, 1)
+		return &fakeSession{mint: okMint, establishErr: errors.New("full-length proof failed")}, nil
+	}
+	ctx := context.Background()
+
+	if _, _, err := m.PlayerContext(ctx, "vid"); !errors.Is(err, ErrUnproven) {
+		t.Fatalf("first request err = %v, want ErrUnproven", err)
+	}
+	gen1 := m.Generation()
+
+	// Move the recorded failure outside the cool-down so the next request
+	// retries the proof instead of refusing on sight.
+	m.mu.Lock()
+	m.proofFailedAt = time.Now().Add(-proofRetryCooldown - time.Second)
+	m.mu.Unlock()
+
+	_, gen2, err := m.PlayerContext(ctx, "vid")
+	if !errors.Is(err, ErrUnproven) {
+		t.Fatalf("second request err = %v, want ErrUnproven", err)
+	}
+	if gen2 == gen1 {
+		t.Errorf("generation = %d, want a new generation after the relaunch", gen2)
+	}
+	if got := atomic.LoadInt64(&launches); got != 2 {
+		t.Errorf("launches = %d, want 2 (exactly one relaunch)", got)
+	}
+	if got := m.metrics.Escalations.Load(); got != 1 {
+		t.Errorf("escalations = %d, want 1 (the relaunch ladder fires exactly once)", got)
+	}
+	// Two refusals, not three: the first request's failure (starts the
+	// cool-down), and the second request's ultimate failure once the relaunched
+	// generation's own proof also fails. The second request's initial retry
+	// against generation 1 triggers the relaunch but is never itself returned to
+	// a caller, so only a return that hands an error back to the caller counts.
+	if got := m.metrics.UnprovenRejections.Load(); got != 2 {
+		t.Errorf("unproven_rejections = %d, want 2", got)
+	}
+	m.mu.Lock()
+	failGen, failedAt := m.proofFailGen, m.proofFailedAt
+	m.mu.Unlock()
+	if failGen != gen2 {
+		t.Errorf("proofFailGen = %d, want %d (the relaunched generation, not the one it replaced)", failGen, gen2)
+	}
+	if failedAt.IsZero() {
+		t.Error("proofFailedAt is zero after the relaunched session's failed proof")
+	}
+}
+
+// A proof that runs out the request's own deadline is recorded as a failure
+// rather than treated as an abandoned caller: the environment failed to prove
+// within the budget the handler gave it, so the cool-down applies to the next
+// request. The function still reports context.DeadlineExceeded, so the server's
+// timeout mapping is unchanged.
+func TestPlayerContextProofDeadlineExceededRecordsFailure(t *testing.T) {
+	fs := &fakeSession{mint: okMint, establishBlocks: true}
+	m := newBareMinter(0, 0)
+	m.launch = func(context.Context) (minterSession, error) { return fs, nil }
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	_, gen, err := m.PlayerContext(ctx, "vid")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want context.DeadlineExceeded", err)
+	}
+	m.mu.Lock()
+	failGen, failedAt := m.proofFailGen, m.proofFailedAt
+	m.mu.Unlock()
+	if failGen != gen {
+		t.Errorf("proofFailGen = %d, want %d (the deadline failure must be recorded)", failGen, gen)
+	}
+	if failedAt.IsZero() {
+		t.Error("proofFailedAt is zero after a deadline-exceeded proof")
+	}
+	if got := m.metrics.UnprovenRejections.Load(); got != 1 {
+		t.Errorf("unproven_rejections = %d, want 1", got)
+	}
+}
+
+// The proof-driven relaunch is spent once per failure streak, not once per
+// generation: while it is unspent, a generation's second proof failure
+// relaunches once; once spent, a second failure on any later generation
+// (whether that generation came from the proof ladder itself or from some other
+// relaunch entirely, such as a crash) records the failure and refuses without
+// relaunching again. Only a successful proof frees the streak's relaunch for
+// reuse.
+func TestPlayerContextProofRelaunchSpentOncePerStreak(t *testing.T) {
+	var launches int64
+	var gen3Session *fakeSession
+	m := newBareMinter(0, 0)
+	m.launch = func(context.Context) (minterSession, error) {
+		n := atomic.AddInt64(&launches, 1)
+		fs := &fakeSession{mint: okMint, establishErr: errors.New("full-length proof failed")}
+		if n == 3 {
+			gen3Session = fs
+		}
+		return fs, nil
+	}
+	ctx := context.Background()
+	rewindCooldown := func() {
+		m.mu.Lock()
+		m.proofFailedAt = time.Now().Add(-proofRetryCooldown - time.Second)
+		m.mu.Unlock()
+	}
+
+	// Generation 1's first failure: recorded, no relaunch.
+	if _, _, err := m.PlayerContext(ctx, "vid"); !errors.Is(err, ErrUnproven) {
+		t.Fatalf("gen1 first request err = %v, want ErrUnproven", err)
+	}
+	gen1 := m.Generation()
+
+	// Generation 1's second failure, past the cool-down: the streak's relaunch is
+	// unspent, so this relaunches to generation 2, whose own inline proof also
+	// fails as generation 2's first failure.
+	rewindCooldown()
+	if _, _, err := m.PlayerContext(ctx, "vid"); !errors.Is(err, ErrUnproven) {
+		t.Fatalf("gen1 second request err = %v, want ErrUnproven", err)
+	}
+	gen2 := m.Generation()
+	if gen2 == gen1 {
+		t.Fatal("generation did not advance after the second failure")
+	}
+	if got := atomic.LoadInt64(&launches); got != 2 {
+		t.Fatalf("launches = %d, want 2 (exactly one relaunch)", got)
+	}
+	if got := m.metrics.Escalations.Load(); got != 1 {
+		t.Fatalf("escalations = %d, want 1", got)
+	}
+
+	// Generation 2's second failure, past the cool-down: the streak already spent
+	// its relaunch, so this refuses instead of relaunching.
+	rewindCooldown()
+	if _, _, err := m.PlayerContext(ctx, "vid"); !errors.Is(err, ErrUnproven) {
+		t.Fatalf("gen2 second request err = %v, want ErrUnproven", err)
+	}
+	if got := atomic.LoadInt64(&launches); got != 2 {
+		t.Errorf("launches = %d, want 2 (the streak's relaunch is already spent)", got)
+	}
+
+	// Something other than the proof ladder relaunches the browser again (a
+	// crash, a mint failure, or a degradation report all retire the session and
+	// let the next ensure relaunch it). Generation 3's own failures must still
+	// honour the already-spent streak.
+	if !m.retire(gen2, "test: simulated out-of-band relaunch", false) {
+		t.Fatal("retire(gen2) returned false, want true")
+	}
+	if _, _, err := m.ensure(ctx); err != nil {
+		t.Fatalf("ensure (simulated relaunch): %v", err)
+	}
+	gen3 := m.Generation()
+	if gen3 == gen2 {
+		t.Fatal("generation did not advance after the simulated relaunch")
+	}
+	if got := atomic.LoadInt64(&launches); got != 3 {
+		t.Fatalf("launches = %d, want 3 (the simulated out-of-band relaunch)", got)
+	}
+
+	// Generation 3's first failure: recorded, no relaunch (not yet a second
+	// failure on this generation).
+	if _, _, err := m.PlayerContext(ctx, "vid"); !errors.Is(err, ErrUnproven) {
+		t.Fatalf("gen3 first request err = %v, want ErrUnproven", err)
+	}
+	if got := atomic.LoadInt64(&launches); got != 3 {
+		t.Errorf("launches = %d, want 3 (a first failure never relaunches)", got)
+	}
+
+	// Generation 3's second failure, past the cool-down: still refuses without
+	// relaunching, because the streak's one relaunch was spent back on
+	// generation 1 and a new generation does not reset it.
+	rewindCooldown()
+	if _, _, err := m.PlayerContext(ctx, "vid"); !errors.Is(err, ErrUnproven) {
+		t.Fatalf("gen3 second request err = %v, want ErrUnproven", err)
+	}
+	if got := atomic.LoadInt64(&launches); got != 3 {
+		t.Errorf("launches = %d, want 3 (the streak's relaunch stays spent across generations)", got)
+	}
+	if got := m.metrics.Escalations.Load(); got != 1 {
+		t.Errorf("escalations = %d, want 1 (no further relaunch across three failing generations)", got)
+	}
+
+	// The session recovers, and the next request, past the cool-down, proves
+	// successfully: that clears the flag.
+	gen3Session.establishErr = nil
+	rewindCooldown()
+	if _, _, err := m.PlayerContext(ctx, "vid"); err != nil {
+		t.Fatalf("gen3 recovery request: %v", err)
+	}
+	m.mu.Lock()
+	stillSet := m.proofRelaunched
+	m.mu.Unlock()
+	if stillSet {
+		t.Fatal("proofRelaunched is still set after a successful proof")
+	}
+
+	// A later double failure relaunches again: clearing the flag freed a fresh
+	// streak's one relaunch.
+	m.launch = func(context.Context) (minterSession, error) {
+		atomic.AddInt64(&launches, 1)
+		return &fakeSession{mint: okMint, establishErr: errors.New("full-length proof failed")}, nil
+	}
+	if !m.retire(gen3, "test: force a fresh failing generation", false) {
+		t.Fatal("retire(gen3) returned false, want true")
+	}
+	if _, _, err := m.ensure(ctx); err != nil {
+		t.Fatalf("ensure (fresh failing generation): %v", err)
+	}
+	launchesBeforeRelaunch := atomic.LoadInt64(&launches)
+	gen4 := m.Generation()
+
+	if _, _, err := m.PlayerContext(ctx, "vid"); !errors.Is(err, ErrUnproven) {
+		t.Fatalf("gen4 first request err = %v, want ErrUnproven", err)
+	}
+	rewindCooldown()
+	if _, _, err := m.PlayerContext(ctx, "vid"); !errors.Is(err, ErrUnproven) {
+		t.Fatalf("gen4 second request err = %v, want ErrUnproven", err)
+	}
+	if got := atomic.LoadInt64(&launches); got != launchesBeforeRelaunch+1 {
+		t.Errorf("launches = %d, want %d (a fresh streak relaunches once more)", got, launchesBeforeRelaunch+1)
+	}
+	if got := m.metrics.Escalations.Load(); got != 2 {
+		t.Errorf("escalations = %d, want 2 (a second relaunch after the flag cleared)", got)
+	}
+	gen5 := m.Generation()
+	if gen5 == gen4 {
+		t.Error("generation did not advance on the fresh streak's relaunch")
+	}
+}
+
+// The tests below cover a browser that dies while a request already holds its
+// session. Only the crash watcher retires a session without mintMu, so a session
+// superseded under a request means exactly that, and the request must take the
+// replacement and finish rather than feed the dead page's failure to the ladders
+// that grade live sessions. It is the SIGKILL-then-request race the provider
+// self-heal e2e test exercises. Each hook retires the way watchCrash does, so the
+// crash is counted once, by the retirement, and by nothing else.
+
+// errDeadPage is the shape of error a dead CDP connection produces.
+var errDeadPage = errors.New("cdp: connection closed: EOF")
+
+// crashUnder retires the current generation as the crash watcher would.
+func crashUnder(m *Minter) { m.retire(m.Generation(), "browser connection lost", true) }
+
+// requireCrashOnlyMetrics asserts that a mid-request crash left exactly one
+// crash behind and touched none of the failure ladders.
+func requireCrashOnlyMetrics(t *testing.T, m *Minter) {
+	t.Helper()
+	if got := m.metrics.Crashes.Load(); got != 1 {
+		t.Errorf("crashes = %d, want 1 (the watcher's retirement)", got)
+	}
+	if got := m.metrics.Escalations.Load(); got != 0 {
+		t.Errorf("escalations = %d, want 0 (a crash is not an escalation)", got)
+	}
+	if got := m.metrics.UnprovenRejections.Load(); got != 0 {
+		t.Errorf("unproven_rejections = %d, want 0 (the request was served)", got)
+	}
+	m.mu.Lock()
+	failGen, relaunched := m.proofFailGen, m.proofRelaunched
+	m.mu.Unlock()
+	if failGen != 0 || relaunched {
+		t.Errorf("proofFailGen = %d, proofRelaunched = %v; a dead page's proof must not start a cool-down or spend the streak's relaunch", failGen, relaunched)
+	}
+}
+
+// The exact race from the e2e test: the crash watcher retires the generation
+// while its proof is in flight. The request proves the replacement and is served.
+func TestPlayerContextSurvivesCrashDuringProof(t *testing.T) {
+	m := newBareMinter(0, 0)
+	var launches int64
+	first := &fakeSession{mint: okMint}
+	first.onEstablish = func() error {
+		crashUnder(m)
+		return errDeadPage
+	}
+	m.launch = func(context.Context) (minterSession, error) {
+		if atomic.AddInt64(&launches, 1) == 1 {
+			return first, nil
+		}
+		return &fakeSession{mint: okMint}, nil
+	}
+
+	pc, gen, err := m.PlayerContext(context.Background(), "vid")
+	if err != nil {
+		t.Fatalf("player-context after a crash mid-proof: %v, want it served from the replacement", err)
+	}
+	if gen != 2 {
+		t.Errorf("generation = %d, want 2 (the replacement)", gen)
+	}
+	if pc.ServerAbrStreamingURL == "" {
+		t.Error("served an empty context")
+	}
+	if got := atomic.LoadInt64(&launches); got != 2 {
+		t.Errorf("launches = %d, want 2 (one replacement)", got)
+	}
+	if !first.closed.Load() {
+		t.Error("the dead session was not closed")
+	}
+	if got := m.metrics.PlayerContextFailures.Load(); got != 0 {
+		t.Errorf("player_context_failures = %d, want 0", got)
+	}
+	if got := m.metrics.PlayerContexts.Load(); got != 1 {
+		t.Errorf("player_contexts = %d, want 1", got)
+	}
+	requireCrashOnlyMetrics(t, m)
+}
+
+// A request takes one replacement. If the replacement dies during its own proof,
+// the request is refused (there is no live session to serve it from) without
+// looping, and the following request relaunches and is served.
+func TestPlayerContextCrashDuringReplacementProofRefusesOnce(t *testing.T) {
+	m := newBareMinter(0, 0)
+	var launches int64
+	dying := func() *fakeSession {
+		fs := &fakeSession{mint: okMint}
+		fs.onEstablish = func() error {
+			crashUnder(m)
+			return errDeadPage
+		}
+		return fs
+	}
+	m.launch = func(context.Context) (minterSession, error) {
+		if atomic.AddInt64(&launches, 1) <= 2 {
+			return dying(), nil
+		}
+		return &fakeSession{mint: okMint}, nil
+	}
+	ctx := context.Background()
+
+	_, _, err := m.PlayerContext(ctx, "vid")
+	if !errors.Is(err, ErrUnproven) {
+		t.Fatalf("err = %v, want ErrUnproven when the replacement dies too", err)
+	}
+	if got := atomic.LoadInt64(&launches); got != 2 {
+		t.Fatalf("launches = %d, want 2 (the request takes one replacement, not a loop)", got)
+	}
+	if got := m.metrics.UnprovenRejections.Load(); got != 1 {
+		t.Errorf("unproven_rejections = %d, want 1 (the request was refused once)", got)
+	}
+	if got := m.metrics.Escalations.Load(); got != 0 {
+		t.Errorf("escalations = %d, want 0", got)
+	}
+	m.mu.Lock()
+	failGen := m.proofFailGen
+	m.mu.Unlock()
+	if failGen != 0 {
+		t.Errorf("proofFailGen = %d, want 0: a dead generation's proof is not a failure to hold against the next one", failGen)
+	}
+
+	pc, gen, err := m.PlayerContext(ctx, "vid")
+	if err != nil {
+		t.Fatalf("next request: %v, want it served after a relaunch", err)
+	}
+	if gen != 3 || pc.ServerAbrStreamingURL == "" {
+		t.Errorf("next request served generation %d (url set: %v), want 3", gen, pc.ServerAbrStreamingURL != "")
+	}
+	if got := m.metrics.Crashes.Load(); got != 2 {
+		t.Errorf("crashes = %d, want 2", got)
+	}
+}
+
+// A caller that has already gone away is not owed a replacement: a crash during
+// its proof returns the context error and launches nothing.
+func TestPlayerContextCrashDuringProofOfCancelledCaller(t *testing.T) {
+	m := newBareMinter(0, 0)
+	var launches int64
+	ctx, cancel := context.WithCancel(context.Background())
+	first := &fakeSession{mint: okMint}
+	first.onEstablish = func() error {
+		cancel()
+		crashUnder(m)
+		return errDeadPage
+	}
+	m.launch = func(context.Context) (minterSession, error) {
+		atomic.AddInt64(&launches, 1)
+		return first, nil
+	}
+	if _, _, err := m.PlayerContext(ctx, "vid"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if got := atomic.LoadInt64(&launches); got != 1 {
+		t.Errorf("launches = %d, want 1 (no replacement for a departed caller)", got)
+	}
+	if got := m.metrics.UnprovenRejections.Load(); got != 0 {
+		t.Errorf("unproven_rejections = %d, want 0", got)
+	}
+}
+
+// The same crash landing during the context establishment itself, on the first
+// attempt or on the in-place retry. Neither is a player-context failure of the
+// page: the first case counts nothing, the second counts only the live transient
+// failure that preceded the crash, and neither escalates.
+func TestPlayerContextSurvivesCrashDuringContext(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		dieOnAttempt int
+		wantFailures int64
+	}{
+		{"first attempt", 1, 0},
+		{"in-place retry", 2, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newBareMinter(0, 0)
+			var launches int64
+			var attempts int
+			first := &fakeSession{mint: okMint}
+			first.playerCtx = func(string) (browser.PlayerContext, error) {
+				attempts++
+				if attempts < tc.dieOnAttempt {
+					return browser.PlayerContext{}, errors.New("transient extraction miss")
+				}
+				crashUnder(m)
+				return browser.PlayerContext{}, errDeadPage
+			}
+			m.launch = func(context.Context) (minterSession, error) {
+				if atomic.AddInt64(&launches, 1) == 1 {
+					return first, nil
+				}
+				return &fakeSession{mint: okMint}, nil
+			}
+
+			pc, gen, err := m.PlayerContext(context.Background(), "vid")
+			if err != nil {
+				t.Fatalf("player-context: %v, want it served from the replacement", err)
+			}
+			if gen != 2 || pc.ServerAbrStreamingURL == "" {
+				t.Errorf("served generation %d (url set: %v), want 2", gen, pc.ServerAbrStreamingURL != "")
+			}
+			if got := atomic.LoadInt64(&launches); got != 2 {
+				t.Errorf("launches = %d, want 2", got)
+			}
+			if attempts != tc.dieOnAttempt {
+				t.Errorf("attempts on the dead session = %d, want %d (no retry against a dead page)", attempts, tc.dieOnAttempt)
+			}
+			if got := m.metrics.PlayerContextFailures.Load(); got != tc.wantFailures {
+				t.Errorf("player_context_failures = %d, want %d", got, tc.wantFailures)
+			}
+			requireCrashOnlyMetrics(t, m)
+		})
+	}
+}
+
+// The mint path has the same two attempts and the same rule.
+func TestMintSurvivesCrashDuringMint(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		dieOnAttempt int
+		wantFailures int64
+	}{
+		{"first attempt", 1, 0},
+		{"in-place retry", 2, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newBareMinter(0, 0)
+			var launches int64
+			var attempts int
+			first := &fakeSession{}
+			first.mint = func(id string) (browser.MintResult, error) {
+				if id != "vid2" { // the pre-mint at launch succeeds
+					return okMint(id)
+				}
+				attempts++
+				if attempts < tc.dieOnAttempt {
+					return browser.MintResult{}, errors.New("transient mint failure")
+				}
+				crashUnder(m)
+				return browser.MintResult{}, errDeadPage
+			}
+			m.launch = func(context.Context) (minterSession, error) {
+				if atomic.AddInt64(&launches, 1) == 1 {
+					return first, nil
+				}
+				return &fakeSession{mint: okMint}, nil
+			}
+			ctx := context.Background()
+
+			res, cached, err := m.Mint(ctx, "player", "vid2")
+			if err != nil {
+				t.Fatalf("mint: %v, want it served from the replacement", err)
+			}
+			if cached || res.Token == "" {
+				t.Errorf("mint = (cached=%v, token set=%v), want a fresh token", cached, res.Token != "")
+			}
+			if got := atomic.LoadInt64(&launches); got != 2 {
+				t.Errorf("launches = %d, want 2", got)
+			}
+			if attempts != tc.dieOnAttempt {
+				t.Errorf("attempts on the dead session = %d, want %d", attempts, tc.dieOnAttempt)
+			}
+			if got := m.metrics.MintFailures.Load(); got != tc.wantFailures {
+				t.Errorf("mint_failures = %d, want %d", got, tc.wantFailures)
+			}
+			requireCrashOnlyMetrics(t, m)
+			// The token is cached under the replacement generation, so the next call
+			// is a hit that survives, as any token of the current generation does.
+			if _, cached, err := m.Mint(ctx, "player", "vid2"); err != nil || !cached {
+				t.Errorf("repeat mint = (cached=%v, %v), want a cache hit", cached, err)
+			}
+		})
+	}
+}
+
+// The session export reads cookies after the proof; a crash between the two is
+// handled the same way.
+func TestSessionSnapshotSurvivesCrashDuringCookies(t *testing.T) {
+	m := newBareMinter(0, 0)
+	var launches int64
+	first := &fakeSession{mint: okMint, id: browser.Identity{VisitorData: "vd1"}}
+	first.cookiesFn = func() ([]*http.Cookie, error) {
+		crashUnder(m)
+		return nil, errDeadPage
+	}
+	m.launch = func(context.Context) (minterSession, error) {
+		if atomic.AddInt64(&launches, 1) == 1 {
+			return first, nil
+		}
+		return &fakeSession{mint: okMint, id: browser.Identity{VisitorData: "vd2"}, cookies: []*http.Cookie{{Name: "c", Value: "v"}}}, nil
+	}
+
+	id, cookies, gen, err := m.SessionSnapshot(context.Background())
+	if err != nil {
+		t.Fatalf("session snapshot: %v, want it served from the replacement", err)
+	}
+	if id.VisitorData != "vd2" || gen != 2 || len(cookies) != 1 {
+		t.Errorf("snapshot = (vd=%q, gen=%d, cookies=%d), want the replacement's (vd2, 2, 1)", id.VisitorData, gen, len(cookies))
+	}
+	if got := atomic.LoadInt64(&launches); got != 2 {
+		t.Errorf("launches = %d, want 2", got)
+	}
+	requireCrashOnlyMetrics(t, m)
+}
+
+// Warm serializes with requests. The rule the mid-request crash handling rests
+// on is that nothing but the crash watcher retires a session without mintMu, and
+// ensure's own recycle closes an aged session, so Warm must not be able to run
+// it concurrently with a request that holds one.
+func TestWarmSerializesWithRequests(t *testing.T) {
+	m := newBareMinter(0, 0)
+	m.launch = func(context.Context) (minterSession, error) { return &fakeSession{mint: okMint}, nil }
+
+	m.mintMu.Lock()
+	done := make(chan error, 1)
+	go func() { done <- m.Warm(context.Background()) }()
+	select {
+	case err := <-done:
+		m.mintMu.Unlock()
+		t.Fatalf("Warm returned %v while a request held mintMu; it must wait", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	m.mintMu.Unlock()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Warm after the request released mintMu: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Warm never returned after mintMu was released")
+	}
+}
+
+// The tests below cover Close as a terminal state. Close does not take mintMu,
+// so a request already past ensure keeps running after the shutdown drain
+// expires. Without the closed flag its ladder calls ensure again and launches,
+// attests, and publishes a fresh session on a Minter nothing will tear down.
+
+// The mechanism item 2 exists for: a request already past ensure, holding a live
+// session, when Close lands. Its operation then fails, it walks its ladder back
+// into ensure, and ensure must refuse instead of launching a second browser onto
+// a Minter nothing will tear down again. Close deliberately does not take mintMu,
+// which is what lets it land in this window.
+func TestCloseStopsAnInFlightRequestFromRelaunching(t *testing.T) {
+	var launches int64
+	var sessions []*fakeSession
+	var smu sync.Mutex
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	m := newBareMinter(0, 0)
+	m.launch = func(context.Context) (minterSession, error) {
+		atomic.AddInt64(&launches, 1)
+		fs := &fakeSession{mint: func(binding string) (browser.MintResult, error) {
+			if binding == "vd" { // the attestation pre-mint, so the session publishes
+				return okMint(binding)
+			}
+			// The request is now past ensure, holding this session. Park it there so
+			// Close lands underneath, then fail the way a torn-down page does.
+			once.Do(func() { close(entered) })
+			<-release
+			return browser.MintResult{}, errors.New("page gone")
+		}}
+		smu.Lock()
+		sessions = append(sessions, fs)
+		smu.Unlock()
+		return fs, nil
+	}
+	if err := m.Warm(context.Background()); err != nil {
+		t.Fatalf("Warm: %v", err)
+	}
+	genBefore := m.Generation()
+
+	// A binding the pre-mint did not fill, so this really reaches sess.Mint.
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := m.Mint(context.Background(), "gvs", "other-binding")
+		done <- err
+	}()
+	<-entered
+	m.Close()
+	close(release)
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrClosed) {
+			t.Fatalf("Mint across Close = %v, want ErrClosed from the ladder's ensure", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the in-flight Mint never returned")
+	}
+	if got := atomic.LoadInt64(&launches); got != 1 {
+		t.Errorf("launches = %d, want 1 (Close must not let the ladder relaunch)", got)
+	}
+	if got := m.Generation(); got != genBefore {
+		t.Errorf("generation = %d, want %d unchanged", got, genBefore)
+	}
+	if got := m.metrics.Escalations.Load(); got != 0 {
+		t.Errorf("escalations = %d, want 0 (Close abandoned the generation, not this request)", got)
+	}
+	snap := m.MetricsSnapshot()
+	if live, _ := snap["session_live"].(bool); live {
+		t.Error("session_live = true after Close")
+	}
+	smu.Lock()
+	defer smu.Unlock()
+	for i, s := range sessions {
+		if !s.closed.Load() {
+			t.Errorf("session %d was left open by Close", i)
+		}
+	}
+}
+
+// Warm on a closed Minter reports ErrClosed without launching anything.
+func TestWarmAfterCloseDoesNotLaunch(t *testing.T) {
+	var launches int64
+	m := newBareMinter(0, 0)
+	m.launch = func(context.Context) (minterSession, error) {
+		atomic.AddInt64(&launches, 1)
+		return &fakeSession{mint: okMint}, nil
+	}
+	m.Close()
+	if err := m.Warm(context.Background()); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Warm after Close = %v, want ErrClosed", err)
+	}
+	if got := atomic.LoadInt64(&launches); got != 0 {
+		t.Errorf("launches = %d, want 0", got)
+	}
+	if got := m.Generation(); got != 0 {
+		t.Errorf("generation = %d, want 0 (nothing was published)", got)
+	}
+}
+
+// Close landing while a launch is in flight is the only way a session can still
+// reach publication. The publish critical section must discard it rather than
+// leave the pool a browser context nothing will close.
+func TestCloseDuringLaunchClosesTheLaunchedSession(t *testing.T) {
+	m := newBareMinter(0, 0)
+	launchStarted := make(chan struct{})
+	release := make(chan struct{})
+	launched := &fakeSession{mint: okMint}
+	var launches int64
+	m.launch = func(context.Context) (minterSession, error) {
+		atomic.AddInt64(&launches, 1)
+		close(launchStarted)
+		<-release
+		return launched, nil
+	}
+	done := make(chan error, 1)
+	go func() { done <- m.Warm(context.Background()) }()
+
+	<-launchStarted
+	m.Close() // Close does not take mintMu, so it lands mid-launch.
+	close(release)
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrClosed) {
+			t.Fatalf("Warm across Close = %v, want ErrClosed", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Warm never returned")
+	}
+	if !launched.closed.Load() {
+		t.Error("the session launched across Close was published or leaked, not closed")
+	}
+	if got := m.Generation(); got != 0 {
+		t.Errorf("generation = %d, want 0 (a closed Minter publishes nothing)", got)
+	}
+	if got := atomic.LoadInt64(&launches); got != 1 {
+		t.Errorf("launches = %d, want 1", got)
+	}
+}
+
+// The tests below cover a generation retired out from under a request by
+// something that is neither a crash nor the request's own ladder. The request
+// must take the replacement without counting an escalation: only one attempt
+// against that generation ever failed, and abandoning it was somebody else's
+// decision. Compare crashUnder above, which retires as a crash and is graded
+// nowhere at all.
+
+// retireUnder retires the current generation the way a non-crash retirer that
+// skips mintMu does. After item 2, Minter.Close is the only one in the tree.
+func retireUnder(m *Minter) { m.retire(m.Generation(), "retired out from under the request", false) }
+
+func TestMintDoesNotEscalateOnAForeignRetirement(t *testing.T) {
+	var launches int64
+	m := newBareMinter(0, 0)
+	m.launch = func(context.Context) (minterSession, error) {
+		if atomic.AddInt64(&launches, 1) > 1 {
+			return &fakeSession{mint: okMint}, nil
+		}
+		return &fakeSession{mint: func(binding string) (browser.MintResult, error) {
+			if binding == "vd" { // the attestation pre-mint, not the request
+				return okMint(binding)
+			}
+			retireUnder(m)
+			return browser.MintResult{}, errDeadPage
+		}}, nil
+	}
+	if err := m.Warm(context.Background()); err != nil {
+		t.Fatalf("Warm: %v", err)
+	}
+	res, _, err := m.Mint(context.Background(), "gvs", "request-binding")
+	if err != nil {
+		t.Fatalf("Mint: %v, want the replacement to serve it", err)
+	}
+	if res.Token != "t" {
+		t.Errorf("token = %q, want the replacement's", res.Token)
+	}
+	if got := atomic.LoadInt64(&launches); got != 2 {
+		t.Errorf("launches = %d, want 2 (the original plus its replacement)", got)
+	}
+	if got := m.metrics.MintFailures.Load(); got != 1 {
+		t.Errorf("mint_failures = %d, want 1 (one attempt ran against that generation)", got)
+	}
+	if got := m.metrics.Escalations.Load(); got != 0 {
+		t.Errorf("escalations = %d, want 0 (the generation was already abandoned)", got)
+	}
+}
+
+func TestPlayerContextDoesNotEscalateOnAForeignRetirement(t *testing.T) {
+	var launches int64
+	m := newBareMinter(0, 0)
+	m.launch = func(context.Context) (minterSession, error) {
+		if atomic.AddInt64(&launches, 1) > 1 {
+			return &fakeSession{mint: okMint}, nil
+		}
+		return &fakeSession{mint: okMint, playerCtx: func(string) (browser.PlayerContext, error) {
+			retireUnder(m)
+			return browser.PlayerContext{}, errDeadPage
+		}}, nil
+	}
+	pc, _, err := m.PlayerContext(context.Background(), "vid")
+	if err != nil {
+		t.Fatalf("PlayerContext: %v, want the replacement to serve it", err)
+	}
+	if pc.ServerAbrStreamingURL == "" {
+		t.Error("empty context; want the replacement's")
+	}
+	if got := atomic.LoadInt64(&launches); got != 2 {
+		t.Errorf("launches = %d, want 2 (the original plus its replacement)", got)
+	}
+	if got := m.metrics.PlayerContextFailures.Load(); got != 1 {
+		t.Errorf("player_context_failures = %d, want 1 (one attempt ran against that generation)", got)
+	}
+	if got := m.metrics.Escalations.Load(); got != 0 {
+		t.Errorf("escalations = %d, want 0 (the generation was already abandoned)", got)
+	}
+	if got := m.metrics.PlayerContexts.Load(); got != 1 {
+		t.Errorf("player_contexts = %d, want 1", got)
+	}
+}
+
+// cacheEntries reads the cache_entries gauge the way /metrics does.
+func cacheEntries(t *testing.T, m *Minter) int {
+	t.Helper()
+	v, ok := m.MetricsSnapshot()["cache_entries"].(int)
+	if !ok {
+		t.Fatalf("cache_entries missing from the snapshot or not an int: %#v", m.MetricsSnapshot()["cache_entries"])
+	}
+	return v
+}
+
+// cache_entries reports what cacheGet would serve, not the size of the map: an
+// expired entry no sweep has reached yet, and a stale-generation one, are both
+// unservable. Counting them told an operator the daemon held tokens it would
+// have refused.
+func TestCacheEntriesCountsOnlyServableEntries(t *testing.T) {
+	m, _, _, _ := newTestMinter(okMint)
+	if err := m.Warm(context.Background()); err != nil {
+		t.Fatalf("Warm: %v", err)
+	}
+	// The attestation pre-mint caches one token under both scopes.
+	if got := cacheEntries(t, m); got != 2 {
+		t.Fatalf("cache_entries after warm = %d, want 2", got)
+	}
+	m.mu.Lock()
+	m.cache["gvs|expired"] = cachedToken{res: browser.MintResult{Token: "old"}, expiry: time.Now().Add(-time.Second), gen: m.gen}
+	m.cache["gvs|stale-gen"] = cachedToken{res: browser.MintResult{Token: "older"}, expiry: time.Now().Add(time.Hour), gen: m.gen - 1}
+	m.mu.Unlock()
+
+	if got := cacheEntries(t, m); got != 2 {
+		t.Errorf("cache_entries = %d, want 2: neither the expired nor the stale-generation entry is servable", got)
+	}
+	// /metrics is a read path. cacheGet deletes what it rejects; this must not,
+	// or scraping the daemon would change it.
+	m.mu.Lock()
+	n := len(m.cache)
+	m.mu.Unlock()
+	if n != 4 {
+		t.Errorf("len(m.cache) = %d, want 4: a scrape must not sweep the cache", n)
+	}
+}
+
+// A consumer degradation report drops the reported generation's cached tokens.
+// Without this the positive cache keeps handing out the generation the consumer
+// just called degraded, because a report-driven retire leaves m.gen unchanged.
+func TestReportDropsTheReportedGenerationsCachedTokens(t *testing.T) {
+	// Attempts, not successes: counting only the successful launches would make
+	// the assertion below unfalsifiable, since nothing increments it once
+	// failLaunch is set.
+	var attempts int64
+	failLaunch := false
+	m := newBareMinter(0, 0)
+	m.launch = func(context.Context) (minterSession, error) {
+		atomic.AddInt64(&attempts, 1)
+		if failLaunch {
+			return nil, errors.New("no browser")
+		}
+		return &fakeSession{mint: okMint}, nil
+	}
+	ctx := context.Background()
+	if err := m.Warm(ctx); err != nil {
+		t.Fatalf("Warm: %v", err)
+	}
+	if _, cached, err := m.Mint(ctx, "gvs", "b"); err != nil || cached {
+		t.Fatalf("first mint: cached=%v err=%v, want a fresh token", cached, err)
+	}
+	if got := cacheEntries(t, m); got != 3 {
+		t.Fatalf("cache_entries = %d, want 3 (two pre-mint scopes plus the request's)", got)
+	}
+
+	if res := m.ReportDegraded(m.Generation(), "vid", "cap"); !res.Retired {
+		t.Fatalf("report = %+v, want an immediate retirement", res)
+	}
+	// The generation is unchanged by a report-driven retire, so this is the drop
+	// and not a generation bump invalidating the entries.
+	if got := cacheEntries(t, m); got != 0 {
+		t.Errorf("cache_entries = %d after the report, want 0", got)
+	}
+
+	// The named tradeoff: with the relaunch failing, this request is refused
+	// rather than served the token the consumer just reported as degraded. Before
+	// the drop, Mint's aged-generation fallback would have handed it over.
+	failLaunch = true
+	if _, cached, err := m.Mint(ctx, "gvs", "b"); err == nil {
+		t.Errorf("mint after a report with a failing relaunch: cached=%v, want a refusal, not the degraded generation's token", cached)
+	}
+	// Two attempts: the warm, and the relaunch this request reached only because
+	// the cache lookup before it missed. Had the report left the tokens in place,
+	// the lookup would have been a hit and ensure would never have been called.
+	if got := atomic.LoadInt64(&attempts); got != 2 {
+		t.Errorf("launch attempts = %d, want 2 (the warm, plus the relaunch the miss forced)", got)
+	}
+}
+
+// The deferred path drops them too. A report that arrives while a browser
+// operation holds mintMu is consumed by the next streaming handoff, which is
+// where refreshStreamingSession retires the suspect generation.
+func TestDeferredReportDropsTheReportedGenerationsCachedTokens(t *testing.T) {
+	m, _, _, release, done := startBlockingPlayerContext(t)
+	// Released with a defer, matching the other tests on this fixture: a t.Fatalf
+	// below would otherwise strand the parked call inside sess.PlayerContext,
+	// holding this Minter's mintMu for the rest of the run.
+	released := false
+	defer func() {
+		if !released {
+			release()
+			<-done
+		}
+	}()
+	if got := cacheEntries(t, m); got != 2 {
+		t.Fatalf("cache_entries = %d, want 2 (the pre-mint under both scopes)", got)
+	}
+	if res := m.ReportDegraded(1, "vid", "cap"); !res.RetirementPending {
+		t.Fatalf("report while busy = %+v, want RetirementPending", res)
+	}
+	release()
+	<-done
+	released = true
+
+	// Fail the relaunch so the drop is observable: a successful one publishes a
+	// new generation, which clears the whole cache on its own.
+	m.launch = func(context.Context) (minterSession, error) { return nil, errors.New("no browser") }
+	if _, _, err := m.PlayerContext(context.Background(), "vid"); err == nil {
+		t.Fatal("player-context after the deferred retirement succeeded; want the failed relaunch")
+	}
+	if got := cacheEntries(t, m); got != 0 {
+		t.Errorf("cache_entries = %d after the deferred retirement, want 0", got)
+	}
+	if got := m.metrics.ReportDrivenRecycles.Load(); got != 1 {
+		t.Errorf("report_driven_recycles = %d, want 1", got)
+	}
+}
+
+// A browser that dies during status-1 confirmation surfaces as
+// ErrStatus2Unconfirmed: the confirm loop's eval errors run out its budget and
+// grade it target-not-buffered. The request must still take the replacement.
+// playerContextDied refuses to consult sessionDied for a status-2 error, so that
+// a status-2 failure on a live session cannot buy a relaunch; when the session is
+// gone there is nothing left to protect, and refusing here would both fail a
+// recoverable request and file a crash under status2_rejections.
+func TestPlayerContextCrashDuringConfirmTakesTheReplacement(t *testing.T) {
+	var launches int64
+	m := newBareMinter(0, 0)
+	m.launch = func(context.Context) (minterSession, error) {
+		if atomic.AddInt64(&launches, 1) > 1 {
+			return &fakeSession{mint: okMint}, nil
+		}
+		return &fakeSession{mint: okMint, playerCtx: func(string) (browser.PlayerContext, error) {
+			crashUnder(m) // the watcher retires the generation mid-confirm
+			return browser.PlayerContext{}, fmt.Errorf("%w: buffered probe eval error: %v", browser.ErrStatus2Unconfirmed, errDeadPage)
+		}}, nil
+	}
+	pc, _, err := m.PlayerContext(context.Background(), "vid")
+	if err != nil {
+		t.Fatalf("PlayerContext: %v, want the replacement to serve it", err)
+	}
+	if pc.ServerAbrStreamingURL == "" {
+		t.Error("empty context; want the replacement's")
+	}
+	if got := atomic.LoadInt64(&launches); got != 2 {
+		t.Errorf("launches = %d, want 2 (the dead session plus its replacement)", got)
+	}
+	if got := m.metrics.Status2Rejections.Load(); got != 0 {
+		t.Errorf("status2_rejections = %d, want 0 (a dead page is a crash, not a status-2 refusal)", got)
+	}
+	// A dead page is graded nowhere: the crash is counted by the retirement alone.
+	requireCrashOnlyMetrics(t, m)
+	if got := m.metrics.PlayerContextFailures.Load(); got != 0 {
+		t.Errorf("player_context_failures = %d, want 0 (the dead page's failure is not graded)", got)
+	}
+}
+
+// A pending report can be consumed by a teardown that fired for another reason.
+// The suspect mark is cleared either way, so the drop has to happen there too, or
+// the tokens of a generation a consumer called degraded outlive it.
+func TestReportPendingThenCrashStillDropsTheCachedTokens(t *testing.T) {
+	m, _, _, release, done := startBlockingPlayerContext(t)
+	defer func() { release(); <-done }()
+
+	if got := cacheEntries(t, m); got != 2 {
+		t.Fatalf("cache_entries = %d, want 2 (the pre-mint under both scopes)", got)
+	}
+	if res := m.ReportDegraded(1, "vid", "cap"); !res.RetirementPending {
+		t.Fatalf("report while busy = %+v, want RetirementPending", res)
+	}
+	// The crash watcher gets there before the next streaming handoff does. It
+	// retires without mintMu, which is what lets it land while the report is still
+	// pending. m.gen does not move, so the entries stay generation-matched.
+	crashUnder(m)
+	if got := m.Generation(); got != 1 {
+		t.Fatalf("generation = %d, want 1 (a crash retire does not bump it)", got)
+	}
+	if got := cacheEntries(t, m); got != 0 {
+		t.Errorf("cache_entries = %d after a crash consumed the pending report, want 0", got)
+	}
+}
+
+// A teardown with no report against the generation keeps its tokens. A PO token
+// is not invalidated by the browser dying or by the clock, and dropping them
+// would force needless re-mints.
+func TestCrashWithoutAReportKeepsTheCachedTokens(t *testing.T) {
+	m, _, _, _ := newTestMinter(okMint)
+	if err := m.Warm(context.Background()); err != nil {
+		t.Fatalf("Warm: %v", err)
+	}
+	if got := cacheEntries(t, m); got != 2 {
+		t.Fatalf("cache_entries after warm = %d, want 2", got)
+	}
+	crashUnder(m)
+	if got := cacheEntries(t, m); got != 2 {
+		t.Errorf("cache_entries = %d after an unreported crash, want 2 (the tokens are still good)", got)
+	}
+}
+
+// A refusal the daemon expects to lift on its own carries the wait, and the
+// cause still classifies with errors.Is so the server's own routing is unmoved.
+func TestRetryAfterErrorCarriesTheWaitAndTheCause(t *testing.T) {
+	fs := &fakeSession{mint: okMint, establishErr: errors.New("full-length proof failed")}
+	m := newBareMinter(0, 0)
+	m.launch = func(context.Context) (minterSession, error) { return fs, nil }
+	ctx := context.Background()
+
+	// The refusal that starts the window states the whole window.
+	_, _, err := m.PlayerContext(ctx, "vid")
+	ra, ok := errors.AsType[*RetryAfterError](err)
+	if !ok {
+		t.Fatalf("first refusal = %v (%T), want a *RetryAfterError", err, err)
+	}
+	if ra.After != proofRetryCooldown {
+		t.Errorf("After = %v, want the whole window %v", ra.After, proofRetryCooldown)
+	}
+	if !errors.Is(err, ErrUnproven) {
+		t.Errorf("err = %v, want it to still be ErrUnproven", err)
+	}
+	if !strings.Contains(err.Error(), "full-length proof failed") {
+		t.Errorf("err = %q, want it to name the proof failure", err)
+	}
+
+	// A refusal from inside the window states what is LEFT of it, not the window
+	// again: age the record by a known amount and the stated wait must have moved
+	// by that much.
+	const elapsed = 10 * time.Second
+	m.RewindProofCooldownForTest(elapsed)
+	_, _, err = m.PlayerContext(ctx, "vid")
+	ra, ok = errors.AsType[*RetryAfterError](err)
+	if !ok {
+		t.Fatalf("cool-down refusal = %v (%T), want a *RetryAfterError", err, err)
+	}
+	want := proofRetryCooldown - elapsed
+	if ra.After > want || ra.After < want-time.Second {
+		t.Errorf("After = %v, want about %v (the window less the %v already elapsed)", ra.After, want, elapsed)
+	}
+	if !errors.Is(err, ErrUnproven) || !strings.Contains(err.Error(), "full-length proof failed") {
+		t.Errorf("cool-down refusal = %v, want ErrUnproven naming the original proof failure", err)
+	}
+
+	// /session refuses from the same record with the same remaining wait.
+	_, _, _, err = m.SessionSnapshot(ctx)
+	ra, ok = errors.AsType[*RetryAfterError](err)
+	if !ok {
+		t.Fatalf("session refusal = %v (%T), want a *RetryAfterError", err, err)
+	}
+	if ra.After > want || ra.After < want-time.Second {
+		t.Errorf("session After = %v, want about %v", ra.After, want)
+	}
+}
+
+// The two refusals that end a proof ladder, a spent relaunch and a replacement
+// that could not prove either, both state the fresh cool-down.
+func TestProofLadderRefusalsStateTheCooldown(t *testing.T) {
+	rewind := func(m *Minter) {
+		m.mu.Lock()
+		m.proofFailedAt = time.Now().Add(-proofRetryCooldown - time.Second)
+		m.mu.Unlock()
+	}
+	wantWholeWindow := func(t *testing.T, err error) {
+		t.Helper()
+		ra, ok := errors.AsType[*RetryAfterError](err)
+		if !ok {
+			t.Fatalf("refusal = %v (%T), want a *RetryAfterError", err, err)
+		}
+		if ra.After != proofRetryCooldown {
+			t.Errorf("After = %v, want the whole window %v", ra.After, proofRetryCooldown)
+		}
+	}
+
+	t.Run("relaunched session could not prove", func(t *testing.T) {
+		m := newBareMinter(0, 0)
+		m.launch = func(context.Context) (minterSession, error) {
+			return &fakeSession{mint: okMint, establishErr: errors.New("full-length proof failed")}, nil
+		}
+		ctx := context.Background()
+		if _, _, err := m.PlayerContext(ctx, "vid"); !errors.Is(err, ErrUnproven) {
+			t.Fatalf("first request err = %v, want ErrUnproven", err)
+		}
+		rewind(m)
+		_, _, err := m.PlayerContext(ctx, "vid") // relaunches, the replacement fails too
+		wantWholeWindow(t, err)
+	})
+
+	t.Run("relaunch already spent", func(t *testing.T) {
+		m := newBareMinter(0, 0)
+		m.launch = func(context.Context) (minterSession, error) {
+			return &fakeSession{mint: okMint, establishErr: errors.New("full-length proof failed")}, nil
+		}
+		ctx := context.Background()
+		for range 2 {
+			if _, _, err := m.PlayerContext(ctx, "vid"); !errors.Is(err, ErrUnproven) {
+				t.Fatalf("setup request err = %v, want ErrUnproven", err)
+			}
+			rewind(m)
+		}
+		_, _, err := m.PlayerContext(ctx, "vid") // the streak's relaunch is spent
+		wantWholeWindow(t, err)
+	})
+}
+
+// The pool knows how long its relaunch is backing off, so every entry point that
+// needs a session passes that wait to the caller instead of a bare string.
+func TestLaunchBackoffCarriesTheWait(t *testing.T) {
+	const wait = 7 * time.Second
+	backoff := &browser.RelaunchBackoffError{Wait: wait, Streak: 2}
+	newM := func() *Minter {
+		m := newBareMinter(0, 0)
+		m.launch = func(context.Context) (minterSession, error) { return nil, backoff }
+		return m
+	}
+	check := func(t *testing.T, err error) {
+		t.Helper()
+		ra, ok := errors.AsType[*RetryAfterError](err)
+		if !ok {
+			t.Fatalf("refusal = %v (%T), want a *RetryAfterError", err, err)
+		}
+		if ra.After != wait {
+			t.Errorf("After = %v, want the pool's remaining backoff %v", ra.After, wait)
+		}
+		if !errors.Is(err, backoff) {
+			t.Errorf("err = %v, want it to wrap the pool's backoff error", err)
+		}
+	}
+	ctx := context.Background()
+
+	t.Run("player-context", func(t *testing.T) {
+		m := newM()
+		_, _, err := m.PlayerContext(ctx, "vid")
+		check(t, err)
+		if got := m.metrics.LaunchFailures.Load(); got != 1 {
+			t.Errorf("launch_failures = %d, want 1 (the wrap must not hide the failure)", got)
+		}
+	})
+	t.Run("session", func(t *testing.T) {
+		m := newM()
+		_, _, _, err := m.SessionSnapshot(ctx)
+		check(t, err)
+	})
+	t.Run("mint", func(t *testing.T) {
+		m := newM()
+		_, _, err := m.Mint(ctx, "gvs", "b")
+		check(t, err)
+	})
+}
+
+// Seconds is what the Retry-After header carries: whole seconds, rounded up, and
+// never zero, because a wait under a second is still later rather than now.
+func TestRetryAfterSeconds(t *testing.T) {
+	for _, tc := range []struct {
+		after time.Duration
+		want  int
+	}{
+		{12200 * time.Millisecond, 13},
+		{400 * time.Millisecond, 1},
+		{30 * time.Second, 30},
+		{0, 1},
+		{-5 * time.Second, 1},
+	} {
+		ra := &RetryAfterError{Err: ErrUnproven, After: tc.after}
+		if got := ra.Seconds(); got != tc.want {
+			t.Errorf("(&RetryAfterError{After: %v}).Seconds() = %d, want %d", tc.after, got, tc.want)
+		}
+	}
+}
+
+// botCheck is the error a walled browser session answers with, at a proof or a
+// context. It is never about the video.
+func botCheck() error {
+	return &browser.BotCheckError{Status: "LOGIN_REQUIRED", Reason: "Sign in to confirm you’re not a bot"}
+}
+
+// A bot check on the context path buys one fresh identity and serves the same
+// request from it: waiting cannot lift a wall that keys on the visitor, and the
+// video itself is fine, so it must not be negative-cached.
+func TestPlayerContextBotCheckRelaunchesAndServesFromReplacement(t *testing.T) {
+	var launches int64
+	m := newBareMinter(0, 0)
+	m.launch = func(context.Context) (minterSession, error) {
+		if atomic.AddInt64(&launches, 1) == 1 {
+			return &fakeSession{mint: okMint, playerCtx: func(string) (browser.PlayerContext, error) {
+				return browser.PlayerContext{}, botCheck()
+			}}, nil
+		}
+		return &fakeSession{mint: okMint}, nil
+	}
+	ctx := context.Background()
+
+	pc, _, err := m.PlayerContext(ctx, "vid")
+	if err != nil {
+		t.Fatalf("PlayerContext: %v", err)
+	}
+	if pc.ServerAbrStreamingURL == "" {
+		t.Error("the replacement served an empty context")
+	}
+	if got := atomic.LoadInt64(&launches); got != 2 {
+		t.Errorf("launches = %d, want 2 (the bot check relaunches once)", got)
+	}
+	if got := m.metrics.BotChecks.Load(); got != 1 {
+		t.Errorf("bot_checks = %d, want 1", got)
+	}
+	if got := m.metrics.Escalations.Load(); got != 1 {
+		t.Errorf("escalations = %d, want 1", got)
+	}
+	if got := m.metrics.PlayerContextFailures.Load(); got != 1 {
+		t.Errorf("player_context_failures = %d, want 1", got)
+	}
+	if err := m.negCacheGet("vid"); err != nil {
+		t.Errorf("negative cache holds %v; a bot check is not a verdict on the video", err)
+	}
+}
+
+// A wall the fresh identity meets too is refused with the bot-check wait, and the
+// replacement's own passing proof must not hand the window a second relaunch.
+func TestPlayerContextBotCheckOnReplacementRefusesWithWait(t *testing.T) {
+	var logs bytes.Buffer
+	var launches int64
+	var pcCalls atomic.Int64
+	walled := func(string) (browser.PlayerContext, error) {
+		pcCalls.Add(1)
+		return browser.PlayerContext{}, botCheck()
+	}
+	m := NewMinter("v", browser.Options{Logger: slog.New(slog.NewTextHandler(&logs, nil))}, 0, 0, 0)
+	m.mintSeparation = 0
+	m.launch = func(context.Context) (minterSession, error) {
+		atomic.AddInt64(&launches, 1)
+		return &fakeSession{mint: okMint, playerCtx: walled}, nil
+	}
+	ctx := context.Background()
+
+	_, _, err := m.PlayerContext(ctx, "vid")
+	ra, ok := errors.AsType[*RetryAfterError](err)
+	if !ok {
+		t.Fatalf("refusal = %v (%T), want a *RetryAfterError", err, err)
+	}
+	if ra.After != botCheckCooldown {
+		t.Errorf("After = %v, want the bot-check cool-down %v", ra.After, botCheckCooldown)
+	}
+	if !errors.Is(err, browser.ErrBotCheck) {
+		t.Errorf("err = %v, want it to wrap ErrBotCheck", err)
+	}
+	if got := m.metrics.BotChecks.Load(); got != 2 {
+		t.Errorf("bot_checks = %d, want 2 (the context, then the replacement's)", got)
+	}
+	if got := atomic.LoadInt64(&launches); got != 2 {
+		t.Errorf("launches = %d, want 2 (the window grants one relaunch)", got)
+	}
+
+	// The next request is refused from the cool-down without touching the browser,
+	// even though the replacement's proof passed: markProved must not clear the
+	// bot-check window.
+	before := pcCalls.Load()
+	preRejections := m.metrics.UnprovenRejections.Load()
+	m.RewindProofCooldownForTest(10 * time.Second)
+	_, _, err = m.PlayerContext(ctx, "vid")
+	ra, ok = errors.AsType[*RetryAfterError](err)
+	if !ok {
+		t.Fatalf("cool-down refusal = %v (%T), want a *RetryAfterError", err, err)
+	}
+	if want := botCheckCooldown - 10*time.Second; ra.After > want || ra.After < want-time.Second {
+		t.Errorf("After = %v, want about %v (the window less the 10s aged off it)", ra.After, want)
+	}
+	if got := pcCalls.Load(); got != before {
+		t.Errorf("PlayerContext calls = %d, want %d (the cool-down must refuse without touching the browser)", got, before)
+	}
+	if got := atomic.LoadInt64(&launches); got != 2 {
+		t.Errorf("launches = %d, want 2 (a cool-down refusal never relaunches)", got)
+	}
+	if m.metrics.UnprovenRejections.Load() <= preRejections {
+		t.Error("unproven_rejections did not move for the cool-down refusal")
+	}
+	if !strings.Contains(logs.String(), "bot-check cool-down") {
+		t.Errorf("log = %q, want the refusal to name the bot-check cool-down", logs.String())
+	}
+}
+
+// A bot check at the proof skips the first-failure step a proof failure gets:
+// waiting cannot lift it, so the relaunch is immediate and the same request is
+// served from the fresh identity.
+func TestProofBotCheckRelaunchesAtOnce(t *testing.T) {
+	var launches int64
+	m := newBareMinter(0, 0)
+	m.launch = func(context.Context) (minterSession, error) {
+		if atomic.AddInt64(&launches, 1) == 1 {
+			return &fakeSession{mint: okMint, establishErr: botCheck()}, nil
+		}
+		return &fakeSession{mint: okMint}, nil
+	}
+	ctx := context.Background()
+
+	pc, _, err := m.PlayerContext(ctx, "vid")
+	if err != nil {
+		t.Fatalf("PlayerContext: %v", err)
+	}
+	if pc.ServerAbrStreamingURL == "" {
+		t.Error("the replacement served an empty context")
+	}
+	if got := atomic.LoadInt64(&launches); got != 2 {
+		t.Errorf("launches = %d, want 2 on the first request (no first-failure cool-down)", got)
+	}
+	if got := m.metrics.BotChecks.Load(); got != 1 {
+		t.Errorf("bot_checks = %d, want 1", got)
+	}
+	if got := m.metrics.UnprovenRejections.Load(); got != 0 {
+		t.Errorf("unproven_rejections = %d, want 0 (the request was served)", got)
+	}
+}
+
+// A replacement that meets the wall too is counted and named as a bot check, not
+// as a session that could not prove full-length streaming.
+func TestProofBotCheckOnReplacementIsCountedAndNamed(t *testing.T) {
+	var logs bytes.Buffer
+	m := NewMinter("v", browser.Options{Logger: slog.New(slog.NewTextHandler(&logs, nil))}, 0, 0, 0)
+	m.mintSeparation = 0
+	m.launch = func(context.Context) (minterSession, error) {
+		return &fakeSession{mint: okMint, establishErr: botCheck()}, nil
+	}
+
+	_, _, err := m.PlayerContext(context.Background(), "vid")
+	ra, ok := errors.AsType[*RetryAfterError](err)
+	if !ok {
+		t.Fatalf("refusal = %v (%T), want a *RetryAfterError", err, err)
+	}
+	if ra.After != botCheckCooldown {
+		t.Errorf("After = %v, want the bot-check cool-down %v", ra.After, botCheckCooldown)
+	}
+	if !errors.Is(err, browser.ErrBotCheck) {
+		t.Errorf("err = %v, want it to wrap ErrBotCheck", err)
+	}
+	if got := m.metrics.BotChecks.Load(); got != 2 {
+		t.Errorf("bot_checks = %d, want 2", got)
+	}
+	if !strings.Contains(logs.String(), "bot check as well") {
+		t.Errorf("log = %q, want the replacement's failure named as a bot check", logs.String())
+	}
+	if strings.Contains(logs.String(), "could not prove full-length streaming") {
+		t.Errorf("log = %q, want the bot check not reported as an unprovable session", logs.String())
+	}
+}
+
+// One fresh identity per window, however many proofs pass in between, and a
+// window that has rolled over grants the next one.
+func TestBotCheckRelaunchOncePerWindow(t *testing.T) {
+	var launches int64
+	m := newBareMinter(0, 0)
+	m.launch = func(context.Context) (minterSession, error) {
+		atomic.AddInt64(&launches, 1)
+		return &fakeSession{mint: okMint, playerCtx: func(string) (browser.PlayerContext, error) {
+			return browser.PlayerContext{}, botCheck()
+		}}, nil
+	}
+	ctx := context.Background()
+	clearCooldown := func() {
+		m.mu.Lock()
+		m.proofFailGen, m.proofFailedAt, m.proofFailCause, m.proofFailCooldown = 0, time.Time{}, nil, 0
+		m.mu.Unlock()
+	}
+
+	// The first bot check claims the window's relaunch.
+	if _, _, err := m.PlayerContext(ctx, "vid"); !errors.Is(err, browser.ErrBotCheck) {
+		t.Fatalf("first request err = %v, want ErrBotCheck", err)
+	}
+	if got := atomic.LoadInt64(&launches); got != 2 {
+		t.Fatalf("launches = %d, want 2", got)
+	}
+
+	// A later bot check, past the cool-down, refuses without another launch.
+	clearCooldown()
+	if _, _, err := m.PlayerContext(ctx, "vid"); !errors.Is(err, browser.ErrBotCheck) {
+		t.Fatalf("second request err = %v, want ErrBotCheck", err)
+	}
+	if got := atomic.LoadInt64(&launches); got != 2 {
+		t.Errorf("launches = %d, want 2 (the window's relaunch is spent)", got)
+	}
+
+	// Once the window has rolled over, the next bot check buys another identity.
+	m.mu.Lock()
+	m.botCheckRelaunchedAt = time.Now().Add(-botCheckRelaunchWindow - time.Second)
+	m.mu.Unlock()
+	clearCooldown()
+	if _, _, err := m.PlayerContext(ctx, "vid"); !errors.Is(err, browser.ErrBotCheck) {
+		t.Fatalf("third request err = %v, want ErrBotCheck", err)
+	}
+	if got := atomic.LoadInt64(&launches); got != 3 {
+		t.Errorf("launches = %d, want 3 (a fresh window grants another relaunch)", got)
+	}
+}
+
+// The startup self-test counts a bot check and warns, but records no cool-down:
+// a walled daemon would otherwise refuse its first requests without ever trying
+// a fresh identity. The self-test never relaunches on its own.
+func TestSelfTestBotCheckCountsWithoutCooldown(t *testing.T) {
+	var logs bytes.Buffer
+	var launches int64
+	m := NewMinter("v", browser.Options{Logger: slog.New(slog.NewTextHandler(&logs, nil))}, 0, 0, 0)
+	m.mintSeparation = 0
+	m.launch = func(context.Context) (minterSession, error) {
+		if atomic.AddInt64(&launches, 1) == 1 {
+			return &fakeSession{mint: okMint, establishErr: botCheck()}, nil
+		}
+		return &fakeSession{mint: okMint}, nil
+	}
+	ctx := context.Background()
+
+	if err := m.SelfTest(ctx); err != nil {
+		t.Fatalf("SelfTest = %v, want nil after a logged bot check", err)
+	}
+	if got := m.metrics.BotChecks.Load(); got != 1 {
+		t.Errorf("bot_checks = %d, want 1", got)
+	}
+	if got := atomic.LoadInt64(&launches); got != 1 {
+		t.Errorf("launches = %d, want 1 (the self-test never relaunches)", got)
+	}
+	if !strings.Contains(logs.String(), "bot check") {
+		t.Errorf("log = %q, want the startup bot check named", logs.String())
+	}
+	m.mu.Lock()
+	recorded := !m.proofFailedAt.IsZero()
+	m.mu.Unlock()
+	if recorded {
+		t.Error("the self-test recorded a cool-down; the first request would be refused before meeting the wall itself")
+	}
+
+	// The first request meets the wall itself and relaunches at once.
+	if _, _, err := m.PlayerContext(ctx, "vid"); err != nil {
+		t.Fatalf("PlayerContext after the self-test: %v", err)
+	}
+	if got := atomic.LoadInt64(&launches); got != 2 {
+		t.Errorf("launches = %d, want 2 (the first request relaunches)", got)
+	}
+}
+
+// /session proves through the same ladder, so a bot check there relaunches too
+// and the caller gets the replacement's identity.
+func TestSessionSnapshotBotCheckRelaunches(t *testing.T) {
+	var launches int64
+	m := newBareMinter(0, 0)
+	m.launch = func(context.Context) (minterSession, error) {
+		if atomic.AddInt64(&launches, 1) == 1 {
+			return &fakeSession{mint: okMint, establishErr: botCheck(), id: browser.Identity{VisitorData: "walled"}}, nil
+		}
+		return &fakeSession{mint: okMint, id: browser.Identity{VisitorData: "fresh"}}, nil
+	}
+
+	id, _, _, err := m.SessionSnapshot(context.Background())
+	if err != nil {
+		t.Fatalf("SessionSnapshot: %v", err)
+	}
+	if id.VisitorData != "fresh" {
+		t.Errorf("visitor_data = %q, want the replacement's identity", id.VisitorData)
+	}
+	if got := atomic.LoadInt64(&launches); got != 2 {
+		t.Errorf("launches = %d, want 2", got)
+	}
+	if got := m.metrics.BotChecks.Load(); got != 1 {
+		t.Errorf("bot_checks = %d, want 1", got)
+	}
+}
+
+// A bot check met on a replacement this request already took for another reason
+// must not consume the window's one relaunch: nothing relaunches on that path,
+// so claiming the grant there would spend it with no fresh identity to show for
+// it and refuse the next real bot check.
+func TestBotCheckOnAnUnrelatedReplacementKeepsTheGrant(t *testing.T) {
+	var launches int64
+	var pcCalls atomic.Int64
+	m := newBareMinter(0, 0)
+	m.launch = func(context.Context) (minterSession, error) {
+		atomic.AddInt64(&launches, 1)
+		return &fakeSession{mint: okMint, playerCtx: func(string) (browser.PlayerContext, error) {
+			// The first request walks the ladder on a plain failure (attempt, retry,
+			// then the replacement); the wall appears only once it is already on that
+			// replacement.
+			if pcCalls.Add(1) < 3 {
+				return browser.PlayerContext{}, errors.New("extract failed")
+			}
+			return browser.PlayerContext{}, botCheck()
+		}}, nil
+	}
+	ctx := context.Background()
+
+	if _, _, err := m.PlayerContext(ctx, "vid"); !errors.Is(err, browser.ErrBotCheck) {
+		t.Fatalf("first request err = %v, want the replacement's bot check", err)
+	}
+	m.mu.Lock()
+	claimed := !m.botCheckRelaunchedAt.IsZero()
+	m.mu.Unlock()
+	if claimed {
+		t.Fatal("the bot-check window was claimed on a path that never relaunches for one")
+	}
+
+	// The next bot check is the first one that can act on a grant, so it must
+	// still get its fresh identity.
+	before := atomic.LoadInt64(&launches)
+	m.mu.Lock()
+	m.proofFailGen, m.proofFailedAt, m.proofFailCause, m.proofFailCooldown = 0, time.Time{}, nil, 0
+	m.mu.Unlock()
+	if _, _, err := m.PlayerContext(ctx, "vid"); !errors.Is(err, browser.ErrBotCheck) {
+		t.Fatalf("second request err = %v, want ErrBotCheck", err)
+	}
+	if got := atomic.LoadInt64(&launches) - before; got != 1 {
+		t.Errorf("launches on the bot check = %d, want 1 (the window's grant was still unspent)", got)
+	}
+}
+
+// The proof-failure streak and the bot-check window are separate rules. They
+// share one cool-down record, so the streak has to read the cause: a bot check
+// must not make the next proof failure on that generation count as its second
+// and claim the streak's relaunch.
+func TestBotCheckDoesNotSeedTheProofStreak(t *testing.T) {
+	const gen = 7
+
+	t.Run("a bot check does not count as a proof failure", func(t *testing.T) {
+		m := newBareMinter(0, 0)
+		m.recordBotCheck(gen, botCheck(), true)
+		second, relaunch := m.recordProofFailure(gen, errors.New("full-length proof failed"), true)
+		if second {
+			t.Error("a proof failure after a bot check counted as the generation's second")
+		}
+		if relaunch {
+			t.Error("a proof failure after a bot check claimed the streak's relaunch")
+		}
+	})
+
+	t.Run("two proof failures still make a second", func(t *testing.T) {
+		m := newBareMinter(0, 0)
+		m.recordProofFailure(gen, errors.New("full-length proof failed"), true)
+		second, relaunch := m.recordProofFailure(gen, errors.New("full-length proof failed"), true)
+		if !second || !relaunch {
+			t.Errorf("second = %v, relaunch = %v, want both true", second, relaunch)
+		}
+	})
 }

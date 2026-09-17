@@ -36,9 +36,19 @@ type Config struct {
 	// reaches this age. A zero value disables time-based recycling.
 	StreamingMaxAge time.Duration
 
-	// ReportDebounce is the minimum interval between session recycles caused by
-	// consumer reports. A non-positive value uses minter.DefaultReportDebounce.
+	// ReportDebounce is the refill interval of the report-driven recycle budget:
+	// bursts of up to minter.ReportBurst recycles are allowed before
+	// rate-limiting, and past the burst the budget refills at one recycle per
+	// interval. A non-positive value uses minter.DefaultReportDebounce.
 	ReportDebounce time.Duration
+
+	// MintSeparation overrides, for every tenant, the spacing the minter keeps
+	// between an in-page mint and a context establishment, when positive. A
+	// non-positive value leaves each tenant's Minter to resolve its own
+	// env-derived default (WAXSEAL_MINT_SEPARATION, or 12s). The waxseal server
+	// command does not expose a flag for this; it exists for programmatic callers
+	// such as tests that need a daemon with a specific, known spacing.
+	MintSeparation time.Duration
 
 	// MetricsPublic makes keyed daemons serve full per-tenant /metrics detail
 	// without a metrics key. It is ignored for keyless daemons, which already
@@ -95,7 +105,7 @@ func New(cfg Config) (*Server, error) {
 		return nil, err
 	}
 	s := &Server{
-		tenants:       minter.NewTenants(pool, cfg.Video, cfg.TenantKeys, opts, cfg.StreamingMaxAge, cfg.ReportDebounce),
+		tenants:       minter.NewTenants(pool, cfg.Video, cfg.TenantKeys, opts, cfg.StreamingMaxAge, cfg.ReportDebounce, cfg.MintSeparation),
 		log:           log,
 		metricsPublic: cfg.MetricsPublic,
 		// Hash once at startup. Request handling hashes the presented key and
@@ -126,7 +136,8 @@ func newHTTPServer(addr string, h http.Handler) *http.Server {
 // routes registers method-specific handlers and path-only 405 fallbacks.
 // ServeMux routes HEAD requests to GET handlers. For /session and /player-context
 // that would run browser-backed work, so explicit HEAD patterns reject them with
-// 405. HEAD /ping and /metrics stay on the GET handlers because they are cheap.
+// 405. HEAD /ping and /metrics stay on the GET handlers: /metrics is cheap, and
+// /ping is a bounded probe with no navigation that some balancers issue as HEAD.
 // Add the same HEAD gate for any future browser-backed GET endpoint. Because
 // authentication runs in endpoint handlers, unsupported methods are rejected before
 // tenant lookup.
@@ -198,22 +209,40 @@ func (s *Server) ListenAndServe() error { return s.srv.ListenAndServe() }
 // Serve accepts HTTP requests on ln and closes the listener before returning.
 func (s *Server) Serve(ln net.Listener) error { return s.srv.Serve(ln) }
 
-// Shutdown drains in-flight requests, then tears down the browser.
+// Shutdown drains in-flight requests until ctx is done, then tears down the
+// browser regardless of whether the drain finished. The caller supplies the
+// drain budget through ctx; the waxseal server command bounds it with
+// --shutdown-timeout (default 60s).
 func (s *Server) Shutdown(ctx context.Context) error {
 	err := s.srv.Shutdown(ctx)
 	s.tenants.Close()
 	return err
 }
 
-// apiKey extracts the tenant key from the header (preferred) or a query param.
+// apiKey extracts the tenant key, preferring X-API-Key, then an Authorization
+// Bearer header, then the key query parameter. Each source is skipped when it
+// carries nothing, so a request may present the key in whichever one it can.
 func apiKey(r *http.Request) string {
 	if k := r.Header.Get("X-API-Key"); k != "" {
 		return k
 	}
-	if a := r.Header.Get("Authorization"); strings.HasPrefix(a, "Bearer ") {
-		return strings.TrimSpace(strings.TrimPrefix(a, "Bearer "))
+	if k := bearerKey(r.Header.Get("Authorization")); k != "" {
+		return k
 	}
 	return r.URL.Query().Get("key")
+}
+
+// bearerKey returns the credentials from an RFC 7235 "Bearer" Authorization
+// header, or "" when the header names another scheme or carries no value. The
+// scheme is matched case insensitively, as RFC 7235 requires, and a header with
+// no usable credentials falls through to the next source rather than resolving to
+// the empty key, which would have 401ed a request whose ?key= was fine.
+func bearerKey(a string) string {
+	scheme, rest, ok := strings.Cut(a, " ")
+	if !ok || !strings.EqualFold(scheme, "Bearer") {
+		return ""
+	}
+	return strings.TrimSpace(rest)
 }
 
 // tenant resolves the request's Minter. It writes a 401 response and returns
@@ -275,7 +304,7 @@ func (s *Server) handleGetPot(w http.ResponseWriter, r *http.Request) {
 		if s.writeCtxErr(w, r, ctx, label) {
 			return
 		}
-		writeErr(w, http.StatusBadGateway, CodeMintFailed, "mint failed: "+err.Error())
+		writeRefusal(w, http.StatusBadGateway, CodeMintFailed, "mint failed: "+err.Error(), err)
 		return
 	}
 	// Use the token's real expiry (fixed at attest time, preserved through the
@@ -334,7 +363,7 @@ func (s *Server) handlePlayerContext(w http.ResponseWriter, r *http.Request) {
 			}
 			writeErrDetails(w, http.StatusUnprocessableEntity, CodeVideoUnavailable, err.Error(), status)
 		default:
-			writeErr(w, http.StatusBadGateway, CodePlayerContextFailed, "player-context failed: "+err.Error())
+			writeRefusal(w, http.StatusBadGateway, CodePlayerContextFailed, "player-context failed: "+err.Error(), err)
 		}
 		return
 	}
@@ -394,54 +423,92 @@ func normalizeScope(raw string) (string, bool) {
 }
 
 // strictPing reports whether ?strict asks /ping to map probe failures to HTTP
-// 503. Healthy sessions and no-session responses stay 200. A bare ?strict
-// enables it; explicit false values disable it.
-func strictPing(r *http.Request) bool {
+// 503, and whether the value parsed. A bare ?strict enables it. An unparseable
+// value is rejected rather than silently disabling the mode, so a typo in a
+// liveness probe fails loudly instead of quietly losing the behaviour.
+// Healthy sessions and no-session responses stay 200.
+func strictPing(r *http.Request) (strict, ok bool) {
 	q := r.URL.Query()
 	if !q.Has("strict") {
-		return false
+		return false, true
 	}
 	v := q.Get("strict")
 	if v == "" { // bare ?strict or ?strict=: presence means enabled
-		return true
+		return true, true
 	}
 	b, err := strconv.ParseBool(v)
-	return err == nil && b
+	if err != nil {
+		return false, false
+	}
+	return b, true
 }
 
-// handlePing probes an existing tenant session without launching Chromium,
-// attesting, or minting. A failed probe may retire the session. After
-// authentication, the handler reports health in a stable body. The reason field
-// distinguishes no-session from probe-failed; ?strict=true maps only probe
-// failures to HTTP 503.
+// strictPingUsage is the 400 message for a ?strict value strictPing cannot read.
+const strictPingUsage = `strict must be a boolean ("true", "false", "1", "0"), a bare ?strict, or omitted`
+
+// errBrowserTornDown is the probe error for a browser this probe found wedged.
+// The pool has already replaced it by the time the probe reports.
+var errBrowserTornDown = errors.New("the shared browser missed two probes and was torn down and relaunched")
+
+// handlePing is the health probe. It never attests or mints. Its scope depends
+// on the key: a tenant key, or no key on a keyless daemon, probes that
+// tenant's session; no key on a keyed daemon probes the shared browser (see
+// handleDaemonPing). A tenant probe whose page did not answer is followed by
+// the browser check as well, so a wedged Chromium is found and replaced by the
+// probe rather than by the next request stalling on it.
+//
+// The body reports health directly rather than through the error envelope,
+// with an always-present reason. no-session and busy are benign windows;
+// probe-failed means this probe confirmed a loss, a session retired or a browser
+// torn down or unreplaceable, and is the only reason ?strict=true maps to 503.
+// A probe runs on the raw request context: every step is bounded on its own
+// (four session round trips of pingProbeTimeout, a session teardown, two
+// browser round trips, a browser teardown, and a launch handshake), so the only
+// early exit is the caller leaving, which writes nothing.
 func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
+	// A keyed daemon answers a probe that presents no key at daemon scope: the
+	// shared browser's liveness, which belongs to no tenant. That is what the
+	// image's HEALTHCHECK sends, and it mirrors /metrics, which serves a keyed
+	// daemon's redacted aggregate without a key. A key that is present is always
+	// resolved, so a typo in a probe still fails it with 401 instead of hiding
+	// behind the daemon-level answer. A keyless daemon has one tenant, which the
+	// empty key selects, so it keeps the tenant-level probe.
+	if s.tenants.Keyed() && apiKey(r) == "" {
+		s.handleDaemonPing(w, r)
+		return
+	}
 	m, label, ok := s.tenant(w, r)
 	if !ok {
 		return
 	}
+	// Validate before probing, so an unparseable value is reported whatever the
+	// session's health is. /ping otherwise bypasses the error envelope, but a
+	// rejected parameter is the same class of failure the other handlers report,
+	// so it gets the same shape.
+	strict, ok := strictPing(r)
+	if !ok {
+		writeErr(w, http.StatusBadRequest, CodeInvalidRequest, strictPingUsage)
+		return
+	}
 	snap, live, err := m.Health(r.Context())
-	reason := "ok"
-	status := http.StatusOK
+	reason, relaunched := PingReasonOK, false
 	if err != nil {
-		// Check the caller first. A mid-probe disconnect is not a server condition, so
-		// write no body even if the probe also returned no-session. /ping uses the raw
-		// request context, which makes this check unambiguous.
-		if clientGone(r) {
-			s.log.Debug("request abandoned by client", "tenant", label, "err", r.Context().Err())
+		if s.pingAbandoned(r, "tenant", label) {
 			return
 		}
-		reason = "probe-failed"
-		if errors.Is(err, minter.ErrNoSession) {
-			// A report can retire the session before the next streaming request
-			// lazily creates a replacement. Treat that gap as expected.
-			reason = "no-session"
-		} else {
-			// Probe failures should be visible in logs even when callers do not poll
-			// /ping. Strict mode also exposes them through the status code.
-			s.log.Warn("ping probe failed", "tenant", label, "err", err)
-			if strictPing(r) {
-				status = http.StatusServiceUnavailable
-			}
+		reason = tenantPingReason(err)
+		s.logPing(reason, err, "tenant", label)
+		// No page answered, whichever the reason, and the browser itself may be
+		// what hung: a retired page, a page in use, and no page at all look the
+		// same from a wedged Chromium, and the next request would stall on it for
+		// its whole budget before the pool noticed. So the browser check follows.
+		// A browser that answers leaves the tenant reason standing: the page's
+		// failure was the page's own, or contention, which is what busy means. A
+		// page that answered has already proved the browser, which is why the
+		// healthy path never gets here.
+		reason, err, relaunched = s.checkBrowser(r.Context(), reason, err, "tenant", label)
+		if s.pingAbandoned(r, "tenant", label) {
+			return
 		}
 	}
 	// Browser proof describes playback in the daemon. A consumer report can still
@@ -450,27 +517,151 @@ func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
 	// browser-detection health signal. In failure responses these values are
 	// zero-valued, except generation, which carries the last-known generation so
 	// /ping stays consistent with /metrics.
-	body := map[string]any{
+	writePing(w, strict, reason, err, map[string]any{
 		"ok":                         live,
+		"probe":                      PingProbeTenant,
 		"tenant":                     label,
-		"reason":                     reason,
 		"attest":                     snap.AttestKind,
 		"generation":                 snap.Generation,
 		"navigator_webdriver":        snap.Identity.Webdriver,
 		"browser_proof_established":  snap.BrowserProofEstablished,
 		"last_browser_proof_outcome": snap.LastBrowserProofOutcome,
 		"streaming_suspect":          snap.StreamingSuspect,
+		"browser_relaunched":         relaunched,
+	})
+}
+
+// handleDaemonPing answers a keyless probe on a keyed daemon with the shared
+// browser's health. The body carries only whether the daemon has a running
+// browser and, if not, why, which is less than the redacted /metrics already
+// serves anyone. There is no loopback gate: an orchestrator's probe arrives
+// from the node, not loopback, and a port published through Docker's proxy
+// arrives from the bridge address, so the source address says nothing about
+// who is asking. A caller cannot make a healthy browser fail the check, so the
+// teardown and relaunch it can lead to happen only to a browser that is wedged
+// or gone, and the pool single-flights and backs off relaunches on its own.
+func (s *Server) handleDaemonPing(w http.ResponseWriter, r *http.Request) {
+	strict, ok := strictPing(r)
+	if !ok {
+		writeErr(w, http.StatusBadRequest, CodeInvalidRequest, strictPingUsage)
+		return
 	}
+	reason, err, relaunched := s.checkBrowser(r.Context(), PingReasonOK, nil) // it names the browser itself
+	if err != nil && s.pingAbandoned(r, "probe", PingProbeDaemon) {
+		return
+	}
+	writePing(w, strict, reason, err, map[string]any{
+		"ok":                 err == nil,
+		"probe":              PingProbeDaemon,
+		"browser_relaunched": relaunched,
+	})
+}
+
+// tenantPingReason maps a Minter.Health error to the reason a tenant probe
+// reports: the two benign windows, or probe-failed for a retired session.
+func tenantPingReason(err error) string {
+	switch {
+	case errors.Is(err, minter.ErrNoSession):
+		// A report can retire the session before the next streaming request
+		// lazily creates a replacement. Treat that gap as expected.
+		return PingReasonNoSession
+	case errors.Is(err, minter.ErrProbeBusy):
+		// A confirmed probe failure that could not take the page from a running
+		// request. It says as much about contention as about the browser, and
+		// nothing was retired, so it stays 200 under strict for the same reason
+		// no-session does: three of these must not mark a healthy container
+		// unhealthy. The next probe re-checks once the request finishes.
+		return PingReasonBusy
+	}
+	return PingReasonProbeFailed
+}
+
+// checkBrowser runs the browser check and folds its outcome into a probe's
+// reason and error so far (a tenant probe's, or ok and nil for a daemon-level
+// probe). A browser that answered leaves them. One that had exited and was
+// relaunched leaves them too and reports the relaunch, since the death was
+// already handled and the daemon has a browser again. One this probe found
+// wedged, or one that could not be replaced, is a loss this probe found: the
+// reason becomes probe-failed, logged at warn with the browser named so the loss
+// is not read as one tenant's, and the error says what happened to the browser
+// after whatever the tenant probe said. Cancellation is returned as is, unlogged,
+// for the caller's abandoned-request check.
+func (s *Server) checkBrowser(ctx context.Context, reason string, err error, attrs ...any) (string, error, bool) {
+	rec, berr := s.tenants.BrowserHealth(ctx)
+	if ctx.Err() != nil {
+		return reason, ctx.Err(), false
+	}
+	relaunched := rec != browser.RecoveryNone
+	switch {
+	case berr != nil:
+		berr = fmt.Errorf("no browser answers and none could be launched: %w", berr)
+	case rec == browser.RecoveryTornDown:
+		berr = errBrowserTornDown
+	default:
+		return reason, err, relaunched
+	}
+	s.logPing(PingReasonProbeFailed, berr, append(attrs, "probe", PingProbeDaemon)...)
 	if err != nil {
-		// /ping bypasses the error envelope, so strip the internal prefix (and clamp)
-		// here too, matching writeErrDetails and the CLI.
+		berr = fmt.Errorf("%v; %w", err, berr)
+	}
+	return PingReasonProbeFailed, berr, relaunched
+}
+
+// pingAbandoned reports whether the caller has gone away, logging it at debug.
+// A probe runs on the raw request context, so a disconnect is the only way it
+// ends early, and nothing is written for one: the response would go nowhere,
+// and a disconnect is not a server condition.
+func (s *Server) pingAbandoned(r *http.Request, attrs ...any) bool {
+	if !clientGone(r) {
+		return false
+	}
+	s.log.Debug("request abandoned by client", append(attrs, "err", r.Context().Err())...)
+	return true
+}
+
+// logPing records a probe outcome. A loss is logged at warn so it is visible
+// even when nobody reads the body; the busy window at debug, since probe_busy
+// already counts it and it is benign.
+func (s *Server) logPing(reason string, err error, attrs ...any) {
+	switch reason {
+	case PingReasonProbeFailed:
+		s.log.Warn("ping probe failed", append(attrs, "err", err)...)
+	case PingReasonBusy:
+		s.log.Debug("ping probe could not act: the session is busy", append(attrs, "err", err)...)
+	}
+}
+
+// writePing writes a health body. The status comes from the same predicate the
+// CLI reads (healthy is ok, or a benign reason), so the strict policy lives in
+// one place: 503 only for a failed probe whose reason is not benign, and only
+// when asked. /ping bypasses the error envelope, so the error text gets the same
+// prefix stripping and clamp.
+func writePing(w http.ResponseWriter, strict bool, reason string, err error, body map[string]any) {
+	status := http.StatusOK
+	if strict && err != nil && !BenignPingReason(reason) {
+		status = http.StatusServiceUnavailable
+	}
+	body["reason"] = reason
+	if err != nil {
 		body["error"] = presentErr(err.Error())
 	}
 	writeJSON(w, status, body)
 }
 
-// sessionCookie is the wire representation of one youtube.com cookie.
-type sessionCookie struct {
+// SessionResponse is the /session response. It is exported, with SessionCookie,
+// so the README block stays a checkable contract (TestSessionShapeContract) and
+// so a reader of the wire format has one place to look.
+type SessionResponse struct {
+	VisitorData       string          `json:"visitor_data"`
+	UserAgent         string          `json:"user_agent"`
+	ClientVersion     string          `json:"client_version"`
+	Cookies           []SessionCookie `json:"cookies"`
+	CookieHeader      string          `json:"cookie_header"`
+	SessionGeneration uint64          `json:"session_generation"`
+}
+
+// SessionCookie is the wire representation of one youtube.com cookie.
+type SessionCookie struct {
 	Name     string `json:"name"`
 	Value    string `json:"value"`
 	Domain   string `json:"domain"`
@@ -514,13 +705,13 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 		if s.writeCtxErr(w, r, ctx, label) {
 			return
 		}
-		writeErr(w, http.StatusServiceUnavailable, CodeNoSession, "no session: "+err.Error())
+		writeRefusal(w, http.StatusServiceUnavailable, CodeNoSession, "no session: "+err.Error(), err)
 		return
 	}
-	cookies := make([]sessionCookie, 0, len(raw))
+	cookies := make([]SessionCookie, 0, len(raw))
 	pairs := make([]string, 0, len(raw))
 	for _, c := range raw {
-		sc := sessionCookie{
+		sc := SessionCookie{
 			Name: c.Name, Value: c.Value, Domain: c.Domain, Path: c.Path,
 			Secure: c.Secure, HTTPOnly: c.HttpOnly, SameSite: sameSiteWire(c.SameSite),
 		}
@@ -531,13 +722,13 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 		pairs = append(pairs, c.Name+"="+c.Value)
 	}
 	s.log.Info("session handed out", "tenant", label, "visitor_data_len", len(id.VisitorData), "cookies", len(cookies), "generation", gen)
-	writeJSON(w, http.StatusOK, map[string]any{
-		"visitor_data":       id.VisitorData,
-		"user_agent":         id.UserAgent,
-		"client_version":     id.ClientVersion,
-		"cookies":            cookies,
-		"cookie_header":      strings.Join(pairs, "; "),
-		"session_generation": gen,
+	writeJSON(w, http.StatusOK, SessionResponse{
+		VisitorData:       id.VisitorData,
+		UserAgent:         id.UserAgent,
+		ClientVersion:     id.ClientVersion,
+		Cookies:           cookies,
+		CookieHeader:      strings.Join(pairs, "; "),
+		SessionGeneration: gen,
 	})
 }
 
@@ -681,24 +872,82 @@ const (
 	CodeNotFound = "not-found"
 )
 
+// The /ping probe values. The probe field, present on every health body, says
+// what the daemon checked: a tenant's session (a keyed request, or any request
+// on a keyless daemon) or the shared browser (a keyless request on a keyed
+// daemon). The 400 and 401 rejections use the error envelope instead.
+const (
+	// PingProbeTenant means the body describes one tenant's attested session.
+	PingProbeTenant = "tenant"
+	// PingProbeDaemon means the body describes the shared Chromium's liveness
+	// and nothing about any tenant.
+	PingProbeDaemon = "daemon"
+)
+
+// The /ping reason values. The reason field, present on every health body,
+// carries exactly one of these, and only PingReasonProbeFailed maps to 503 under
+// ?strict=true.
+const (
+	// PingReasonOK means a live session answered the probe.
+	PingReasonOK = "ok"
+	// PingReasonNoSession means no session is attested: a report retires one and
+	// re-establishment is lazy. Benign.
+	PingReasonNoSession = "no-session"
+	// PingReasonBusy means a probe failed twice while a request held the page, so
+	// nothing was retired and the next probe re-checks. Benign.
+	PingReasonBusy = "busy"
+	// PingReasonProbeFailed means this probe confirmed a loss: a live session's
+	// probe failed twice and the session was retired, or the shared browser
+	// missed two probes and was torn down, or no browser answers and none could
+	// be launched.
+	PingReasonProbeFailed = "probe-failed"
+)
+
+// BenignPingReason reports whether a not-ok /ping reason describes a state that
+// is expected on a working daemon. /ping keeps these at HTTP 200 even under
+// ?strict=true, and `waxseal ping --strict` calls this rather than keeping its
+// own list, because --strict deliberately does not trust the status code alone: a
+// pre-strict daemon answers a real probe failure with 200. One definition means a
+// liveness probe and the daemon cannot disagree about what counts as unhealthy.
+func BenignPingReason(reason string) bool {
+	return reason == PingReasonNoSession || reason == PingReasonBusy
+}
+
 // errEnvelope is the JSON error response shared by the API endpoints.
 type errEnvelope struct {
 	Error   string `json:"error"`
 	Code    string `json:"code"`
 	Details string `json:"details,omitempty"`
+	// RetryAfterSeconds mirrors the Retry-After header for a JSON consumer that
+	// never sees it. Absent when the daemon cannot put a number on the wait.
+	RetryAfterSeconds int `json:"retry_after_seconds,omitempty"`
 }
 
 // maxErrTextBytes bounds each error-envelope text field. err.Error() can include
 // multi-KiB CDP/V8 stack traces; if an envelope crosses the client's 64 KiB read
-// cap, the client may fail to parse Code and Details. All error envelopes pass
-// through writeErrDetails, so clamping here covers future endpoints too. JSON
-// escaping can expand a byte to six bytes (\u00XX), and two 4 KiB fields still fit
-// comfortably under the client cap.
+// cap, the client may fail to parse Code and Details. Every error envelope is
+// built through writeErrEnvelope, so clamping there covers future endpoints too.
+// JSON escaping can expand a byte to six bytes (\u00XX), and two 4 KiB fields
+// still fit comfortably under the client cap.
 const maxErrTextBytes = 4 << 10
 
 func writeErr(w http.ResponseWriter, status int, code, msg string) {
-	// Keep the clamp in writeErrDetails, the common path.
 	writeErrDetails(w, status, code, msg, "")
+}
+
+// writeRefusal is writeErr for a refusal the daemon expects to lift on its own:
+// a cool-down after a failed proof or a bot check, or the shared browser's
+// relaunch backoff. The minter states the wait on the error, and it goes out both
+// ways, since a generic HTTP client reads the header and a JSON consumer reads
+// the field. An error carrying no wait writes neither. /report keeps its own
+// writer: it answers 200, not a refusal.
+func writeRefusal(w http.ResponseWriter, status int, code, msg string, err error) {
+	secs := 0
+	if ra, ok := errors.AsType[*minter.RetryAfterError](err); ok {
+		secs = ra.Seconds()
+		w.Header().Set("Retry-After", strconv.Itoa(secs))
+	}
+	writeErrEnvelope(w, status, errEnvelope{Error: msg, Code: code, RetryAfterSeconds: secs})
 }
 
 // clampErrText caps s at maxErrTextBytes and appends a marker. It may split a
@@ -801,7 +1050,14 @@ func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any, allowEmpty,
 }
 
 func writeErrDetails(w http.ResponseWriter, status int, code, msg, details string) {
-	writeJSON(w, status, errEnvelope{Error: presentErr(msg), Code: code, Details: presentErr(details)})
+	writeErrEnvelope(w, status, errEnvelope{Error: msg, Code: code, Details: details})
+}
+
+// writeErrEnvelope is the one path every error response takes, so the text clamp
+// applies wherever an envelope is built.
+func writeErrEnvelope(w http.ResponseWriter, status int, env errEnvelope) {
+	env.Error, env.Details = presentErr(env.Error), presentErr(env.Details)
+	writeJSON(w, status, env)
 }
 
 // MetricsKeyCollision reports the tenant label that shares an API key with

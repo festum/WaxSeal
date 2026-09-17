@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+
+	"github.com/colespringer/waxseal/server"
 )
 
 // hasScheme reports whether s carries a URL scheme. Unlike
@@ -40,19 +42,27 @@ func newPingCmd() *cobra.Command {
 	}
 	f := c.Flags()
 	f.StringVar(&p.addr, "addr", "127.0.0.1:4416", "server address to connect to")
-	f.StringVar(&p.key, "key", "", "tenant API key (required if the server is multi-tenant)")
+	f.StringVar(&p.key, "key", "",
+		"tenant API key: probe that tenant's session. Without it a keyed daemon\n"+
+			"answers with the shared browser's liveness instead, which is what a\n"+
+			"container health check needs; a keyless daemon probes its one tenant.")
 	f.BoolVar(&p.strict, "strict", false,
-		"treat the no-session window as healthy and fail only on probe failure\n"+
-			"(sends ?strict=true). Use this for container or systemd liveness\n"+
-			"checks while sessions are re-established lazily.")
+		"treat the benign no-session and busy windows as healthy and fail only\n"+
+			"on probe failure (sends ?strict=true). Use this for container or\n"+
+			"systemd liveness checks while sessions are re-established lazily.")
 	return c
 }
 
 func runPing(cmd *cobra.Command, p *pingOpts) error {
-	q := url.Values{}
-	if p.key != "" {
-		q.Set("key", p.key)
+	// An empty --key is a usage error rather than "no key". A compose file that
+	// passes `--key ${VAR}` with the variable unset would otherwise send no
+	// header, and on a keyed daemon that turns the tenant probe the operator
+	// configured into the daemon-level one without a word: healthy, while the
+	// tenant it meant to watch is never checked.
+	if cmd.Flags().Changed("key") && p.key == "" {
+		return &usageError{msg: "--key is empty: pass the tenant key, or omit --key to probe the daemon's browser"}
 	}
+	q := url.Values{}
 	if p.strict {
 		q.Set("strict", "true")
 	}
@@ -87,39 +97,60 @@ func runPing(cmd *cobra.Command, p *pingOpts) error {
 		// usage-error path. Passing a nil request to http.DefaultClient.Do would panic.
 		return &usageError{msg: fmt.Sprintf("invalid --addr %q: %v", p.addr, err)}
 	}
+	// The key travels in a header, never in the query string. A health check runs
+	// every few seconds, and reverse proxies and container runtimes log request
+	// lines, so ?key= would write the tenant key into those logs forever. ?strict
+	// stays in the query because it is not a secret.
+	if p.key != "" {
+		req.Header.Set("X-API-Key", p.key)
+	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("unreachable: %w", err)
 	}
 	defer resp.Body.Close()
 	var body struct {
-		OK     bool   `json:"ok"`
-		Attest string `json:"attest"`
-		Reason string `json:"reason"`
+		OK         bool   `json:"ok"`
+		Probe      string `json:"probe"` // what the daemon checked; absent from older daemons
+		Attest     string `json:"attest"`
+		Reason     string `json:"reason"`
+		Relaunched bool   `json:"browser_relaunched"` // the probe found the browser gone and relaunched it
 	}
 	_ = json.NewDecoder(resp.Body).Decode(&body)
 	// Health semantics:
-	//   default: require a live session (ok:true), so no-session means not ready.
-	//   strict: accept no-session as healthy, but still fail on probe-failed.
+	//   default: require a live session or browser (ok:true), so the benign
+	//   no-session window reads as not ready.
+	//   strict: accept the benign reasons as healthy, but still fail on probe-failed.
 	//
 	// Do not trust HTTP 200 alone in strict mode. Older daemons ignore ?strict and
 	// can return 200 with {"ok":false}; non-WaxSeal endpoints can do the same.
 	healthy := body.OK
 	if p.strict {
-		healthy = body.OK || body.Reason == "no-session"
+		// server.BenignPingReason is the daemon's own strict-200 policy, so the
+		// probe and the daemon cannot disagree about what counts as unhealthy.
+		healthy = body.OK || server.BenignPingReason(body.Reason)
 	}
 	if resp.StatusCode != http.StatusOK || !healthy {
-		// reason distinguishes the benign no-session window from a real probe
-		// failure; older servers omit it.
+		// reason distinguishes the benign windows (no-session, busy) from a real
+		// probe failure; older servers omit it.
 		if body.Reason != "" {
 			return fmt.Errorf("unhealthy: status=%d ok=%v reason=%s", resp.StatusCode, body.OK, body.Reason)
 		}
 		return fmt.Errorf("unhealthy: status=%d ok=%v", resp.StatusCode, body.OK)
 	}
-	if !body.OK { // strict mode, benign no-session: healthy but no live attestation
-		fmt.Fprintf(cmd.OutOrStdout(), "ok (reason=%s)\n", body.Reason)
-		return nil
+	// A relaunch is worth a word in the health log: the probe found the browser
+	// gone and replaced it, which otherwise shows only in the daemon's own log.
+	detail := ""
+	if body.Relaunched {
+		detail = ", browser relaunched"
 	}
-	fmt.Fprintf(cmd.OutOrStdout(), "ok (attest=%s)\n", body.Attest)
+	switch {
+	case !body.OK: // strict mode, a benign window: healthy but nothing live to describe
+		fmt.Fprintf(cmd.OutOrStdout(), "ok (reason=%s%s)\n", body.Reason, detail)
+	case body.Probe == server.PingProbeDaemon: // a keyed daemon probed without a key: no session, so no attest
+		fmt.Fprintf(cmd.OutOrStdout(), "ok (probe=%s%s)\n", body.Probe, detail)
+	default:
+		fmt.Fprintf(cmd.OutOrStdout(), "ok (attest=%s%s)\n", body.Attest, detail)
+	}
 	return nil
 }

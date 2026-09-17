@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -101,23 +102,49 @@ func TestMetricsKeyCollision(t *testing.T) {
 	}
 }
 
+// TestAPIKeyExtraction pins where a tenant key may be presented and which source
+// wins. The cases that matter beyond the happy path are the ones where a header
+// carries no usable key: it has to fall through to ?key= instead of resolving to
+// the empty key, which a keyed daemon would 401.
 func TestAPIKeyExtraction(t *testing.T) {
-	header := httptest.NewRequest(http.MethodGet, "/", nil)
-	header.Header.Set("X-API-Key", "H")
-	if got := apiKey(header); got != "H" {
-		t.Errorf("X-API-Key = %q, want H", got)
-	}
-	bearer := httptest.NewRequest(http.MethodGet, "/", nil)
-	bearer.Header.Set("Authorization", "Bearer B")
-	if got := apiKey(bearer); got != "B" {
-		t.Errorf("Bearer = %q, want B", got)
-	}
-	query := httptest.NewRequest(http.MethodGet, "/?key=Q", nil)
-	if got := apiKey(query); got != "Q" {
-		t.Errorf("query key = %q, want Q", got)
-	}
-	if got := apiKey(httptest.NewRequest(http.MethodGet, "/", nil)); got != "" {
-		t.Errorf("no key = %q, want empty", got)
+	for _, tt := range []struct {
+		name  string
+		auth  string // Authorization header, sent only when non-empty
+		key   string // X-API-Key header, sent only when non-empty
+		query string // request target
+		want  string
+	}{
+		{name: "X-API-Key", key: "H", query: "/", want: "H"},
+		{name: "bearer", auth: "Bearer B", query: "/", want: "B"},
+		{name: "query", query: "/?key=Q", want: "Q"},
+		{name: "nothing", query: "/", want: ""},
+
+		// Precedence, most preferred source first.
+		{name: "header beats bearer", key: "H", auth: "Bearer B", query: "/?key=Q", want: "H"},
+		{name: "bearer beats query", auth: "Bearer B", query: "/?key=Q", want: "B"},
+
+		// RFC 7235 makes the scheme case insensitive.
+		{name: "lowercase scheme", auth: "bearer B", query: "/", want: "B"},
+		{name: "mixed-case scheme", auth: "BeArEr B", query: "/?key=Q", want: "B"},
+
+		// A Bearer header with nothing usable in it defers to ?key=.
+		{name: "empty bearer falls through", auth: "Bearer ", query: "/?key=Q", want: "Q"},
+		{name: "whitespace bearer falls through", auth: "Bearer    \t  ", query: "/?key=Q", want: "Q"},
+		{name: "another scheme falls through", auth: "Basic dXNlcjpwdw==", query: "/?key=Q", want: "Q"},
+		{name: "scheme with no space falls through", auth: "Bearer", query: "/?key=Q", want: "Q"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodGet, tt.query, nil)
+			if tt.key != "" {
+				r.Header.Set("X-API-Key", tt.key)
+			}
+			if tt.auth != "" {
+				r.Header.Set("Authorization", tt.auth)
+			}
+			if got := apiKey(r); got != tt.want {
+				t.Errorf("apiKey() = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -280,7 +307,7 @@ func TestRoutesMethodMatching(t *testing.T) {
 
 func TestMethodNotAllowedBeforeAuth(t *testing.T) {
 	s := &Server{
-		tenants: minter.NewTenants(nil, "", map[string]string{"GOODKEY": "alice"}, browser.Options{}, 0, 0),
+		tenants: minter.NewTenants(nil, "", map[string]string{"GOODKEY": "alice"}, browser.Options{}, 0, 0, 0),
 		log:     slog.New(slog.DiscardHandler),
 	}
 	r := httptest.NewRequest(http.MethodGet, "/get_pot", nil) // no API key
@@ -311,7 +338,7 @@ func TestMethodNotAllowedBeforeAuth(t *testing.T) {
 // needed.
 func TestHeadGate(t *testing.T) {
 	s := &Server{
-		tenants: minter.NewTenants(nil, "", nil, browser.Options{}, 0, 0), // keyless, no browser
+		tenants: minter.NewTenants(nil, "", nil, browser.Options{}, 0, 0, 0), // keyless, no browser
 		log:     slog.New(slog.DiscardHandler),
 	}
 	mux := s.routes()
@@ -422,7 +449,7 @@ func TestNotFoundJSONEnvelope(t *testing.T) {
 
 	// Unknown paths on keyed daemons return 404 without an auth challenge.
 	keyed := &Server{
-		tenants: minter.NewTenants(nil, "", map[string]string{"GOODKEY": "alice"}, browser.Options{}, 0, 0),
+		tenants: minter.NewTenants(nil, "", map[string]string{"GOODKEY": "alice"}, browser.Options{}, 0, 0, 0),
 		log:     slog.New(slog.DiscardHandler),
 	}
 	r = httptest.NewRequest(http.MethodGet, "/nope", nil) // no API key
@@ -458,7 +485,7 @@ func TestNotFoundJSONEnvelope(t *testing.T) {
 
 func TestTenantUnauthorizedCode(t *testing.T) {
 	s := &Server{
-		tenants: minter.NewTenants(nil, "", map[string]string{"GOODKEY": "alice"}, browser.Options{}, 0, 0),
+		tenants: minter.NewTenants(nil, "", map[string]string{"GOODKEY": "alice"}, browser.Options{}, 0, 0, 0),
 		log:     slog.New(slog.DiscardHandler),
 	}
 	r := httptest.NewRequest(http.MethodPost, "/get_pot", nil)
@@ -518,7 +545,7 @@ func TestDecodeErrMsg(t *testing.T) {
 // live session is needed because the decoder runs right after auth.
 func postKeyed(path, body string) *httptest.ResponseRecorder {
 	s := &Server{
-		tenants: minter.NewTenants(nil, "", map[string]string{"K": "alice"}, browser.Options{}, 0, 0),
+		tenants: minter.NewTenants(nil, "", map[string]string{"K": "alice"}, browser.Options{}, 0, 0, 0),
 		log:     slog.New(slog.DiscardHandler),
 	}
 	r := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
@@ -692,7 +719,14 @@ type fakePlayerSession struct {
 	pcBlocks        bool           // PlayerContext blocks until ctx is done (/player-context timeout)
 	establishBlocks bool           // EnsureEstablished blocks until ctx is done (/session timeout)
 	cookies         []*http.Cookie // when non-nil, BrowserCookies returns these
-	closed          atomic.Bool
+	// mintExpiresAt, when non-zero, is the attested expiry Mint reports. The
+	// zero default keeps the response layer's now+6h sentinel exercised.
+	mintExpiresAt time.Time
+	// pcGate, when set, runs at the top of PlayerContext. A test uses it to keep a
+	// request parked inside the minter, which is the only way to hold the page
+	// lock the way a real in-flight request does.
+	pcGate func(ctx context.Context)
+	closed atomic.Bool
 }
 
 func (f *fakePlayerSession) Mint(ctx context.Context, _ string) (browser.MintResult, error) {
@@ -703,9 +737,12 @@ func (f *fakePlayerSession) Mint(ctx context.Context, _ string) (browser.MintRes
 	if f.mintErr != nil {
 		return browser.MintResult{}, f.mintErr
 	}
-	return browser.MintResult{Kind: "integrity", Lifetime: 3600}, nil
+	return browser.MintResult{Kind: "integrity", Lifetime: 3600, ExpiresAt: f.mintExpiresAt}, nil
 }
 func (f *fakePlayerSession) PlayerContext(ctx context.Context, _ string) (browser.PlayerContext, error) {
+	if f.pcGate != nil {
+		f.pcGate(ctx)
+	}
 	if f.pcBlocks {
 		<-ctx.Done()
 		return browser.PlayerContext{}, ctx.Err()
@@ -713,7 +750,16 @@ func (f *fakePlayerSession) PlayerContext(ctx context.Context, _ string) (browse
 	if f.pcErr != nil {
 		return browser.PlayerContext{}, f.pcErr
 	}
-	return browser.PlayerContext{PlayabilityStatus: "OK", ServerAbrStreamingURL: f.abrURL, VisitorData: f.vd}, nil
+	return browser.PlayerContext{
+		PlayabilityStatus:     "OK",
+		ServerAbrStreamingURL: f.abrURL,
+		VisitorData:           f.vd,
+		ChannelID:             "UCfake",
+		Description:           "a fake description",
+		Thumbnails:            []browser.Thumbnail{{URL: "https://i.ytimg.com/vi/x/default.jpg", Width: 120, Height: 90}},
+		IsLiveContent:         true,
+		PublishDate:           "2015-04-10",
+	}, nil
 }
 func (f *fakePlayerSession) EnsureEstablished(ctx context.Context) error {
 	if f.establishBlocks {
@@ -743,13 +789,24 @@ func (f *fakePlayerSession) Close() { f.closed.Store(true) }
 // (generation 1), so live-session handlers run without a browser.
 func liveServer(t *testing.T, keys map[string]string, sessions map[string]*fakePlayerSession) *Server {
 	t.Helper()
-	tn := minter.NewTenants(nil, "v", keys, browser.Options{}, 0, 0)
+	s, _ := liveServerMinter(t, keys, sessions)
+	return s
+}
+
+// liveServerMinter is liveServer for a test that also has to reach the minter
+// behind one tenant, such as to age a cool-down without sleeping through it.
+func liveServerMinter(t *testing.T, keys map[string]string, sessions map[string]*fakePlayerSession) (*Server, map[string]*minter.Minter) {
+	t.Helper()
+	tn := minter.NewTenants(nil, "v", keys, browser.Options{}, 0, 0, 0)
+	minters := make(map[string]*minter.Minter, len(sessions))
 	for key, sess := range sessions {
-		if _, err := tn.InjectSessionForTest(context.Background(), key, sess); err != nil {
+		m, err := tn.InjectSessionForTest(context.Background(), key, sess)
+		if err != nil {
 			t.Fatalf("inject session for %q: %v", key, err)
 		}
+		minters[key] = m
 	}
-	return &Server{tenants: tn, log: slog.New(slog.DiscardHandler)}
+	return &Server{tenants: tn, log: slog.New(slog.DiscardHandler)}, minters
 }
 
 func TestPlayerContextEchoesGeneration(t *testing.T) {
@@ -770,6 +827,27 @@ func TestPlayerContextEchoesGeneration(t *testing.T) {
 	}
 	if resp["session_generation"] != float64(1) {
 		t.Errorf("session_generation = %v, want 1", resp["session_generation"])
+	}
+	// The metadata fields are embedded the same way, so a nested "player_context"
+	// object would show up here as a missing top-level key.
+	for key, want := range map[string]any{
+		"channel_id":      "UCfake",
+		"description":     "a fake description",
+		"is_live_content": true,
+		"is_live_now":     false,
+		"is_upcoming":     false,
+		"publish_date":    "2015-04-10",
+	} {
+		if resp[key] != want {
+			t.Errorf("%s = %v, want %v (embedded fields must stay top-level)", key, resp[key], want)
+		}
+	}
+	thumbs, ok := resp["thumbnails"].([]any)
+	if !ok || len(thumbs) != 1 {
+		t.Fatalf("thumbnails = %v, want one rung", resp["thumbnails"])
+	}
+	if rung := thumbs[0].(map[string]any); rung["url"] == "" || rung["width"] != float64(120) {
+		t.Errorf("thumbnail rung = %v, want the fake ladder entry", rung)
 	}
 }
 
@@ -802,7 +880,7 @@ func aggregateCounter(t *testing.T, s *Server, name string) float64 {
 // The deadline is forced into the past to keep the test deterministic.
 func TestPlayerContextRecyclesStaleStreamingSession(t *testing.T) {
 	ctx := context.Background()
-	tn := minter.NewTenants(nil, "v", map[string]string{"K": "alice"}, browser.Options{}, 0, 0)
+	tn := minter.NewTenants(nil, "v", map[string]string{"K": "alice"}, browser.Options{}, 0, 0, 0)
 	m, err := tn.InjectSessionForTest(ctx, "K", &fakePlayerSession{abrURL: "https://r/ok", vd: "vd"})
 	if err != nil {
 		t.Fatalf("inject: %v", err)
@@ -834,7 +912,7 @@ func TestPlayerContextRecyclesStaleStreamingSession(t *testing.T) {
 // behavior to the operator-visible metrics contract.
 func TestMetricsSurfacesCacheEvictions(t *testing.T) {
 	ctx := context.Background()
-	tn := minter.NewTenants(nil, "v", map[string]string{"K": "alice"}, browser.Options{}, 0, 0)
+	tn := minter.NewTenants(nil, "v", map[string]string{"K": "alice"}, browser.Options{}, 0, 0, 0)
 	m, err := tn.InjectSessionForTest(ctx, "K", &fakePlayerSession{abrURL: "https://r/ok", vd: "vd"})
 	if err != nil {
 		t.Fatalf("inject: %v", err)
@@ -899,7 +977,15 @@ func TestPingHealthFields(t *testing.T) {
 	if resp["reason"] != "ok" {
 		t.Errorf("reason = %v, want \"ok\" on a healthy ping", resp["reason"])
 	}
-	for _, k := range []string{"ok", "attest", "generation", "navigator_webdriver", "browser_proof_established", "last_browser_proof_outcome", "streaming_suspect", "reason"} {
+	// A keyed probe says it checked the tenant's session, so a reader can tell
+	// this body from the daemon-level one a keyless probe gets.
+	if resp["probe"] != "tenant" {
+		t.Errorf("probe = %v, want \"tenant\"", resp["probe"])
+	}
+	if resp["browser_relaunched"] != false {
+		t.Errorf("browser_relaunched = %v, want false when the browser answered", resp["browser_relaunched"])
+	}
+	for _, k := range []string{"ok", "probe", "attest", "generation", "navigator_webdriver", "browser_proof_established", "last_browser_proof_outcome", "streaming_suspect", "reason", "browser_relaunched"} {
 		if _, ok := resp[k]; !ok {
 			t.Errorf("/ping missing field %q", k)
 		}
@@ -1146,7 +1232,7 @@ func TestPingReason(t *testing.T) {
 			}
 
 			// No session yet: benign no-session.
-			noSess := &Server{tenants: minter.NewTenants(nil, "", tc.keys, browser.Options{}, 0, 0), log: slog.New(slog.DiscardHandler)}
+			noSess := &Server{tenants: minter.NewTenants(nil, "", tc.keys, browser.Options{}, 0, 0, 0), log: slog.New(slog.DiscardHandler)}
 			if resp := ping(noSess); resp["ok"] != false || resp["reason"] != "no-session" {
 				t.Errorf("no-session: ok=%v reason=%v, want false/no-session", resp["ok"], resp["reason"])
 			}
@@ -1160,26 +1246,105 @@ func TestPingReason(t *testing.T) {
 	}
 }
 
-// TestStrictPingParsing covers how the ?strict query parameter is read: a bare
-// flag enables it, common truthy spellings enable it, and absence or explicit
-// false values disable it.
-func TestStrictPingParsing(t *testing.T) {
-	cases := map[string]bool{
-		"/ping":              false, // absent
-		"/ping?strict":       true,  // bare flag (no value)
-		"/ping?strict=":      true,  // present, empty value
-		"/ping?strict=true":  true,
-		"/ping?strict=1":     true,
-		"/ping?strict=True":  true, // ParseBool accepts these spellings
-		"/ping?strict=t":     true,
-		"/ping?strict=false": false,
-		"/ping?strict=0":     false,
-		"/ping?strict=nope":  false, // unparseable values are disabled
+// TestBenignPingReason pins which /ping reasons stay healthy under ?strict=true.
+// Both the handler's status code and `waxseal ping --strict` read this, so a
+// reason added on one side and not the other is how the image's HEALTHCHECK
+// starts failing on a healthy daemon.
+func TestBenignPingReason(t *testing.T) {
+	for _, r := range []string{PingReasonNoSession, PingReasonBusy} {
+		if !BenignPingReason(r) {
+			t.Errorf("BenignPingReason(%q) = false, want true", r)
+		}
 	}
-	for target, want := range cases {
+	// "ok" arrives with ok:true, which the caller has already accepted. A
+	// probe-failed, or a reason-less body from a pre-strict daemon, must still
+	// read as unhealthy.
+	for _, r := range []string{PingReasonOK, PingReasonProbeFailed, "", "banana"} {
+		if BenignPingReason(r) {
+			t.Errorf("BenignPingReason(%q) = true, want false", r)
+		}
+	}
+}
+
+// A probe failure that cannot take the page from a running request is reported
+// as busy, not probe-failed: nothing was retired, so the failure says as much
+// about contention as about the browser. It stays 200 even under ?strict=true,
+// for the same reason no-session does. Three of these in a row would otherwise
+// mark a healthy container unhealthy while it was simply busy.
+func TestPingBusyStaysHealthyUnderStrict(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	sess := &fakePlayerSession{
+		abrURL:  "https://r/x",
+		vd:      "vd",
+		pingErr: errors.New("cdp connection closed"),
+		pcGate: func(ctx context.Context) {
+			once.Do(func() { close(entered) })
+			select {
+			case <-release:
+			case <-ctx.Done():
+			}
+		},
+	}
+	s := liveServer(t, map[string]string{"K": "alice"}, map[string]*fakePlayerSession{"K": sess})
+
+	// Park a /player-context inside the minter so it holds the page lock, the way
+	// a real request does while /ping runs.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r := httptest.NewRequest(http.MethodPost, "/player-context", strings.NewReader(`{"video_id":"aqz-KE-bpKQ"}`))
+		r.Header.Set("X-API-Key", "K")
+		s.routes().ServeHTTP(httptest.NewRecorder(), r)
+	}()
+	<-entered
+	defer func() { close(release); <-done }()
+
+	r := httptest.NewRequest(http.MethodGet, "/ping?strict=true", nil)
+	r.Header.Set("X-API-Key", "K")
+	w := httptest.NewRecorder()
+	s.routes().ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200 (busy is benign, even under strict)", w.Code)
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp["reason"] != "busy" {
+		t.Errorf("reason = %v, want busy", resp["reason"])
+	}
+	if resp["ok"] != false {
+		t.Errorf("ok = %v, want false", resp["ok"])
+	}
+}
+
+// TestStrictPingParsing covers how the ?strict query parameter is read: a bare
+// flag enables it, common truthy spellings enable it, absence and explicit false
+// values disable it, and anything ParseBool cannot read is rejected rather than
+// quietly disabling the mode the operator asked for.
+func TestStrictPingParsing(t *testing.T) {
+	type want struct{ strict, ok bool }
+	cases := map[string]want{
+		"/ping":               {false, true}, // absent
+		"/ping?strict":        {true, true},  // bare flag (no value)
+		"/ping?strict=":       {true, true},  // present, empty value
+		"/ping?strict=true":   {true, true},
+		"/ping?strict=1":      {true, true},
+		"/ping?strict=True":   {true, true}, // ParseBool accepts these spellings
+		"/ping?strict=t":      {true, true},
+		"/ping?strict=false":  {false, true},
+		"/ping?strict=0":      {false, true},
+		"/ping?strict=yes":    {false, false}, // ParseBool does not read these
+		"/ping?strict=on":     {false, false},
+		"/ping?strict=banana": {false, false},
+	}
+	for target, w := range cases {
 		r := httptest.NewRequest(http.MethodGet, target, nil)
-		if got := strictPing(r); got != want {
-			t.Errorf("strictPing(%q) = %v, want %v", target, got, want)
+		strict, ok := strictPing(r)
+		if strict != w.strict || ok != w.ok {
+			t.Errorf("strictPing(%q) = (%v, %v), want (%v, %v)", target, strict, ok, w.strict, w.ok)
 		}
 	}
 }
@@ -1191,16 +1356,19 @@ func TestPingStrict(t *testing.T) {
 	probeErr := errors.New("cdp connection closed")
 	keys := map[string]string{"K": "alice"}
 
-	ping := func(s *Server, strict bool) int {
-		u := "/ping"
-		if strict {
-			u += "?strict=true"
-		}
+	pingTarget := func(s *Server, u string) int {
 		r := httptest.NewRequest(http.MethodGet, u, nil)
 		r.Header.Set("X-API-Key", "K")
 		w := httptest.NewRecorder()
 		s.routes().ServeHTTP(w, r)
 		return w.Code
+	}
+	ping := func(s *Server, strict bool) int {
+		u := "/ping"
+		if strict {
+			u += "?strict=true"
+		}
+		return pingTarget(s, u)
 	}
 	newHealthy := func() *Server {
 		return liveServer(t, keys, map[string]*fakePlayerSession{"K": {abrURL: "https://r/ok", vd: "vd"}})
@@ -1209,7 +1377,7 @@ func TestPingStrict(t *testing.T) {
 		return liveServer(t, keys, map[string]*fakePlayerSession{"K": {abrURL: "https://r/x", vd: "vd", pingErr: probeErr}})
 	}
 	newNoSession := func() *Server {
-		return &Server{tenants: minter.NewTenants(nil, "", keys, browser.Options{}, 0, 0), log: slog.New(slog.DiscardHandler)}
+		return &Server{tenants: minter.NewTenants(nil, "", keys, browser.Options{}, 0, 0, 0), log: slog.New(slog.DiscardHandler)}
 	}
 
 	// With ?strict=true only a real probe failure flips to 503.
@@ -1232,6 +1400,17 @@ func TestPingStrict(t *testing.T) {
 	}
 	if code := ping(newHealthy(), false); code != http.StatusOK {
 		t.Errorf("non-strict healthy status = %d, want 200", code)
+	}
+
+	// An unparseable value is a request error, not a silent downgrade to
+	// non-strict, and it is reported whatever the session's health is.
+	for _, u := range []string{"/ping?strict=banana", "/ping?strict=yes", "/ping?strict=on"} {
+		if code := pingTarget(newHealthy(), u); code != http.StatusBadRequest {
+			t.Errorf("%s on a healthy session: status = %d, want 400", u, code)
+		}
+		if code := pingTarget(newFailing(), u); code != http.StatusBadRequest {
+			t.Errorf("%s on a failing probe: status = %d, want 400", u, code)
+		}
 	}
 }
 
@@ -1261,6 +1440,50 @@ func TestGetPotWarnsOnURLBinding(t *testing.T) {
 	bareResp := post("aqz-KE-bpKQ")
 	if v, present := bareResp["warning"]; present {
 		t.Errorf("bare ID: warning = %v, want no warning key", v)
+	}
+}
+
+// TestGetPotCacheHeaderAndExpiry covers the cache disposition a consumer reads
+// off /get_pot: the first request for a binding mints and reports a miss, the
+// repeat is served from the cache and reports a hit, and both echo the token's
+// own attested expiry rather than one recomputed from the time of the response.
+func TestGetPotCacheHeaderAndExpiry(t *testing.T) {
+	// Whole seconds, because the response formats with RFC3339.
+	expires := time.Now().Add(2 * time.Hour).Truncate(time.Second)
+	s := liveServer(t, map[string]string{"K": "alice"}, map[string]*fakePlayerSession{
+		"K": {abrURL: "https://r/ok", vd: "vd", mintExpiresAt: expires},
+	})
+	get := func() (string, time.Time) {
+		t.Helper()
+		r := httptest.NewRequest(http.MethodPost, "/get_pot", strings.NewReader(`{"content_binding":"aqz-KE-bpKQ"}`))
+		r.Header.Set("X-API-Key", "K")
+		w := httptest.NewRecorder()
+		s.routes().ServeHTTP(w, r)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, body = %s", w.Code, w.Body)
+		}
+		var resp struct {
+			ExpiresAt time.Time `json:"expiresAt"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		return w.Header().Get("X-POT-Cache"), resp.ExpiresAt
+	}
+
+	disposition, exp := get()
+	if disposition != "miss" {
+		t.Errorf("first request: X-POT-Cache = %q, want %q", disposition, "miss")
+	}
+	if !exp.Equal(expires) {
+		t.Errorf("first request: expiresAt = %v, want the token's own %v", exp, expires)
+	}
+	disposition, exp = get()
+	if disposition != "hit" {
+		t.Errorf("repeat request: X-POT-Cache = %q, want %q", disposition, "hit")
+	}
+	if !exp.Equal(expires) {
+		t.Errorf("repeat request: expiresAt = %v, want the token's own %v (not recomputed on the hit)", exp, expires)
 	}
 }
 
@@ -1415,7 +1638,7 @@ func TestHandleReportLive(t *testing.T) {
 
 func TestHandleReportValidation(t *testing.T) {
 	newSrv := func() *Server {
-		return &Server{tenants: minter.NewTenants(nil, "", map[string]string{"K": "alice"}, browser.Options{}, 0, 0), log: slog.New(slog.DiscardHandler)}
+		return &Server{tenants: minter.NewTenants(nil, "", map[string]string{"K": "alice"}, browser.Options{}, 0, 0, 0), log: slog.New(slog.DiscardHandler)}
 	}
 	t.Run("no auth is 401", func(t *testing.T) {
 		s := newSrv()
@@ -1466,7 +1689,7 @@ func TestHandleReportValidation(t *testing.T) {
 
 func TestHandleReportNoSessionReflectsResult(t *testing.T) {
 	// A report for an unwarmed tenant is returned as not accepted.
-	s := &Server{tenants: minter.NewTenants(nil, "", map[string]string{"K": "alice"}, browser.Options{}, 0, 0), log: slog.New(slog.DiscardHandler)}
+	s := &Server{tenants: minter.NewTenants(nil, "", map[string]string{"K": "alice"}, browser.Options{}, 0, 0, 0), log: slog.New(slog.DiscardHandler)}
 	r := httptest.NewRequest(http.MethodPost, "/report", strings.NewReader(`{"session_generation":1,"reason":"cap"}`))
 	r.Header.Set("X-API-Key", "K")
 	w := httptest.NewRecorder()
@@ -1493,18 +1716,20 @@ func TestHandleReportRateLimited(t *testing.T) {
 		s.routes().ServeHTTP(w, r)
 		return w
 	}
-	if w := post("/report", `{"session_generation":1,"reason":"cap"}`); w.Code != http.StatusOK {
-		t.Fatalf("first report status = %d", w.Code)
+	// Spend the whole burst allowance: each report recycles, each player-context
+	// relaunches the next generation.
+	for gen := 1; gen <= minter.ReportBurst; gen++ {
+		if w := post("/report", fmt.Sprintf(`{"session_generation":%d,"reason":"cap"}`, gen)); w.Code != http.StatusOK {
+			t.Fatalf("report %d status = %d", gen, w.Code)
+		}
+		pcW := post("/player-context", `{"video_id":"aqz-KE-bpKQ"}`)
+		var pc map[string]any
+		json.Unmarshal(pcW.Body.Bytes(), &pc)
+		if got, _ := pc["session_generation"].(float64); int(got) != gen+1 {
+			t.Fatalf("relaunch %d generation = %v, want %d", gen, pc["session_generation"], gen+1)
+		}
 	}
-	// Relaunch to a live generation 2.
-	pcW := post("/player-context", `{"video_id":"aqz-KE-bpKQ"}`)
-	var pc map[string]any
-	json.Unmarshal(pcW.Body.Bytes(), &pc)
-	gen2, _ := pc["session_generation"].(float64)
-	if gen2 != 2 {
-		t.Fatalf("relaunch generation = %v, want 2", pc["session_generation"])
-	}
-	w := post("/report", fmt.Sprintf(`{"session_generation":%d,"reason":"cap"}`, int(gen2)))
+	w := post("/report", fmt.Sprintf(`{"session_generation":%d,"reason":"cap"}`, minter.ReportBurst+1))
 	if w.Code != http.StatusOK {
 		t.Fatalf("rate-limited report status = %d", w.Code)
 	}
@@ -1616,7 +1841,7 @@ func TestGetPotDecodeMessages(t *testing.T) {
 }
 
 func TestPlayerContextEmptyBodyReportsMissingVideoID(t *testing.T) {
-	s := &Server{tenants: minter.NewTenants(nil, "", map[string]string{"K": "alice"}, browser.Options{}, 0, 0), log: slog.New(slog.DiscardHandler)}
+	s := &Server{tenants: minter.NewTenants(nil, "", map[string]string{"K": "alice"}, browser.Options{}, 0, 0, 0), log: slog.New(slog.DiscardHandler)}
 	r := httptest.NewRequest(http.MethodPost, "/player-context", strings.NewReader("")) // empty body, no query
 	r.Header.Set("X-API-Key", "K")
 	w := httptest.NewRecorder()
@@ -1652,6 +1877,26 @@ func (h *capturingHandler) Handle(_ context.Context, r slog.Record) error {
 // these synchronous, single-goroutine tests.
 func (h *capturingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
 func (h *capturingHandler) WithGroup(string) slog.Handler      { return h }
+
+// attrs returns the attributes of the first record at level with msg, as
+// key/value strings in order, and false when there is none. Repeated keys are
+// kept, so a caller can see a duplicated attribute.
+func (h *capturingHandler) attrs(level slog.Level, msg string) ([][2]string, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, r := range h.records {
+		if r.Level != level || r.Message != msg {
+			continue
+		}
+		var out [][2]string
+		r.Attrs(func(a slog.Attr) bool {
+			out = append(out, [2]string{a.Key, a.Value.String()})
+			return true
+		})
+		return out, true
+	}
+	return nil, false
+}
 
 func (h *capturingHandler) has(level slog.Level, msg string) bool {
 	h.mu.Lock()
@@ -1957,5 +2202,605 @@ func TestInnerDeadlineIsNot504(t *testing.T) {
 	}
 	if w.Code != http.StatusBadGateway || decodeCode(t, w.Body.Bytes()) != CodeMintFailed {
 		t.Errorf("status/code = %d/%q, want 502/%q", w.Code, decodeCode(t, w.Body.Bytes()), CodeMintFailed)
+	}
+}
+
+// TestPlayerContextUnprovenSessionMaps502 checks that a session which cannot
+// prove full-length streaming reaches the client as 502/player-context-failed,
+// the same shape any other refused player-context request uses.
+func TestPlayerContextUnprovenSessionMaps502(t *testing.T) {
+	sess := &fakePlayerSession{abrURL: "https://r/ok", vd: "vd", establishErr: errors.New("full-length proof failed")}
+	s := liveServer(t, map[string]string{"K": "alice"}, map[string]*fakePlayerSession{"K": sess})
+	r := httptest.NewRequest(http.MethodPost, "/player-context", strings.NewReader(`{"video_id":"aqz-KE-bpKQ"}`))
+	r.Header.Set("X-API-Key", "K")
+	w := httptest.NewRecorder()
+	s.routes().ServeHTTP(w, r)
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, body = %s, want 502", w.Code, w.Body)
+	}
+	if got := decodeCode(t, w.Body.Bytes()); got != CodePlayerContextFailed {
+		t.Errorf("code = %q, want %q", got, CodePlayerContextFailed)
+	}
+	if got := aggregateCounter(t, s, "unproven_rejections"); got != 1 {
+		t.Errorf("unproven_rejections = %v, want 1", got)
+	}
+	// The failure opened a cool-down, so the refusal states how long it runs.
+	wantRetryAfter(t, w, 30)
+}
+
+// TestSessionUnprovenSessionMaps503 checks that a session which cannot prove
+// full-length streaming reaches /session as 503/no-session, the same shape any
+// other missing-session response uses. SessionSnapshot routes its proof through
+// the same ensureProven ladder /player-context uses, so the failure also counts
+// toward unproven_rejections.
+func TestSessionUnprovenSessionMaps503(t *testing.T) {
+	sess := &fakePlayerSession{abrURL: "https://r/ok", vd: "vd", establishErr: errors.New("full-length proof failed")}
+	s := liveServer(t, map[string]string{"K": "alice"}, map[string]*fakePlayerSession{"K": sess})
+	r := httptest.NewRequest(http.MethodGet, "/session", nil)
+	r.Header.Set("X-API-Key", "K")
+	w := httptest.NewRecorder()
+	s.routes().ServeHTTP(w, r)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, body = %s, want 503", w.Code, w.Body)
+	}
+	if got := decodeCode(t, w.Body.Bytes()); got != CodeNoSession {
+		t.Errorf("code = %q, want %q", got, CodeNoSession)
+	}
+	if got := aggregateCounter(t, s, "unproven_rejections"); got != 1 {
+		t.Errorf("unproven_rejections = %v, want 1", got)
+	}
+	wantRetryAfter(t, w, 30)
+}
+
+// wantRetryAfter asserts that a refusal states its wait both ways: the header a
+// generic HTTP client reads and the envelope field a JSON consumer does.
+func wantRetryAfter(t *testing.T, w *httptest.ResponseRecorder, want int) {
+	t.Helper()
+	if got := w.Header().Get("Retry-After"); got != strconv.Itoa(want) {
+		t.Errorf("Retry-After = %q, want %q", got, strconv.Itoa(want))
+	}
+	var env struct {
+		RetryAfterSeconds int `json:"retry_after_seconds"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode error body %q: %v", w.Body.Bytes(), err)
+	}
+	if env.RetryAfterSeconds != want {
+		t.Errorf("retry_after_seconds = %d, want %d", env.RetryAfterSeconds, want)
+	}
+}
+
+// playerContextReq drives one /player-context request for video and returns the
+// recorder.
+func playerContextReq(s *Server, video string) *httptest.ResponseRecorder {
+	r := httptest.NewRequest(http.MethodPost, "/player-context", strings.NewReader(`{"video_id":"`+video+`"}`))
+	r.Header.Set("X-API-Key", "K")
+	w := httptest.NewRecorder()
+	s.routes().ServeHTTP(w, r)
+	return w
+}
+
+// A refusal from inside a cool-down states what is left of it, not the whole
+// window: a consumer that waits the stated time finds the daemon ready. Ageing
+// the record by a known amount is what makes that testable, since the whole
+// window also satisfies "somewhere in the window".
+func TestPlayerContextCooldownRetryAfterIsRemaining(t *testing.T) {
+	sess := &fakePlayerSession{abrURL: "https://r/ok", vd: "vd", establishErr: errors.New("full-length proof failed")}
+	s, minters := liveServerMinter(t, map[string]string{"K": "alice"}, map[string]*fakePlayerSession{"K": sess})
+
+	w := playerContextReq(s, "aqz-KE-bpKQ")
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("first status = %d, body = %s, want 502", w.Code, w.Body)
+	}
+	wantRetryAfter(t, w, 30)
+
+	minters["K"].RewindProofCooldownForTest(12 * time.Second)
+	w = playerContextReq(s, "aqz-KE-bpKQ")
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("second status = %d, body = %s, want 502", w.Code, w.Body)
+	}
+	secs, err := strconv.Atoi(w.Header().Get("Retry-After"))
+	if err != nil {
+		t.Fatalf("Retry-After = %q: %v", w.Header().Get("Retry-After"), err)
+	}
+	if secs != 18 {
+		t.Errorf("Retry-After = %d, want 18 (the 30 s window less the 12 s aged off it)", secs)
+	}
+}
+
+// A bot check is the browser session's problem, so it answers as a retryable
+// player-context-failed with the bot-check wait, never as video-unavailable, and
+// the video stays out of the negative cache.
+func TestPlayerContextBotCheckMaps502WithRetryAfter(t *testing.T) {
+	sess := &fakePlayerSession{abrURL: "https://r/ok", vd: "vd",
+		pcErr: &browser.BotCheckError{Status: "LOGIN_REQUIRED", Reason: "Sign in to confirm you\u2019re not a bot"}}
+	s := liveServer(t, map[string]string{"K": "alice"}, map[string]*fakePlayerSession{"K": sess})
+
+	w := playerContextReq(s, "aqz-KE-bpKQ")
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, body = %s, want 502 (a bot check is not a verdict on the video)", w.Code, w.Body)
+	}
+	if got := decodeCode(t, w.Body.Bytes()); got != CodePlayerContextFailed {
+		t.Errorf("code = %q, want %q", got, CodePlayerContextFailed)
+	}
+	var env struct {
+		Error   string `json:"error"`
+		Details string `json:"details"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if env.Details != "" {
+		t.Errorf("details = %q, want none: details carries a playabilityStatus verdict", env.Details)
+	}
+	if !strings.Contains(env.Error, "bot check") {
+		t.Errorf("error = %q, want it to name the bot check", env.Error)
+	}
+	wantRetryAfter(t, w, 120)
+	if got := aggregateCounter(t, s, "bot_checks"); got != 2 {
+		t.Errorf("bot_checks = %v, want 2 (the context, then the replacement's)", got)
+	}
+	if got := aggregateCounter(t, s, "escalations"); got != 1 {
+		t.Errorf("escalations = %v, want 1", got)
+	}
+
+	// The next request is refused from the cool-down, not from the negative cache.
+	if w := playerContextReq(s, "aqz-KE-bpKQ"); w.Code != http.StatusBadGateway {
+		t.Fatalf("second status = %d, body = %s, want 502", w.Code, w.Body)
+	}
+	if got := aggregateCounter(t, s, "player_context_negative_cache_hits"); got != 0 {
+		t.Errorf("player_context_negative_cache_hits = %v, want 0 (a bot check is never cached against the video)", got)
+	}
+}
+
+// The browser pool's relaunch backoff reaches the mint path too, and its wait is
+// the caller's.
+func TestGetPotBackoffCarriesRetryAfter(t *testing.T) {
+	tn := minter.NewTenants(nil, "v", map[string]string{"K": "alice"}, browser.Options{}, 0, 0, 0)
+	if _, err := tn.FailLaunchForTest("K", &browser.RelaunchBackoffError{Wait: 9 * time.Second, Streak: 3}); err != nil {
+		t.Fatalf("FailLaunchForTest: %v", err)
+	}
+	s := &Server{tenants: tn, log: slog.New(slog.DiscardHandler)}
+
+	r := httptest.NewRequest(http.MethodPost, "/get_pot", strings.NewReader(`{"content_binding":"vd"}`))
+	r.Header.Set("X-API-Key", "K")
+	w := httptest.NewRecorder()
+	s.routes().ServeHTTP(w, r)
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, body = %s, want 502", w.Code, w.Body)
+	}
+	if got := decodeCode(t, w.Body.Bytes()); got != CodeMintFailed {
+		t.Errorf("code = %q, want %q", got, CodeMintFailed)
+	}
+	wantRetryAfter(t, w, 9)
+}
+
+// A refusal the daemon cannot put a number on says nothing rather than guessing:
+// no header, and the field stays out of the envelope.
+func TestPlayerContextFailureWithoutWaitOmitsRetryAfter(t *testing.T) {
+	sess := &fakePlayerSession{abrURL: "https://r/ok", vd: "vd", pcErr: errors.New("extract failed")}
+	s := liveServer(t, map[string]string{"K": "alice"}, map[string]*fakePlayerSession{"K": sess})
+
+	w := playerContextReq(s, "aqz-KE-bpKQ")
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, body = %s, want 502", w.Code, w.Body)
+	}
+	if got := w.Header().Get("Retry-After"); got != "" {
+		t.Errorf("Retry-After = %q, want no header", got)
+	}
+	if strings.Contains(w.Body.String(), "retry_after_seconds") {
+		t.Errorf("body = %s, want no retry_after_seconds field", w.Body)
+	}
+}
+
+// fakeProber stands in for the browser pool behind /ping. health decides each
+// check's outcome (nil answers); the counters are what /metrics reports, and a
+// health func may bump them the way Pool.Health does.
+type fakeProber struct {
+	health     func(ctx context.Context) (browser.Recovery, error)
+	calls      int
+	probes     int64
+	relaunches int64
+}
+
+func (f *fakeProber) Health(ctx context.Context) (browser.Recovery, error) {
+	f.calls++
+	if f.health == nil {
+		return browser.RecoveryNone, nil
+	}
+	return f.health(ctx)
+}
+func (f *fakeProber) ProbeFailures() int64    { return f.probes }
+func (f *fakeProber) RelaunchFailures() int64 { return f.relaunches }
+
+// proberOf installs f as s's browser prober and returns f.
+func proberOf(s *Server, f *fakeProber) *fakeProber {
+	s.tenants.SetBrowserProberForTest(f)
+	return f
+}
+
+// answer returns a health func with a fixed outcome.
+func answer(rec browser.Recovery, err error) func(context.Context) (browser.Recovery, error) {
+	return func(context.Context) (browser.Recovery, error) { return rec, err }
+}
+
+// pingWith issues GET target with key (or none) and returns the status and the
+// decoded body, which is nil when the body is empty.
+func pingWith(t *testing.T, s *Server, target, key string) (int, map[string]any) {
+	t.Helper()
+	r := httptest.NewRequest(http.MethodGet, target, nil)
+	if key != "" {
+		r.Header.Set("X-API-Key", key)
+	}
+	w := httptest.NewRecorder()
+	s.routes().ServeHTTP(w, r)
+	if w.Body.Len() == 0 {
+		return w.Code, nil
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode %s: %v (%q)", target, err, w.Body.String())
+	}
+	return w.Code, resp
+}
+
+var keyedOnly = map[string]string{"K": "alice"}
+
+// A keyed daemon answers a probe that presents no key at daemon scope instead of
+// 401, so the image's HEALTHCHECK works without being told a tenant key. The
+// body says what was probed and carries none of the tenant-level fields.
+func TestPingKeylessOnKeyedDaemonProbesTheBrowser(t *testing.T) {
+	s := liveServer(t, keyedOnly, nil)
+	f := proberOf(s, &fakeProber{})
+	code, resp := pingWith(t, s, "/ping", "")
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (a keyless probe on a keyed daemon is not unauthorized)", code)
+	}
+	if f.calls != 1 {
+		t.Errorf("browser checks = %d, want 1", f.calls)
+	}
+	if resp["ok"] != true || resp["reason"] != PingReasonOK || resp["probe"] != PingProbeDaemon || resp["browser_relaunched"] != false {
+		t.Errorf("body = %v, want ok:true reason:ok probe:daemon browser_relaunched:false", resp)
+	}
+	for _, k := range []string{"tenant", "attest", "generation", "navigator_webdriver", "browser_proof_established", "last_browser_proof_outcome", "streaming_suspect", "identity", "error"} {
+		if _, leak := resp[k]; leak {
+			t.Errorf("daemon-level /ping carries %q; a keyless probe reports liveness only", k)
+		}
+	}
+	// Nothing about the probe creates tenant state.
+	if n := s.tenants.MetricsSnapshot()["tenants"]; n != 0 {
+		t.Errorf("tenants after a keyless probe = %v, want 0", n)
+	}
+}
+
+// The daemon-level outcomes. A browser that had exited and was relaunched is
+// healthy and says so; a browser this probe found wedged is a loss, probe-failed
+// and 503 under strict even though it was replaced, as a retired session is;
+// a browser that cannot be replaced is the failure a health check exists to
+// surface.
+func TestPingDaemonProbeOutcomes(t *testing.T) {
+	launchErr := errors.New("waxseal: relaunch chromium: exec: no such file")
+	cases := []struct {
+		name       string
+		rec        browser.Recovery
+		err        error
+		ok         bool
+		reason     string
+		strictCode int
+		relaunched bool
+		wantErr    string
+		warns      bool
+	}{
+		{"answered", browser.RecoveryNone, nil, true, PingReasonOK, http.StatusOK, false, "", false},
+		{"relaunched", browser.RecoveryRelaunched, nil, true, PingReasonOK, http.StatusOK, true, "", false},
+		{"torn down", browser.RecoveryTornDown, nil, false, PingReasonProbeFailed, http.StatusServiceUnavailable, true, "the shared browser missed two probes and was torn down and relaunched", true},
+		{"unlaunchable", browser.RecoveryNone, launchErr, false, PingReasonProbeFailed, http.StatusServiceUnavailable, false, "no browser answers and none could be launched: relaunch chromium: exec: no such file", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := liveServer(t, keyedOnly, nil)
+			proberOf(s, &fakeProber{health: answer(tc.rec, tc.err)})
+			logs := &capturingHandler{}
+			s.log = slog.New(logs)
+
+			code, resp := pingWith(t, s, "/ping", "")
+			if code != http.StatusOK {
+				t.Errorf("non-strict status = %d, want 200", code)
+			}
+			if resp["ok"] != tc.ok || resp["reason"] != tc.reason || resp["probe"] != PingProbeDaemon || resp["browser_relaunched"] != tc.relaunched {
+				t.Errorf("body = %v, want ok:%v reason:%s probe:daemon browser_relaunched:%v", resp, tc.ok, tc.reason, tc.relaunched)
+			}
+			if got, _ := resp["error"].(string); got != tc.wantErr {
+				t.Errorf("error = %q, want %q", got, tc.wantErr)
+			}
+			if code, _ := pingWith(t, s, "/ping?strict=true", ""); code != tc.strictCode {
+				t.Errorf("strict status = %d, want %d", code, tc.strictCode)
+			}
+			if logs.has(slog.LevelWarn, "ping probe failed") != tc.warns {
+				t.Errorf("WARN logged = %v, want %v", !tc.warns, tc.warns)
+			}
+		})
+	}
+}
+
+// A key that is present but unknown is still 401 on /ping. A typo in a probe's
+// --key must surface as a failing probe, not quietly downgrade to the
+// daemon-level check and hide the misconfiguration.
+func TestPingWrongKeyOnKeyedDaemonStays401(t *testing.T) {
+	s := liveServer(t, keyedOnly, nil)
+	f := proberOf(s, &fakeProber{})
+	code, resp := pingWith(t, s, "/ping", "WRONG")
+	if code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", code)
+	}
+	if resp["code"] != CodeUnauthorized {
+		t.Errorf("code = %v, want %q", resp["code"], CodeUnauthorized)
+	}
+	if f.calls != 0 {
+		t.Errorf("browser checks = %d, want 0 for a rejected key", f.calls)
+	}
+}
+
+// A keyless daemon keeps answering a keyless probe at tenant scope: it has one
+// tenant, the empty key selects it, and single-tenant deployments see the same
+// body as before. The browser check still follows a tenant probe that found no
+// page, as on any daemon; here the browser answers, so the tenant reason stands.
+func TestPingKeylessDaemonKeepsTenantProbe(t *testing.T) {
+	s := liveServer(t, nil, nil)
+	proberOf(s, &fakeProber{})
+	code, resp := pingWith(t, s, "/ping", "")
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	if resp["probe"] != PingProbeTenant || resp["tenant"] != "default" || resp["reason"] != PingReasonNoSession {
+		t.Errorf("body = %v, want probe:tenant tenant:default reason:no-session", resp)
+	}
+}
+
+// ?strict is validated before the daemon-level check runs, as it is before the
+// tenant-level one, so a typo in the healthcheck is reported whatever the
+// browser's state.
+func TestPingDaemonProbeRejectsBadStrict(t *testing.T) {
+	s := liveServer(t, keyedOnly, nil)
+	f := proberOf(s, &fakeProber{})
+	code, resp := pingWith(t, s, "/ping?strict=banana", "")
+	if code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", code)
+	}
+	if resp["code"] != CodeInvalidRequest {
+		t.Errorf("code = %v, want %q", resp["code"], CodeInvalidRequest)
+	}
+	if f.calls != 0 {
+		t.Errorf("browser checks = %d, want 0 for a rejected parameter", f.calls)
+	}
+}
+
+// A caller that disconnects during the browser check gets nothing written and
+// nothing logged as a failure, on the daemon-level path and on a tenant probe
+// that escalated.
+func TestPingBrowserCheckClientGoneWritesNothing(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		keys map[string]string
+		key  string
+	}{
+		{"daemon-level", keyedOnly, ""},
+		{"tenant escalation", keyedOnly, "K"}, // no session: instant no-session, then the browser check
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := liveServer(t, tc.keys, nil)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			proberOf(s, &fakeProber{health: func(context.Context) (browser.Recovery, error) {
+				cancel()
+				return browser.RecoveryNone, context.Canceled
+			}})
+			logs := &capturingHandler{}
+			s.log = slog.New(logs)
+
+			r := httptest.NewRequest(http.MethodGet, "/ping?strict=true", nil).WithContext(ctx)
+			if tc.key != "" {
+				r.Header.Set("X-API-Key", tc.key)
+			}
+			w := httptest.NewRecorder()
+			s.routes().ServeHTTP(w, r)
+			if w.Code == http.StatusServiceUnavailable {
+				t.Error("status = 503; a client disconnect must not read as a browser failure")
+			}
+			if body := w.Body.String(); body != "" {
+				t.Errorf("body = %q, want empty (nothing written for an abandoned request)", body)
+			}
+			if logs.has(slog.LevelWarn, "ping probe failed") {
+				t.Error("logged a probe-failed WARN for a client disconnect")
+			}
+		})
+	}
+}
+
+// A tenant probe that found no answering page is followed by the browser
+// check. A browser that answered, or had exited and was relaunched, leaves the
+// tenant reason standing (and says when it relaunched); a browser this probe
+// found wedged, or one that could not be replaced, is a loss the probe found,
+// so the reason becomes probe-failed and the error says what happened to the
+// browser after what the tenant probe said.
+func TestPingTenantProbeEscalatesToBrowser(t *testing.T) {
+	launchErr := errors.New("waxseal: relaunch chromium: exec: no such file")
+	sessions := map[string]map[string]*fakePlayerSession{
+		"no-session":   nil,
+		"probe-failed": {"K": {abrURL: "https://r/x", vd: "vd", pingErr: errors.New("waxseal: cdp connection closed")}},
+	}
+	tenantErr := map[string]string{"no-session": "no attested session", "probe-failed": "cdp connection closed"}
+	tenantCode := map[string]int{"no-session": http.StatusOK, "probe-failed": http.StatusServiceUnavailable}
+	outcomes := []struct {
+		name       string
+		rec        browser.Recovery
+		err        error
+		loss       bool // the browser check turned the probe into probe-failed
+		relaunched bool
+		suffix     string
+	}{
+		{"answered", browser.RecoveryNone, nil, false, false, ""},
+		{"relaunched", browser.RecoveryRelaunched, nil, false, true, ""},
+		{"torn down", browser.RecoveryTornDown, nil, true, true, "; the shared browser missed two probes and was torn down and relaunched"},
+		{"unlaunchable", browser.RecoveryNone, launchErr, true, false, "; no browser answers and none could be launched: relaunch chromium: exec: no such file"},
+	}
+	for state, sess := range sessions {
+		for _, oc := range outcomes {
+			t.Run(state+"/"+oc.name, func(t *testing.T) {
+				s := liveServer(t, keyedOnly, sess)
+				f := proberOf(s, &fakeProber{health: answer(oc.rec, oc.err)})
+				logs := &capturingHandler{}
+				s.log = slog.New(logs)
+
+				code, resp := pingWith(t, s, "/ping?strict=true", "K")
+				wantReason, wantCode := state, tenantCode[state]
+				if oc.loss {
+					wantReason, wantCode = PingReasonProbeFailed, http.StatusServiceUnavailable
+				}
+				if code != wantCode || resp["reason"] != wantReason || resp["probe"] != PingProbeTenant {
+					t.Errorf("status=%d body=%v, want %d reason:%s probe:tenant", code, resp, wantCode, wantReason)
+				}
+				if resp["browser_relaunched"] != oc.relaunched {
+					t.Errorf("browser_relaunched = %v, want %v", resp["browser_relaunched"], oc.relaunched)
+				}
+				if got, _ := resp["error"].(string); got != tenantErr[state]+oc.suffix {
+					t.Errorf("error = %q, want %q", got, tenantErr[state]+oc.suffix)
+				}
+				if f.calls != 1 {
+					t.Errorf("browser checks = %d, want 1", f.calls)
+				}
+				if warned := logs.has(slog.LevelWarn, "ping probe failed"); warned != (wantReason == PingReasonProbeFailed) {
+					t.Errorf("WARN logged = %v for reason %s", warned, wantReason)
+				}
+			})
+		}
+	}
+}
+
+// A busy page is escalated too: the request holding it is stuck if the browser
+// is wedged, and tearing the browser down is what frees it. When the browser
+// answers, the page was merely in use and busy stands, still benign under strict.
+func TestPingBusyEscalatesOnlyWhenTheBrowserIsWedged(t *testing.T) {
+	for _, wedged := range []bool{false, true} {
+		t.Run(fmt.Sprintf("wedged=%v", wedged), func(t *testing.T) {
+			entered := make(chan struct{})
+			release := make(chan struct{})
+			var once sync.Once
+			sess := &fakePlayerSession{
+				abrURL:  "https://r/x",
+				vd:      "vd",
+				pingErr: errors.New("cdp connection closed"),
+				pcGate: func(ctx context.Context) {
+					once.Do(func() { close(entered) })
+					select {
+					case <-release:
+					case <-ctx.Done():
+					}
+				},
+			}
+			s := liveServer(t, keyedOnly, map[string]*fakePlayerSession{"K": sess})
+			rec := browser.RecoveryNone
+			if wedged {
+				rec = browser.RecoveryTornDown
+			}
+			proberOf(s, &fakeProber{health: answer(rec, nil)})
+
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				r := httptest.NewRequest(http.MethodPost, "/player-context", strings.NewReader(`{"video_id":"aqz-KE-bpKQ"}`))
+				r.Header.Set("X-API-Key", "K")
+				s.routes().ServeHTTP(httptest.NewRecorder(), r)
+			}()
+			<-entered
+			defer func() { close(release); <-done }()
+
+			code, resp := pingWith(t, s, "/ping?strict=true", "K")
+			if wedged {
+				if code != http.StatusServiceUnavailable || resp["reason"] != PingReasonProbeFailed {
+					t.Errorf("wedged browser under a busy page: status=%d body=%v, want 503 probe-failed", code, resp)
+				}
+			} else if code != http.StatusOK || resp["reason"] != PingReasonBusy {
+				t.Errorf("answering browser under a busy page: status=%d body=%v, want 200 busy", code, resp)
+			}
+		})
+	}
+}
+
+// A page that answered has proved the browser, so the healthy path does not
+// check it again.
+func TestPingHealthySessionSkipsBrowserCheck(t *testing.T) {
+	s := liveServer(t, keyedOnly, map[string]*fakePlayerSession{"K": {abrURL: "https://r/ok", vd: "vd"}})
+	f := proberOf(s, &fakeProber{})
+	if code, resp := pingWith(t, s, "/ping?strict=true", "K"); code != http.StatusOK || resp["ok"] != true {
+		t.Errorf("status=%d body=%v, want 200 ok:true", code, resp)
+	}
+	if f.calls != 0 {
+		t.Errorf("browser checks = %d, want 0 after a page answered", f.calls)
+	}
+}
+
+// A probe-failed the browser check produced is visible in /metrics: the pool
+// counts the teardown, and both views carry the daemon-wide counters. The fake
+// counts the way Pool.Health does, so this pins the response and the counter
+// moving together, on the redacted view a keyed daemon serves without a key.
+func TestPingBrowserLossMovesMetrics(t *testing.T) {
+	s := liveServer(t, keyedOnly, nil)
+	f := &fakeProber{}
+	f.health = func(context.Context) (browser.Recovery, error) {
+		f.probes++
+		return browser.RecoveryTornDown, nil
+	}
+	proberOf(s, f)
+	if _, resp := pingWith(t, s, "/ping", ""); resp["reason"] != PingReasonProbeFailed {
+		t.Fatalf("reason = %v, want probe-failed", resp["reason"])
+	}
+	w := httptest.NewRecorder()
+	s.routes().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	var m struct {
+		Redacted         bool  `json:"redacted"`
+		ProbeFailures    int64 `json:"browser_probe_failures"`
+		RelaunchFailures int64 `json:"browser_relaunch_failures"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &m); err != nil {
+		t.Fatalf("decode /metrics: %v", err)
+	}
+	if !m.Redacted || m.ProbeFailures != 1 || m.RelaunchFailures != 0 {
+		t.Errorf("/metrics = %+v, want redacted with browser_probe_failures 1 and browser_relaunch_failures 0", m)
+	}
+}
+
+// The warn for a browser loss names the browser once, and on a tenant probe the
+// tenant whose probe found it, so a shared-browser death is neither read as one
+// tenant's own nor logged with a doubled attribute.
+func TestPingBrowserLossLogAttributes(t *testing.T) {
+	cases := []struct {
+		name string
+		key  string
+		want [][2]string
+	}{
+		{"daemon-level", "", [][2]string{{"probe", "daemon"}}},
+		{"tenant escalation", "K", [][2]string{{"tenant", "alice"}, {"probe", "daemon"}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := liveServer(t, keyedOnly, nil)
+			proberOf(s, &fakeProber{health: answer(browser.RecoveryTornDown, nil)})
+			logs := &capturingHandler{}
+			s.log = slog.New(logs)
+			pingWith(t, s, "/ping", tc.key)
+			got, ok := logs.attrs(slog.LevelWarn, "ping probe failed")
+			if !ok {
+				t.Fatal("no WARN for the browser loss")
+			}
+			// Everything but the trailing err attribute must match exactly.
+			if len(got) == 0 || got[len(got)-1][0] != "err" {
+				t.Fatalf("attrs = %v, want them to end with err", got)
+			}
+			got = got[:len(got)-1]
+			if fmt.Sprint(got) != fmt.Sprint(tc.want) {
+				t.Errorf("attrs = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

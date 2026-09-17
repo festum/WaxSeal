@@ -4,13 +4,16 @@ package provider_test
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"os"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -64,6 +67,63 @@ func startColdDaemon(t *testing.T) string {
 	return base
 }
 
+// waxsealE2ELogLevelEnv optionally raises the in-process daemon's log level from
+// the default info to debug, which also prints the reduced SABR URLs logged
+// around the status-2 confirm path.
+const waxsealE2ELogLevelEnv = "WAXSEAL_E2E_LOG_LEVEL"
+
+// testDaemonLogger builds the in-process daemon's logger so its info-level
+// diagnostics, including the status-2 confirm outcome logged around the
+// preview-cap confirmation, reach "go test -v" output instead of server.New's
+// default discard logger. Every browser session the daemon launches shares this
+// logger, so both the warm-time proof and later per-request player-context calls
+// are covered.
+func testDaemonLogger(t *testing.T) *slog.Logger {
+	level := slog.LevelInfo
+	if strings.EqualFold(os.Getenv(waxsealE2ELogLevelEnv), "debug") {
+		level = slog.LevelDebug
+	}
+	w := &testLogWriter{t: t}
+	t.Cleanup(w.close)
+	return slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: level}))
+}
+
+// testLogWriter adapts an io.Writer to t.Log, so each slog record becomes one
+// test log line instead of going to the default discard handler. Writing through
+// t.Log from a goroutine other than the test's own is safe as long as it happens
+// before the test function returns; every write here happens inside a handler for
+// a request the test is still synchronously waiting on, or during Warm, which the
+// test also calls synchronously, so that normally holds. close is registered with
+// t.Cleanup as a last-resort guard: once closed is set, Write drops the record
+// instead of calling t.Log, so a daemon goroutine that logs after the test has
+// already returned can never panic the test binary. close also waits for any
+// Write already inside t.Log, so it cannot return while one is in flight.
+type testLogWriter struct {
+	t *testing.T
+
+	mu     sync.Mutex
+	closed bool
+}
+
+func (w *testLogWriter) close() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.closed = true
+}
+
+func (w *testLogWriter) Write(p []byte) (int, error) {
+	// The lock is held across t.Log, not just the closed check: releasing it first
+	// would let close observe an unset flag, return, and allow the test to finish
+	// while this call is still on its way into t.Log.
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return len(p), nil
+	}
+	w.t.Log(strings.TrimRight(string(p), "\n"))
+	return len(p), nil
+}
+
 // newInProcessDaemon selects a loopback address and registers server cleanup. The
 // address is not reserved after selection, so waitDaemonReady reports any bind
 // failure. The caller is responsible for warming and serving the daemon.
@@ -77,6 +137,9 @@ func newInProcessDaemon(t *testing.T, cfg server.Config) (*server.Server, string
 	_ = ln.Close()
 
 	cfg.Addr = addr
+	if cfg.Logger == nil {
+		cfg.Logger = testDaemonLogger(t)
+	}
 	srv, err := server.New(cfg)
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
@@ -106,30 +169,6 @@ func waitDaemonReady(t *testing.T, base string) {
 	}
 }
 
-// playerContexts sums the per-tenant counter because API keys do not expose their
-// internal tenant labels.
-func playerContexts(t *testing.T, base string) int64 {
-	t.Helper()
-	resp, err := http.Get(base + "/metrics")
-	if err != nil {
-		t.Fatalf("GET /metrics: %v", err)
-	}
-	defer resp.Body.Close()
-	var m struct {
-		PerTenant map[string]struct {
-			PlayerContexts int64 `json:"player_contexts"`
-		} `json:"per_tenant"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
-		t.Fatalf("decode /metrics: %v", err)
-	}
-	var total int64
-	for _, v := range m.PerTenant {
-		total += v.PlayerContexts
-	}
-	return total
-}
-
 // classifyStream uses the reported content length when available and a
 // conservative byte threshold otherwise.
 func classifyStream(n, contentLength int64) string {
@@ -145,21 +184,36 @@ func classifyStream(n, contentLength int64) string {
 	return "capped"
 }
 
-// streamWEBContext streams through the attested player-context path and reports
-// whether WaxTap fell back to plain WEB.
-func streamWEBContext(t *testing.T, ctx context.Context, p *provider.Provider, sess *potoken.Session, videoURL string) (int64, waxtap.StreamInfo, bool) {
+// streamWEBContext builds a WaxTap client over the attested player-context path
+// and streams videoURL to completion, reporting whether WaxTap fell back to
+// plain WEB and the consumer-reported warnings. io.Copy reports bytes copied
+// before an error alongside it, so n is the byte offset the stream reached
+// before a truncation (often the consumer's own error, which already names the
+// segment) stopped it. A copy error is reported here, with the byte offset,
+// contentLength, and consumer warnings together; ok reports whether the stream
+// completed without one, so a caller can skip requireFullLength's own floor
+// check on the same byte count instead of reporting the identical truncation a
+// second time.
+func streamWEBContext(t *testing.T, ctx context.Context, p *provider.Provider, sess *potoken.Session, videoURL string) (n int64, info waxtap.StreamInfo, fellBack bool, warnings []string, ok bool) {
 	t.Helper()
-	var fellBack atomic.Bool
+	var fb atomic.Bool
+	var mu sync.Mutex
 	capture := func(ev waxtap.Event) {
-		if ev.Stage == waxtap.StageWarning && ev.Warning != nil && ev.Warning.Code == waxtap.WarnWebContextFallback {
-			fellBack.Store(true)
+		if ev.Stage != waxtap.StageWarning || ev.Warning == nil {
+			return
 		}
+		if ev.Warning.Code == waxtap.WarnWebContextFallback {
+			fb.Store(true)
+		}
+		mu.Lock()
+		warnings = append(warnings, fmt.Sprintf("code=%d %s", ev.Warning.Code, ev.Warning.Detail))
+		mu.Unlock()
 	}
 	jar, _ := cookiejar.New(nil)
 	tap, err := waxtap.New(waxtap.Options{
 		HTTPClient:            &http.Client{Jar: jar, Timeout: 120 * time.Second},
 		POTokenProvider:       p, // GVS token required by the WEB context
-		PlayerContextProvider: p, // attested WEB SABR path under test
+		PlayerContextProvider: p,
 		Session:               sess,
 		Client:                clientWeb, // the fallback chain; the PC path is preferred
 	})
@@ -171,21 +225,45 @@ func streamWEBContext(t *testing.T, ctx context.Context, p *provider.Provider, s
 		t.Fatalf("stream %s: %v", videoURL, err)
 	}
 	defer rc.Close()
-	n, rerr := io.Copy(io.Discard, rc)
-	if rerr != nil {
-		t.Fatalf("read stream %s: %v", videoURL, rerr)
+	var copyErr error
+	n, copyErr = io.Copy(io.Discard, rc)
+	mu.Lock()
+	defer mu.Unlock()
+	fellBack = fb.Load()
+	if copyErr != nil {
+		t.Errorf("read stream %s: truncated at byte offset %d (contentLength=%d): %v; %s",
+			videoURL, n, info.ContentLength, copyErr, describeWarnings(warnings))
+		return
 	}
-	return n, info, fellBack.Load()
+	ok = true
+	return
+}
+
+// describeWarnings renders the warnings streamWEBContext collected for a failure
+// message, or a placeholder when the caller never wired up an Events callback (so
+// nil does not read as "the consumer reported nothing").
+func describeWarnings(warnings []string) string {
+	if len(warnings) == 0 {
+		return "warnings: none captured"
+	}
+	return "warnings: " + strings.Join(warnings, "; ")
 }
 
 // requireFullLength asserts a long-video stream cleared the status-2 preview cap.
-func requireFullLength(t *testing.T, n int64, info waxtap.StreamInfo, label string) {
+// warnings is whatever streamWEBContext collected from the consumer during the
+// stream; a truncation failure names the byte offset reached, the contentLength
+// the consumer reported, and those warnings together, so the failure is readable
+// without rerunning under a debugger.
+func requireFullLength(t *testing.T, n int64, info waxtap.StreamInfo, label string, warnings []string) {
 	t.Helper()
+	consumerReported := describeWarnings(warnings)
 	if n <= fullLengthFloor {
-		t.Errorf("%s: streamed only %d bytes (<= %d floor); expected data past the roughly 70-second cap", label, n, fullLengthFloor)
+		t.Errorf("%s: truncated at byte offset %d (<= %d floor); contentLength=%d; %s",
+			label, n, fullLengthFloor, info.ContentLength, consumerReported)
 	}
 	if info.ContentLength > 0 && n < int64(0.98*float64(info.ContentLength)) {
-		t.Errorf("%s: streamed %d bytes < 98%% of contentLength %d", label, n, info.ContentLength)
+		t.Errorf("%s: truncated at byte offset %d, %.1f%% of contentLength %d; %s",
+			label, n, 100*float64(n)/float64(info.ContentLength), info.ContentLength, consumerReported)
 	}
 }
 
@@ -197,7 +275,8 @@ func TestPlayerContextOnlyFullLengthHTTP(t *testing.T) {
 	defer cancel()
 
 	pcBefore := playerContexts(t, base)
-	n, info, fellBack := streamWEBContext(t, ctx, p, nil, bbbURL)
+	t.Logf("stream start (wall clock): %s", time.Now().Format("2006-01-02T15:04:05.000Z07:00"))
+	n, info, fellBack, warnings, ok := streamWEBContext(t, ctx, p, nil, bbbURL)
 	if fellBack {
 		t.Errorf("WEB player-context fell back without an adopted session")
 	}
@@ -207,7 +286,9 @@ func TestPlayerContextOnlyFullLengthHTTP(t *testing.T) {
 	if pcAfter := playerContexts(t, base); pcAfter <= pcBefore {
 		t.Errorf("player_contexts did not increase: before=%d after=%d", pcBefore, pcAfter)
 	}
-	requireFullLength(t, n, info, "player-context only")
+	if ok {
+		requireFullLength(t, n, info, "player-context only", warnings)
+	}
 	t.Logf("player-context only: %d bytes (%s; contentLength=%d, reference=%d)", n, classifyStream(n, info.ContentLength), info.ContentLength, bbbContentLength)
 }
 
@@ -219,19 +300,24 @@ func TestSessionOnlyFullLengthHTTP(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	sess, err := p.Session(ctx)
+	sess, err := p.ProvideSession(ctx)
 	if err != nil {
 		t.Fatalf("session handoff: %v", err)
 	}
 	if sess.VisitorData == "" {
 		t.Fatalf("daemon returned an empty visitor_data")
 	}
+	// Without a generation the daemon's session cannot be named in a report, so a
+	// delivery cap on it would have no escape.
+	if sess.Generation == 0 {
+		t.Fatalf("daemon returned no session_generation")
+	}
 
 	jar, _ := cookiejar.New(nil)
 	tap, err := waxtap.New(waxtap.Options{
 		HTTPClient:      &http.Client{Jar: jar, Timeout: 120 * time.Second},
 		POTokenProvider: p,         // GVS token only; no player-context provider
-		Session:         sess,      // adopt the established identity
+		SessionProvider: p,         // the adoption arm WaxTap can invalidate when googlevideo caps it
 		Client:          clientWeb, // uniform client chain is required for session adoption
 	})
 	if err != nil {
@@ -244,12 +330,14 @@ func TestSessionOnlyFullLengthHTTP(t *testing.T) {
 	defer rc.Close()
 	n, rerr := io.Copy(io.Discard, rc)
 	if rerr != nil {
-		t.Fatalf("read stream: %v", rerr)
+		t.Fatalf("read stream: truncated at byte offset %d (contentLength=%d): %v", n, info.ContentLength, rerr)
 	}
 	if info.Client != clientWeb {
 		t.Errorf("info.Client = %q, want %q (plain WEB)", info.Client, clientWeb)
 	}
-	requireFullLength(t, n, info, "session only")
+	// This path streams through waxtap.New directly, with no Events callback, so
+	// there are no consumer-reported warnings to pass here.
+	requireFullLength(t, n, info, "session only", nil)
 	t.Logf("session only: %d bytes (%s; contentLength=%d)", n, classifyStream(n, info.ContentLength), info.ContentLength)
 }
 
@@ -261,14 +349,16 @@ func TestPlayerContextCrossVideoFullLengthHTTP(t *testing.T) {
 	defer cancel()
 
 	// The first request targets a different video from the session's landing page.
-	n, info, fellBack := streamWEBContext(t, ctx, p, nil, tearsURL)
+	n, info, fellBack, warnings, ok := streamWEBContext(t, ctx, p, nil, tearsURL)
 	if fellBack {
 		t.Errorf("WEB player-context fell back; establishment did not carry over to another video")
 	}
 	if info.Client != clientWebContext {
 		t.Errorf("info.Client = %q, want %q", info.Client, clientWebContext)
 	}
-	requireFullLength(t, n, info, "cross-video player-context")
+	if ok {
+		requireFullLength(t, n, info, "cross-video player-context", warnings)
+	}
 	t.Logf("cross-video player-context (%s): %d bytes (%s; contentLength=%d)", tearsVideoID, n, classifyStream(n, info.ContentLength), info.ContentLength)
 }
 
@@ -280,20 +370,24 @@ func TestPlayerContextShortThenLongHTTP(t *testing.T) {
 	defer cancel()
 
 	// The short video ends before the preview cap.
-	nShort, infoShort, fellBackShort := streamWEBContext(t, ctx, p, nil, shortURL)
+	t.Logf("short video stream start (wall clock): %s", time.Now().Format("2006-01-02T15:04:05.000Z07:00"))
+	nShort, infoShort, fellBackShort, warningsShort, _ := streamWEBContext(t, ctx, p, nil, shortURL)
 	if fellBackShort {
 		t.Errorf("WEB player-context fell back for the short video")
 	}
 	if nShort <= 0 {
 		t.Errorf("short video streamed no bytes")
 	}
-	t.Logf("short video first: %d bytes (%s; contentLength=%d)", nShort, classifyStream(nShort, infoShort.ContentLength), infoShort.ContentLength)
+	t.Logf("short video first: %d bytes (%s; contentLength=%d; warnings=%v)", nShort, classifyStream(nShort, infoShort.ContentLength), infoShort.ContentLength, warningsShort)
 
-	nLong, infoLong, fellBackLong := streamWEBContext(t, ctx, p, nil, bbbURL)
+	t.Logf("long video stream start (wall clock): %s", time.Now().Format("2006-01-02T15:04:05.000Z07:00"))
+	nLong, infoLong, fellBackLong, warningsLong, okLong := streamWEBContext(t, ctx, p, nil, bbbURL)
 	if fellBackLong {
 		t.Errorf("WEB player-context fell back for the long video after a short first call")
 	}
-	requireFullLength(t, nLong, infoLong, "long after short")
+	if okLong {
+		requireFullLength(t, nLong, infoLong, "long after short", warningsLong)
+	}
 }
 
 // A lazy tenant's first player-context request must establish on demand.
@@ -318,14 +412,16 @@ func TestLazyTenantFirstCallFullLengthHTTP(t *testing.T) {
 	p := provider.New(client.New(base, client.WithAPIKey(lazyKey)))
 	ctx, cancel2 := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel2()
-	n, info, fellBack := streamWEBContext(t, ctx, p, nil, bbbURL)
+	n, info, fellBack, warnings, ok := streamWEBContext(t, ctx, p, nil, bbbURL)
 	if fellBack {
 		t.Errorf("lazy tenant's first call fell back from the player-context path")
 	}
 	if info.Client != clientWebContext {
 		t.Errorf("info.Client = %q, want %q", info.Client, clientWebContext)
 	}
-	requireFullLength(t, n, info, "lazy tenant first call")
+	if ok {
+		requireFullLength(t, n, info, "lazy tenant first call", warnings)
+	}
 }
 
 // A short landing video must fall back to the default proof video.
@@ -347,51 +443,17 @@ func TestShortLandingVideoEstablishesHTTP(t *testing.T) {
 	p := provider.New(client.New(base, client.WithAPIKey(os.Getenv("WAXSEAL_KEY"))))
 	ctx, cancel2 := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel2()
-	n, info, fellBack := streamWEBContext(t, ctx, p, nil, tearsURL)
+	t.Logf("stream start (wall clock): %s", time.Now().Format("2006-01-02T15:04:05.000Z07:00"))
+	n, info, fellBack, warnings, ok := streamWEBContext(t, ctx, p, nil, tearsURL)
 	if fellBack {
 		t.Errorf("WEB player-context fell back; the default proof video did not establish the session")
 	}
 	if info.Client != clientWebContext {
 		t.Errorf("info.Client = %q, want %q", info.Client, clientWebContext)
 	}
-	requireFullLength(t, n, info, "short landing video")
-}
-
-// escalationMetrics contains the counters used to detect an unnecessary relaunch.
-// Values are summed so the test does not depend on the cold daemon's tenant label.
-type escalationMetrics struct {
-	Generation            int64
-	Attestations          int64
-	Escalations           int64
-	PlayerContextFailures int64
-}
-
-func readEscalationMetrics(t *testing.T, base string) escalationMetrics {
-	t.Helper()
-	resp, err := http.Get(base + "/metrics")
-	if err != nil {
-		t.Fatalf("GET /metrics: %v", err)
+	if ok {
+		requireFullLength(t, n, info, "short landing video", warnings)
 	}
-	defer resp.Body.Close()
-	var m struct {
-		PerTenant map[string]struct {
-			Generation            int64 `json:"generation"`
-			Attestations          int64 `json:"attestations"`
-			Escalations           int64 `json:"escalations"`
-			PlayerContextFailures int64 `json:"player_context_failures"`
-		} `json:"per_tenant"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
-		t.Fatalf("decode /metrics: %v", err)
-	}
-	var out escalationMetrics
-	for _, v := range m.PerTenant {
-		out.Generation += v.Generation
-		out.Attestations += v.Attestations
-		out.Escalations += v.Escalations
-		out.PlayerContextFailures += v.PlayerContextFailures
-	}
-	return out
 }
 
 // TestPlayerContextUnavailableFastHTTP verifies that unavailable videos fail
@@ -442,8 +504,13 @@ func TestPlayerContextUnavailableFastHTTP(t *testing.T) {
 	t.Logf("dead id returned 422 in %v", elapsed)
 
 	after := readEscalationMetrics(t, base)
-	if after.Generation != before.Generation {
-		t.Errorf("generation changed from %d to %d (a relaunch happened)", before.Generation, after.Generation)
+	switch {
+	case before.GenerationKnown && after.GenerationKnown:
+		if after.Generation != before.Generation {
+			t.Errorf("generation changed from %d to %d (a relaunch happened)", before.Generation, after.Generation)
+		}
+	default:
+		t.Logf("generation not compared: this daemon redacts /metrics, which drops per-tenant state; the attestations check below covers the same relaunch")
 	}
 	if after.Attestations != before.Attestations {
 		t.Errorf("attestations changed from %d to %d (a re-attest happened)", before.Attestations, after.Attestations)
@@ -455,13 +522,29 @@ func TestPlayerContextUnavailableFastHTTP(t *testing.T) {
 		t.Errorf("player_context_failures did not increase from %d to %d", before.PlayerContextFailures, after.PlayerContextFailures)
 	}
 
-	// A repeat request should be served from the negative cache.
+	// A repeat request should be served from the negative cache. Both counters are
+	// read from one scrape on each side of that single call, so the window they
+	// describe is the repeat and nothing else. Reusing the earlier snapshot for
+	// player_context_failures instead would straddle the assertions above and
+	// blame the counter split for any unrelated traffic on a shared daemon.
+	beforeRepeat := readMetrics(t, base)
+	negBefore := beforeRepeat.counter(t, "player_context_negative_cache_hits")
+	pcfBefore := beforeRepeat.counter(t, "player_context_failures")
+
 	_, err2, elapsed2 := call(deadID, 10*time.Second)
 	requireUnavailable(t, err2)
 	if elapsed2 > 2*time.Second {
 		t.Errorf("negative-cache repeat took %v, want near-instant", elapsed2)
 	}
 	t.Logf("dead id repeat (negative cache) in %v", elapsed2)
+
+	afterRepeat := readMetrics(t, base)
+	if negAfter := afterRepeat.counter(t, "player_context_negative_cache_hits"); negAfter <= negBefore {
+		t.Errorf("player_context_negative_cache_hits did not increase from %d to %d", negBefore, negAfter)
+	}
+	if pcfAfter := afterRepeat.counter(t, "player_context_failures"); pcfAfter != pcfBefore {
+		t.Errorf("player_context_failures moved from %d to %d across a negative-cache hit; the split exists to stop that", pcfBefore, pcfAfter)
+	}
 
 	// A valid ID immediately afterward must still establish.
 	pc, err3, _ := call(bbbVideoID, 90*time.Second)
@@ -471,4 +554,75 @@ func TestPlayerContextUnavailableFastHTTP(t *testing.T) {
 	if pc.PlayabilityStatus != "OK" {
 		t.Errorf("good id playability_status = %q, want OK", pc.PlayabilityStatus)
 	}
+}
+
+// TestPlayerContextMetadataLive checks that the metadata WaxTap asked for
+// arrives from a real player response, not just from the wire structs. The
+// landing page is the watch page, so the player's own /player response is a WEB
+// response and carries a microformat; the publish-date assertion still hedges,
+// because a response without one is legal and leaves the field empty.
+func TestPlayerContextMetadataLive(t *testing.T) {
+	base := startColdDaemon(t)
+	c := client.New(base, client.WithAPIKey(os.Getenv("WAXSEAL_KEY")))
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	pc, err := c.PlayerContext(ctx, bbbVideoID)
+	if err != nil {
+		t.Fatalf("PlayerContext(%s): %v", bbbVideoID, err)
+	}
+
+	if !strings.HasPrefix(pc.ChannelID, "UC") {
+		t.Errorf("channel_id = %q, want the owner's UC... id", pc.ChannelID)
+	}
+	if pc.Description == "" {
+		t.Error("description is empty; videoDetails.shortDescription was not read")
+	}
+	if len(pc.Thumbnails) == 0 {
+		t.Error("thumbnails is empty; the ladder was not read")
+	}
+	for i, th := range pc.Thumbnails {
+		if th.URL == "" {
+			t.Errorf("thumbnails[%d] has no url", i)
+		}
+		if th.Width <= 0 || th.Height <= 0 {
+			t.Errorf("thumbnails[%d] = %dx%d, want positive dimensions", i, th.Width, th.Height)
+		}
+	}
+	// Big Buck Bunny is an ordinary uploaded VOD, so all three flags are false.
+	if pc.IsLiveContent || pc.IsLiveNow || pc.IsUpcoming {
+		t.Errorf("live flags = %v/%v/%v, want all false for a VOD", pc.IsLiveContent, pc.IsLiveNow, pc.IsUpcoming)
+	}
+	switch {
+	case pc.PublishDate == "":
+		t.Log("publish_date is empty: this player response carried no microformat, which is legal; the field is documented as empty when absent")
+	default:
+		if _, err := time.Parse(time.RFC3339, pc.PublishDate); err != nil {
+			if _, dErr := time.Parse("2006-01-02", pc.PublishDate); dErr != nil {
+				t.Errorf("publish_date = %q parses as neither RFC 3339 (%v) nor 2006-01-02 (%v)", pc.PublishDate, err, dErr)
+			} else {
+				t.Logf("publish_date = %q (bare date)", pc.PublishDate)
+			}
+		} else {
+			t.Logf("publish_date = %q (RFC 3339)", pc.PublishDate)
+		}
+	}
+	// The context's identity must be the one /session exports, or a consumer that
+	// streams under the context would present a different browser than the one the
+	// URL was issued to.
+	if pc.UserAgent == "" {
+		t.Error("user_agent is empty; the session identity was not carried onto the context")
+	}
+	sess, err := c.Session(ctx)
+	if err != nil {
+		t.Fatalf("Session: %v", err)
+	}
+	if pc.UserAgent != sess.UserAgent {
+		t.Errorf("user_agent = %q, want /session's %q", pc.UserAgent, sess.UserAgent)
+	}
+	if pc.ClientVersion != "" && sess.ClientVersion != "" && pc.ClientVersion != sess.ClientVersion {
+		t.Errorf("client_version = %q, want /session's %q", pc.ClientVersion, sess.ClientVersion)
+	}
+	t.Logf("metadata: channel_id=%s title=%q author=%q description_len=%d thumbnails=%d user_agent=%q",
+		pc.ChannelID, pc.Title, pc.Author, len(pc.Description), len(pc.Thumbnails), pc.UserAgent)
 }

@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -73,7 +74,9 @@ func TestPingCLIPortRangeMessage(t *testing.T) {
 func TestPingCLIStrict(t *testing.T) {
 	var status int
 	var payload string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	var gotQuery url.Values
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.Query()
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
 		io.WriteString(w, payload)
@@ -101,6 +104,17 @@ func TestPingCLIStrict(t *testing.T) {
 	if err := run(true); err != nil {
 		t.Errorf("healthy strict: %v, want success", err)
 	}
+	// --strict travels in the query, where the server reads it. It is not a secret,
+	// unlike the key, which TestPingSendsKeyAsHeader pins to the header.
+	if got := gotQuery.Get("strict"); got != "true" {
+		t.Errorf("strict query = %q, want %q", got, "true")
+	}
+	if err := run(false); err != nil {
+		t.Errorf("healthy non-strict (second call): %v, want success", err)
+	}
+	if gotQuery.Has("strict") {
+		t.Errorf("non-strict sent ?strict=%q, want it absent", gotQuery.Get("strict"))
+	}
 
 	// Benign no-session (HTTP 200, ok:false): non-strict reports not-ready, strict
 	// treats it as healthy so a liveness probe does not flap.
@@ -110,6 +124,19 @@ func TestPingCLIStrict(t *testing.T) {
 	}
 	if err := run(true); err != nil {
 		t.Errorf("no-session strict: %v, want success (benign window)", err)
+	}
+
+	// Benign busy (HTTP 200, ok:false): a probe failed twice but a request held the
+	// page, so nothing was retired. --strict must treat it as healthy, or the
+	// image's HEALTHCHECK marks a busy but healthy container unhealthy after three
+	// probes. Non-strict still reports not-ready: there is no confirmed live
+	// session.
+	status, payload = http.StatusOK, `{"ok":false,"reason":"busy"}`
+	if err := run(false); err == nil {
+		t.Error("busy non-strict: want error (no confirmed live session)")
+	}
+	if err := run(true); err != nil {
+		t.Errorf("busy strict: %v, want success (benign window)", err)
 	}
 
 	// Real probe failure: a strict-aware daemon maps it to 503; both modes fail.
@@ -134,5 +161,136 @@ func TestPingCLIStrict(t *testing.T) {
 	status, payload = http.StatusOK, `{}`
 	if err := run(true); err == nil {
 		t.Error("empty 200 body strict: want error")
+	}
+}
+
+// TestPingSendsKeyAsHeader pins that the API key never reaches the query string,
+// where it would land in proxy and container access logs. The healthcheck runs
+// every few seconds, so a key in the request line is written to those logs for
+// the life of the container.
+func TestPingSendsKeyAsHeader(t *testing.T) {
+	const key = "s3cr3t-tenant-key"
+	var gotHeader, gotQueryKey, gotRawQuery string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeader = r.Header.Get("X-API-Key")
+		gotQueryKey = r.URL.Query().Get("key")
+		gotRawQuery = r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"ok":true,"attest":"integrity","reason":"ok"}`)
+	}))
+	defer srv.Close()
+
+	c := newPingCmd()
+	c.SetArgs([]string{"--addr", strings.TrimPrefix(srv.URL, "http://"), "--key", key})
+	c.SetOut(io.Discard)
+	c.SetErr(io.Discard)
+	if err := c.Execute(); err != nil {
+		t.Fatalf("ping --key: %v, want success", err)
+	}
+	if gotHeader != key {
+		t.Errorf("X-API-Key = %q, want %q", gotHeader, key)
+	}
+	if gotQueryKey != "" {
+		t.Errorf("?key = %q, want it absent", gotQueryKey)
+	}
+	// Also check the raw query, so a differently named parameter carrying the key
+	// cannot pass. This is the value that appears in an access log request line.
+	if strings.Contains(gotRawQuery, key) {
+		t.Errorf("raw query %q contains the key", gotRawQuery)
+	}
+}
+
+// TestPingCLIDaemonProbe covers the body a keyed daemon returns to a probe that
+// sends no key: the shared browser's liveness rather than a tenant's session.
+// That is what the image's HEALTHCHECK receives once the daemon is keyed, so
+// both modes must read it, and the output must say what was checked instead of
+// printing an empty attest.
+func TestPingCLIDaemonProbe(t *testing.T) {
+	var status int
+	var payload string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		io.WriteString(w, payload)
+	}))
+	defer srv.Close()
+	addr := strings.TrimPrefix(srv.URL, "http://")
+
+	run := func(strict bool) (string, error) {
+		c := newPingCmd()
+		args := []string{"--addr", addr}
+		if strict {
+			args = append(args, "--strict")
+		}
+		c.SetArgs(args)
+		var out strings.Builder
+		c.SetOut(&out)
+		c.SetErr(io.Discard)
+		err := c.Execute()
+		return out.String(), err
+	}
+
+	// Browser answered: healthy in both modes, and the output names the probe.
+	status, payload = http.StatusOK, `{"ok":true,"probe":"daemon","reason":"ok"}`
+	for _, strict := range []bool{false, true} {
+		out, err := run(strict)
+		if err != nil {
+			t.Errorf("alive strict=%v: %v, want success", strict, err)
+		}
+		if out != "ok (probe=daemon)\n" {
+			t.Errorf("alive strict=%v: output = %q, want %q", strict, out, "ok (probe=daemon)\n")
+		}
+	}
+
+	// Browser had exited and the probe relaunched it: healthy, and the output
+	// says so, since that is the one place a relaunch shows outside the daemon log.
+	status, payload = http.StatusOK, `{"ok":true,"probe":"daemon","reason":"ok","browser_relaunched":true}`
+	for _, strict := range []bool{false, true} {
+		out, err := run(strict)
+		if err != nil {
+			t.Errorf("relaunched strict=%v: %v, want success", strict, err)
+		}
+		if out != "ok (probe=daemon, browser relaunched)\n" {
+			t.Errorf("relaunched strict=%v: output = %q, want %q", strict, out, "ok (probe=daemon, browser relaunched)\n")
+		}
+	}
+	// The same note on a tenant probe's benign window.
+	status, payload = http.StatusOK, `{"ok":false,"probe":"tenant","reason":"no-session","browser_relaunched":true}`
+	if out, err := run(true); err != nil || out != "ok (reason=no-session, browser relaunched)\n" {
+		t.Errorf("no-session with relaunch, strict: out=%q err=%v, want %q", out, err, "ok (reason=no-session, browser relaunched)\n")
+	}
+
+	// Browser confirmed unresponsive: a failure in both modes.
+	status, payload = http.StatusServiceUnavailable, `{"ok":false,"probe":"daemon","reason":"probe-failed","error":"cdp: Browser.getVersion: context deadline exceeded"}`
+	if _, err := run(true); err == nil {
+		t.Error("probe-failed strict (503): want error")
+	}
+	status, payload = http.StatusOK, `{"ok":false,"probe":"daemon","reason":"probe-failed","error":"cdp: Browser.getVersion: context deadline exceeded"}`
+	if _, err := run(false); err == nil {
+		t.Error("probe-failed non-strict: want error")
+	}
+}
+
+// TestPingCLIEmptyKeyIsUsageError pins that `--key ""` is refused. A compose
+// file that passes `--key ${SOME_VAR}` with the variable unset would otherwise
+// send no header, and on a keyed daemon that quietly turns the tenant probe the
+// operator configured into the daemon-level one, which stays healthy while the
+// tenant it meant to watch is never checked.
+func TestPingCLIEmptyKeyIsUsageError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("the daemon was probed despite the empty --key")
+	}))
+	defer srv.Close()
+	c := newPingCmd()
+	c.SetArgs([]string{"--addr", strings.TrimPrefix(srv.URL, "http://"), "--key", ""})
+	c.SetOut(io.Discard)
+	c.SetErr(io.Discard)
+	err := c.Execute()
+	var ue *usageError
+	if !errors.As(err, &ue) {
+		t.Fatalf("ping --key \"\" = %v, want a usage error", err)
+	}
+	if !strings.Contains(err.Error(), "--key") {
+		t.Errorf("usage error %q does not name --key", err)
 	}
 }

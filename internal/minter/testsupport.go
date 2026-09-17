@@ -19,11 +19,24 @@ func (t *Tenants) InjectSessionForTest(ctx context.Context, apiKey string, sess 
 		return nil, err
 	}
 	m.launch = func(context.Context) (minterSession, error) { return sess, nil }
+	// Dependent-package tests exercise handler plumbing, not the spacing between a
+	// mint and a context establishment: turn the separation gates off so no
+	// handler waits out the window, and skip the attestation-time mint so the
+	// injected session records only the calls the test's own request drives.
+	m.mintSeparation = 0
+	m.skipPremint = true
 	if err := m.Warm(ctx); err != nil {
 		return nil, err
 	}
 	return m, nil
 }
+
+// SetBrowserProberForTest replaces the browser check behind BrowserHealth and
+// the browser counters in the metrics views, so tests in dependent packages can
+// drive a /ping through every browser outcome, and assert what it counted,
+// without launching Chromium. Call it before the registry serves any request;
+// the field is not guarded. Production code must not call it.
+func (t *Tenants) SetBrowserProberForTest(p BrowserProber) { t.prober = p }
 
 // ExpireStreamingDeadlineForTest moves the current session's streaming deadline
 // into the past, forcing the next streaming handoff to recycle without sleeping.
@@ -45,5 +58,31 @@ func (m *Minter) FillCachePastBoundForTest() {
 	gen := m.Generation()
 	for i := 0; i <= minterCacheMax; i++ {
 		m.cachePut(fmt.Sprintf("gvs|fill%05d", i), browser.MintResult{Lifetime: 3600}, gen)
+	}
+}
+
+// FailLaunchForTest makes the tenant selected by apiKey refuse every launch with
+// err and publishes no session, so a dependent package can drive the refusals
+// only a failed launch produces, such as the pool's relaunch backoff. Call it
+// before the tenant serves any request; the launcher is not guarded.
+// Production code must not call it.
+func (t *Tenants) FailLaunchForTest(apiKey string, err error) (*Minter, error) {
+	m, _, merr := t.Minter(apiKey)
+	if merr != nil {
+		return nil, merr
+	}
+	m.launch = func(context.Context) (minterSession, error) { return nil, err }
+	return m, nil
+}
+
+// RewindProofCooldownForTest moves the open cool-down record d further into the
+// past, so a dependent package's test can see a refusal state what is left of a
+// window rather than the whole of it, without sleeping through one. It does
+// nothing when no cool-down is open. Production code must not call it.
+func (m *Minter) RewindProofCooldownForTest(d time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.proofFailedAt.IsZero() {
+		m.proofFailedAt = m.proofFailedAt.Add(-d)
 	}
 }
