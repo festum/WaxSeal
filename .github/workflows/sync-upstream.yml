@@ -22,6 +22,10 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
+      - name: Save pre-merge HEAD
+        id: premerge
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
       - name: Add upstream remote
         run: git remote add upstream https://github.com/ColeSpringer/WaxSeal.git
 
@@ -58,10 +62,10 @@ jobs:
             git commit -m "fix: rewrite upstream import paths colespringer→festum after sync"
           fi
 
-      - name: Restore our workflows (GITHUB_TOKEN lacks workflows:write)
+      - name: Restore our workflows
         if: steps.check.outputs.behind != '0'
         run: |
-          git checkout HEAD~1 -- .github/workflows/ 2>/dev/null || true
+          git checkout ${{ steps.premerge.outputs.sha }} -- .github/workflows/
           if ! git diff --quiet; then
             git add -A
             git commit -m "fix: restore fork workflows after upstream merge"
