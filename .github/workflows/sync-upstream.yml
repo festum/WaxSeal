@@ -10,7 +10,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      workflows: write
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
@@ -44,7 +43,7 @@ jobs:
             --strategy-option=ours \
             -m "chore: sync upstream ColeSpringer/WaxSeal"
 
-      - name: Fix upstream import paths (colespringer → festum)
+      - name: Fix upstream import paths
         if: steps.check.outputs.behind != '0'
         run: |
           find . -name "*.go" -not -path "./.git/*" \
@@ -57,6 +56,15 @@ jobs:
           if ! git diff --quiet; then
             git add -A
             git commit -m "fix: rewrite upstream import paths colespringer→festum after sync"
+          fi
+
+      - name: Restore our workflows (GITHUB_TOKEN lacks workflows:write)
+        if: steps.check.outputs.behind != '0'
+        run: |
+          git checkout HEAD~1 -- .github/workflows/ 2>/dev/null || true
+          if ! git diff --quiet; then
+            git add -A
+            git commit -m "fix: restore fork workflows after upstream merge"
           fi
 
       - name: Push to fork
