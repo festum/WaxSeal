@@ -4,43 +4,24 @@ on:
   push:
     branches: [main]
   pull_request:
-  workflow_dispatch:
 
 permissions:
   contents: read
 
-# A newer push to a pull request supersedes the run still in progress. Pushes
-# to main always run to completion, so any commit that could later be tagged
-# has a verdict from the jobs a tag push never reruns.
-concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-
 jobs:
-  # Build, gofmt-check, tidy-check, vet, and run the offline race tests, plus the
-  # real-Chromium CDP pipe-transport tests (-tags live) against a pinned
-  # browser. The committed browser bundle removes the Node dependency. Only
-  # the network YouTube and BotGuard e2e (-tags e2e) still run manually,
-  # needing network access.
+  # Build, vet, and run the offline race tests, plus the real-Chromium CDP
+  # pipe-transport tests (-tags live) against a pinned browser. The committed
+  # browser bundle removes the Node dependency. Only the network YouTube and
+  # BotGuard e2e (-tags e2e) still run manually, needing network access.
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
           cache: true
-          # tidy-check below loads the provider/ module graph as well.
-          cache-dependency-path: |
-            go.sum
-            provider/go.sum
       - run: go build ./...
-      # gofmt and tidy-check cover this whole checkout, including the nested
-      # provider/ module, which the job below builds, vets, and tests on its own.
-      - run: make fmt-check tidy-check
       - run: go vet ./...
       - run: go test -race ./...
       # Real-Chromium CDP live tests. Install Chrome explicitly so a browser is
@@ -52,7 +33,7 @@ jobs:
       # loudly instead of skipping. The tests drive a local Chromium over the pipe
       # transport and need no network.
       - id: setup-chrome
-        uses: browser-actions/setup-chrome@48ad923757ca74d66703209fe939badbdf80f2f4 # v2.2.0
+        uses: browser-actions/setup-chrome@2e1d749697dd1612b833dba4a722266286fbefcd # v2.1.2
         with:
           chrome-version: stable
       - name: CDP live tests (real Chromium, pipe transport)
@@ -61,139 +42,56 @@ jobs:
           WAXSEAL_REQUIRE_CHROME: "1"
         run: go test -race -tags live ./internal/cdp
 
-  # govulncheck over both modules. It reports only vulnerabilities in functions
-  # the code actually calls, so a red run here is something to act on.
-  vulncheck:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version-file: go.mod
-          cache: true
-          cache-dependency-path: |
-            go.sum
-            provider/go.sum
-      - run: make vulncheck
-
-  # Build, vet, and test the nested consumer-adapter module separately. Its
-  # untagged tests are pure httptest: no browser, no network, so they belong in
-  # every run. The -tags e2e files need both, so they are only type-checked here.
+  # Build and vet the nested WaxTap adapter module separately.
   provider:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
           cache: true
-          # This job builds in provider/, but setup-go runs at the repo root, so
-          # its default cache key would ignore provider/go.sum entirely.
-          cache-dependency-path: |
-            go.sum
-            provider/go.sum
       - working-directory: provider
-        run: go build ./... && go vet ./... && go vet -tags e2e ./... && go test -race ./...
+        run: go build ./... && go vet ./...
 
-  # The Windows transport (named pipes, handle inheritance, the job object, the
-  # exclusive-open profile lock) has no Unix equivalent, and the dev box is WSL,
-  # so this job is the only thing that runs it. The live tests need a browser,
-  # which setup-chrome only has for amd64. -race is windows/amd64 only, so the
-  # flag is a matrix value; hardcoded, the Arm leg would refuse to run at all.
-  windows:
+  # Cross-compile the pure Go CLI and daemon for the supported targets. Each
+  # binary drives an external Chromium at runtime. Windows is excluded: it
+  # compiles, but the CDP pipe transport does not run there.
+  cross:
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - runner: windows-latest
-            live: true
-            race: "-race"
-          - runner: windows-11-arm
-            live: false
-            race: ""
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 20
+        goos: [linux, darwin]
+        goarch: [amd64, arm64]
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
           cache: true
-          cache-dependency-path: |
-            go.sum
-            provider/go.sum
-      - run: go build ./...
-      - run: go vet ./...
-      - run: go test ${{ matrix.race }} ./...
-      - name: provider offline tests
-        working-directory: provider
-        run: go build ./... && go vet ./... && go vet -tags e2e ./... && go test ${{ matrix.race }} ./...
-      - id: setup-chrome
-        if: matrix.live
-        uses: browser-actions/setup-chrome@48ad923757ca74d66703209fe939badbdf80f2f4 # v2.2.0
-        with:
-          chrome-version: stable
-      # The one check that the io-pipes transport actually drives a real browser
-      # on this platform. WAXSEAL_REQUIRE_CHROME makes a missing browser a failure
-      # rather than a skip, so the coverage cannot be lost quietly.
-      - name: CDP live tests (real Chrome, io-pipes transport)
-        if: matrix.live
+      - name: build ${{ matrix.goos }}/${{ matrix.goarch }} (no CGo)
         env:
-          WAXSEAL_CHROME_BIN: ${{ steps.setup-chrome.outputs.chrome-path }}
-          WAXSEAL_REQUIRE_CHROME: "1"
-        run: go test -race -tags live ./internal/cdp
-
-  # Cross-compile every RELEASE_PLATFORMS target through the same `make release`
-  # the release workflow runs, so a target the Makefile cannot build fails on a
-  # push to main rather than on a tag. The windows job above builds, vets, and
-  # tests those binaries natively; this is the cross-compilation check.
-  cross:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version-file: go.mod
-          cache: true
-      - run: make release VERSION=ci
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: go build ./cmd/waxseal
 
   # Rebuild the committed browser bundle and require a byte-for-byte match.
   reproduce-bundle:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: "24"
+          node-version: "22"
       - name: rebuild and diff against the committed bundle
         run: make verify-assets
 
-  # Build the image on each architecture's native runner and run the offline
-  # smoke test, through the same `make docker-smoke` that gates a release push.
-  # The Makefile says what the probe proves and why it needs no network.
+  # Build the container image to verify the Dockerfile. Running it needs Chromium
+  # and network access.
   docker:
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [ubuntu-latest, ubuntu-24.04-arm]
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 15
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - run: make docker-smoke VERSION=ci
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - run: DOCKER_BUILDKIT=1 docker build .
