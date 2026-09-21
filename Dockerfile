@@ -3,8 +3,8 @@
 # WaxSeal is a real-browser PO-token service. The image includes Chromium and
 # drives it through the Chrome DevTools Protocol. Chromium runs with
 # --no-sandbox inside the container, so the container boundary provides the
-# isolation. The image uses a non-root user, and the compose files drop
-# capabilities and disable privilege escalation.
+# isolation. The image uses a non-root user, and the compose file drops
+# capabilities and disables privilege escalation.
 
 # build
 FROM golang:1.26-trixie AS build
@@ -60,11 +60,14 @@ RUN apt-get update \
 # Non-root user with a writable HOME (the browser profile lives under $HOME).
 RUN useradd --create-home --uid 10001 waxseal
 COPY --from=build /out/waxseal /usr/local/bin/waxseal
+# The image redistributes this code, and MIT requires the notice to travel with it.
+COPY LICENSE THIRD-PARTY-NOTICES.md /usr/share/doc/waxseal/
 
 # Link the GHCR package to the source repository.
 LABEL org.opencontainers.image.source="https://github.com/festum/WaxSeal" \
       org.opencontainers.image.description="YouTube PO-token service running BotGuard in a real headless Chromium" \
-      org.opencontainers.image.licenses="MIT"
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.version="${VERSION}"
 
 ENV WAXSEAL_CHROME_BIN=/usr/bin/chromium \
     HOME=/home/waxseal

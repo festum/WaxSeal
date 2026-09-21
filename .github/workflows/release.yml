@@ -17,6 +17,7 @@ jobs:
   # assets. The binaries embed the committed JS bundle but need a system Chromium
   # at runtime.
   binaries:
+    needs: verify
     runs-on: ubuntu-latest
     permissions:
       contents: write

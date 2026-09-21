@@ -1,5 +1,6 @@
 # Keep the build context small: only Go source + the committed bundle are needed.
 .git
+.gitnexus
 .github
 .toolchains
 dist
@@ -8,10 +9,15 @@ provider
 build/js/node_modules
 **/*_test.go
 *.md
+# The image is a distribution, so the notices travel with it (LICENSE has no
+# extension and was never excluded).
+!THIRD-PARTY-NOTICES.md
 compose*.yaml
 Dockerfile
 .dockerignore
-# Never copy local env/secret files into the build context.
-.env
-*.env
-.env.*
+# Never copy local env/secret files into the build context, at any depth: a
+# dockerignore pattern without **/ matches only at the context root.
+**/.env
+**/*.env
+**/.env.*
+**/tenant-keys

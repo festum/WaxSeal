@@ -44,9 +44,9 @@ PUSH_LATEST ?= 0
 # way as the last one. Bump it by hand.
 GOVULNCHECK_VERSION ?= v1.8.0
 
-.PHONY: all help fmt-check tidy-check vulncheck vet test live jsbundle-browser verify-assets \
-        release deps clean docker-build docker-smoke docker-login docker-push \
-        docker-push-authed docker-manifest docker-manifest-authed release-guard \
+.PHONY: all help fmt-check tidy-check vulncheck vet test consumer-check live jsbundle-browser \
+        verify-assets release deps clean docker-build docker-smoke compose-check docker-login \
+        docker-push docker-push-authed docker-manifest docker-manifest-authed release-guard \
         image-name docker-digest docker-manifest-digest
 
 # The docker targets order their steps through prerequisite lists (build, then
@@ -64,12 +64,14 @@ help:
 	@echo "  vulncheck         govulncheck over both modules"
 	@echo "  vet               go vet the root and provider/ modules, plus a windows cross-vet"
 	@echo "  test              offline Go test suite, race-enabled (root + provider/)"
+	@echo "  consumer-check    build provider/ as an external go get sees it (needs network)"
 	@echo "  live              real-Chromium CDP transport tests (needs a browser)"
 	@echo "  jsbundle-browser  rebuild the embedded browser bundle (needs Node)"
 	@echo "  verify-assets     rebuild the bundle in a temp dir, fail if the checked-in one differs"
 	@echo "  release           build Linux/macOS/Windows amd64+arm64 binaries into $(DIST)/"
 	@echo "  docker-build      build the runtime image for this host's arch (VERSION=x.y.z to tag a release)"
 	@echo "  docker-smoke      start the image docker-build produced, on an isolated network"
+	@echo "  compose-check     validate compose.yaml and check it pulls $(IMAGE)"
 	@echo "  docker-push       publish this host's per-arch tag to $(REGISTRY)"
 	@echo "  docker-manifest   assemble $(IMAGE):VERSION from the per-arch tags (PUSH_LATEST=1 also moves :latest)"
 	@echo "  deps              install the Node toolchain for the bundle"
@@ -101,6 +103,27 @@ vet:
 	go vet ./...
 	GOOS=windows go vet ./...
 	cd provider && go vet ./... && go vet -tags e2e ./...
+
+# consumer-check builds provider/ the way anyone outside this checkout sees it:
+# the replace is dropped in a throwaway copy, so the module compiles against the
+# root version its require pins instead of these working-tree files. That pin has
+# to be fetched, so this one needs network. The release gate runs it, which is
+# where a pin that has fallen behind the root has to stop things.
+#
+# `go mod download` fills the copy's go.sum, which carries no root entries
+# because the replace is honoured in this checkout. The build and vet then run
+# under the default -mod=readonly, so the go command cannot quietly add or raise
+# a requirement and repair the stale pin this gate exists to catch.
+consumer-check:
+	@tmp=$$(mktemp -d) || exit 1; \
+	  trap 'rm -rf "$$tmp"' EXIT; \
+	  cp -R provider/. "$$tmp/" || exit 1; \
+	  cd "$$tmp" && go mod edit -dropreplace=github.com/colespringer/waxseal \
+	    && export GOWORK=off \
+	    && go mod download github.com/colespringer/waxseal \
+	    && go build ./... && go vet ./... \
+	    || exit 1; \
+	  echo "OK: provider/ compiles against its pinned root with no replace"
 
 # test runs the offline suite: the root module with the race detector (matching
 # CI), then the nested provider/ module. The committed bundle means it does not
@@ -183,7 +206,7 @@ release:
 
 # docker-build builds the runtime image for this host's architecture. It tags the
 # per-arch name the manifest is assembled from, and also the plain VERSION and
-# latest tags locally, so the README's "build instead of pull" compose flow keeps
+# latest tags locally, so the "build instead of pull" flow in docs/deployment.md keeps
 # working on the machine that built it. BuildKit is required: the Dockerfile
 # carries a syntax directive and mounts build caches.
 docker-build:
@@ -200,6 +223,25 @@ docker-build:
 docker-smoke: docker-build
 	docker run --rm --network none --shm-size=1gb --pull=never \
 	  --entrypoint waxseal $(IMAGE):$(VERSION)-$(ARCH) doctor --stop-after-load
+	@out=$$(docker run --rm --pull=never --entrypoint /bin/ls \
+	  $(IMAGE):$(VERSION)-$(ARCH) /usr/share/doc/waxseal) || exit 1; \
+	  for f in LICENSE THIRD-PARTY-NOTICES.md; do \
+	    echo "$$out" | grep -qxF "$$f" || { \
+	      echo "ERROR: /usr/share/doc/waxseal has no $$f"; exit 1; }; \
+	  done; \
+	  echo "OK: the image carries LICENSE and THIRD-PARTY-NOTICES.md"
+
+# compose-check validates the plug-and-play compose file and checks that the
+# image it resolves to is the one this Makefile publishes, so a rename here
+# cannot leave the file pulling the old name. It reads the resolved model, not
+# the file's text, so a comment naming the image or a quoted value cannot fool
+# it. TestREADMEEmbedsComposeFile holds the README's copy of the file to it.
+compose-check:
+	docker compose -f compose.yaml config --quiet
+	@images=$$(docker compose -f compose.yaml config --images) || exit 1; \
+	  echo "$$images" | grep -qF '$(IMAGE):' || { \
+	    echo "ERROR: compose.yaml resolves to '$$images', not $(IMAGE)"; exit 1; }; \
+	  echo "OK: compose.yaml is valid and pulls $(IMAGE)"
 
 # release-guard refuses to publish the default/empty VERSION, which would tag an
 # unreleased build and (with PUSH_LATEST=1) repoint the public :latest at it. It

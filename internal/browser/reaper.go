@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strconv"
+	"time"
 )
 
 const (
@@ -16,6 +17,16 @@ const (
 	// creatorMarkerFile identifies a WaxSeal profile. Its ownership lock, rather
 	// than the recorded PID, indicates whether the creator is still running.
 	creatorMarkerFile = "creator.pid"
+
+	// markerGrace keeps the reaper off a profile whose marker was written moments
+	// ago. markProfileDir writes the marker and then takes its lock, and in the
+	// instant between the two another process's sweep would see a marked
+	// directory with a free lock and delete a browser that is still starting.
+	// Every command reaps before it launches, so two of them starting together is
+	// the ordinary case rather than a rare one. A marker is written once, at
+	// launch, so a genuinely abandoned profile's is as old as the run that left
+	// it and this costs that profile one sweep at most.
+	markerGrace = 10 * time.Second
 )
 
 // profileDirPattern restricts cleanup to the numeric names created by
@@ -26,6 +37,55 @@ var profileDirPattern = regexp.MustCompile("^" + regexp.QuoteMeta(profilePrefix)
 // diagnostics only; the advisory lock determines liveness.
 func writeMarker(dir string) error {
 	return os.WriteFile(filepath.Join(dir, creatorMarkerFile), []byte(strconv.Itoa(os.Getpid())), 0o600)
+}
+
+// markProfileAbandoned marks a directory that is being left behind, so that a
+// sweep collects it. The marker is dated past markerGrace, which is there for a
+// launch that has not taken its lock yet: this directory has no owner left to
+// wait for, and a marker dated now would only hide it from the next sweep.
+func markProfileAbandoned(dir string) error {
+	if err := writeMarker(dir); err != nil {
+		return err
+	}
+	stale := time.Now().Add(-2 * markerGrace)
+	return os.Chtimes(filepath.Join(dir, creatorMarkerFile), stale, stale)
+}
+
+// removeProfile removes a profile directory, taking creator.pid last. RemoveAll
+// on the whole directory would keep going past a file it cannot delete and
+// unlink the marker on the way, and a markerless directory is one every later
+// sweep retains rather than collects. Whatever stops the removal, a pinned file
+// or a kill, has to leave a directory the next sweep can still find.
+func removeProfile(dir string) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	var firstErr error
+	for _, e := range entries {
+		if e.Name() == creatorMarkerFile {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(dir, e.Name())); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if firstErr != nil {
+		return firstErr
+	}
+	if err := os.Remove(filepath.Join(dir, creatorMarkerFile)); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.Remove(dir); err != nil && !os.IsNotExist(err) {
+		// The directory outlived its marker: something landed in it after the scan,
+		// or the directory itself is held. Mark it again for a later sweep.
+		_ = markProfileAbandoned(dir)
+		return err
+	}
+	return nil
 }
 
 // markProfileDir writes the marker and takes its ownership lock, returning the
@@ -53,14 +113,16 @@ func markProfileDir(dir string) *os.File {
 type profileState struct {
 	path      string
 	hasMarker bool
+	fresh     bool // the marker was written within markerGrace
 }
 
-// classifyStaleProfiles returns marked profiles whose ownership lock is free.
-// Markerless profiles are always retained. lockable is injected for tests.
+// classifyStaleProfiles returns marked profiles whose ownership lock is free and
+// whose marker is not newly written. Markerless and fresh profiles are always
+// retained. lockable is injected for tests.
 func classifyStaleProfiles(states []profileState, lockable func(marker string) bool) []profileState {
 	var remove []profileState
 	for _, st := range states {
-		if st.hasMarker && lockable(filepath.Join(st.path, creatorMarkerFile)) {
+		if st.hasMarker && !st.fresh && lockable(filepath.Join(st.path, creatorMarkerFile)) {
 			remove = append(remove, st)
 		}
 	}
@@ -70,8 +132,8 @@ func classifyStaleProfiles(states []profileState, lockable func(marker string) b
 // ReapStaleProfiles removes abandoned profile directories created by WaxSeal.
 //
 // A directory is removed only when its name matches profileDirPattern, it contains
-// a creator marker, and the marker's ownership lock is free. Unmarked directories
-// are left untouched. The lock is an advisory flock on Unix and an exclusive open
+// a creator marker older than markerGrace, and the marker's ownership lock is
+// free. Unmarked directories are left untouched. The lock is an advisory flock on Unix and an exclusive open
 // on Windows; both are released by the kernel on any exit, so neither can leave a
 // stale lock behind. Call ReapStaleProfiles before launching a browser.
 func ReapStaleProfiles(log *slog.Logger) {
@@ -91,8 +153,9 @@ func ReapStaleProfiles(log *slog.Logger) {
 			continue
 		}
 		st := profileState{path: path}
-		if _, err := os.Stat(filepath.Join(path, creatorMarkerFile)); err == nil {
+		if mi, err := os.Stat(filepath.Join(path, creatorMarkerFile)); err == nil {
 			st.hasMarker = true
+			st.fresh = time.Since(mi.ModTime()) < markerGrace
 		} else {
 			markerless++
 		}
@@ -100,7 +163,7 @@ func ReapStaleProfiles(log *slog.Logger) {
 	}
 
 	for _, st := range classifyStaleProfiles(states, markerLockable) {
-		if err := os.RemoveAll(st.path); err != nil {
+		if err := removeProfile(st.path); err != nil {
 			log.Warn("waxseal: reap stale profile directory failed", "dir", st.path, "err", err)
 			continue
 		}

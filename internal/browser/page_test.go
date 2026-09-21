@@ -444,6 +444,43 @@ func TestEstablishUnplayableIsTerminal(t *testing.T) {
 	}
 }
 
+// A private video refuses without videoDetails, so video_id_match stays false;
+// once the response is the new load's, the refusal is terminal on the first
+// poll instead of waiting for onError or the deadline.
+func TestEstablishPrivateWithoutVideoDetailsIsTerminal(t *testing.T) {
+	payload := map[string]any{
+		"error": "pending: player response not yet for vid", "playability_status": "LOGIN_REQUIRED",
+		"reason": "Private video", "video_id_match": false, "response_changed": true,
+	}
+	page := newFakePageFor("vid", map[string][]fakeStep{playerContextExtractJS: {jsStringified(t, payload)}})
+	s := newFakeSession(page)
+	_, err := s.establish(context.Background(), page, "vid", time.Now().Add(s.timing.establishTimeout))
+	var ue *UnplayableError
+	if !errors.As(err, &ue) || ue.Status != "LOGIN_REQUIRED" || ue.Detail != "Private video" {
+		t.Fatalf("err = %v, want UnplayableError LOGIN_REQUIRED / Private video", err)
+	}
+	if got := page.evalCount(playerContextExtractJS); got != 1 {
+		t.Errorf("extract ran %d times, want 1", got)
+	}
+}
+
+// An on-air broadcast is refused as soon as its response arrives: no seek, no
+// confirm, and the verdict is negative-cacheable like any other.
+func TestEstablishLiveBroadcastIsTerminal(t *testing.T) {
+	payload := establishedPayload("vid", 0)
+	payload["is_live_now"] = true
+	page := newFakePageFor("vid", map[string][]fakeStep{playerContextExtractJS: {jsStringified(t, payload)}})
+	s := newFakeSession(page)
+	_, err := s.establishStatus1(context.Background(), page, "vid", s.timing.establishTimeout, s.timing.confirmBudget)
+	var ue *UnplayableError
+	if !errors.As(err, &ue) || ue.Status != LiveBroadcastStatus {
+		t.Fatalf("err = %v, want UnplayableError %s", err, LiveBroadcastStatus)
+	}
+	if got := page.evalCount(playerSeekJS); got != 0 {
+		t.Errorf("seek ran %d times, want 0 (no confirmation for a live broadcast)", got)
+	}
+}
+
 // A bot check reaches establish the same way a per-video verdict does, but it
 // describes the browser session, so it must not unwrap to ErrUnplayable: the
 // minter relaunches on it instead of negative-caching the video.
@@ -557,6 +594,37 @@ func TestEstablishDeadlineWithNoReasonNamesIt(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "no player response before the deadline") {
 		t.Errorf("error = %v, want it to say the page never answered", err)
+	}
+}
+
+// A wall WaxSeal does not recognise reads as pending, so the establish timeout is
+// the only place it surfaces. The deadline error names the status and the phrase
+// the page sat on, which is what makes a rephrased or translated wall
+// diagnosable from one log line, and it stays a plain timeout: neither a graded
+// bot check nor a per-video verdict.
+func TestEstablishDeadlineNamesTheLastPlayabilityStatus(t *testing.T) {
+	payload := map[string]any{
+		"error":              "pending: player response not yet for vid",
+		"playability_status": "LOGIN_REQUIRED",
+		"reason":             "Melde dich an, um zu best\u00e4tigen, dass du kein Bot bist",
+		"video_id_match":     false,
+	}
+	page := newFakePageFor("vid", map[string][]fakeStep{
+		playerContextExtractJS: {jsStringified(t, payload)},
+	})
+	s := newFakeSession(page)
+
+	_, err := s.establish(context.Background(), page, "vid", time.Now().Add(30*time.Millisecond))
+	if err == nil {
+		t.Fatal("establish returned no error at the deadline")
+	}
+	for _, want := range []string{"pending: player response not yet for vid", "LOGIN_REQUIRED", "kein Bot"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error = %v, want it to carry %q", err, want)
+		}
+	}
+	if errors.Is(err, ErrBotCheck) || errors.Is(err, ErrUnplayable) {
+		t.Errorf("error = %v, want a plain deadline: an unrecognised wall is graded as neither", err)
 	}
 }
 

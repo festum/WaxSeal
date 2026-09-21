@@ -14,34 +14,55 @@ tokens with the **integrity** grade.
 
 ## Quick start
 
-WaxSeal usually runs as a container (example compose file found in repo), and
-the published image bundles Chromium, so the host needs only Docker:
+WaxSeal runs as a container, and the published image bundles Chromium, so the
+host needs only Docker. The repository's `compose.yaml` is the whole deployment;
+copy it as it is:
 
-```sh
-docker compose up -d  # pulls ghcr.io/colespringer/waxseal and starts on 127.0.0.1:4416
+```yaml
+# WaxSeal, a YouTube PO-token service
+services:
+  waxseal:
+    image: ghcr.io/colespringer/waxseal:${WAXSEAL_VERSION:-latest}
+    container_name: waxseal
+    restart: unless-stopped # the image runs tini as PID 1, so no init: is needed
+    ports:
+      # Loopback only. The daemon is keyless by default, so set API keys
+      # before publishing on 0.0.0.0 or a LAN address.
+      - "127.0.0.1:4416:4416"
+    shm_size: 1gb # headless Chromium's working space
+    stop_grace_period: 70s # covers the daemon's 60s request drain; compose's default is 10s
+    # Chromium runs with --no-sandbox, so the container is the sandbox: the
+    # image's non-root user, no capabilities, no privilege escalation.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging: # cap log growth for a long-running daemon
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
 ```
 
-That pulls the `:latest` tag; pin a release with `WAXSEAL_VERSION`, for example
-`WAXSEAL_VERSION=1.0.0 docker compose up -d`. To build the image from source instead
-of pulling, run `make docker-build` first; it tags the same name locally.
+```sh
+docker compose up -d --wait   # pulls ghcr.io/colespringer/waxseal; returns once the daemon is healthy
+```
 
-The image is published for linux/amd64 and linux/arm64. The plain tag
-(`:latest`, `:1.0.0`) is a manifest covering both, so Docker resolves the right
-one; the per-architecture tags it is assembled from (`:1.0.0-amd64`,
-`:1.0.0-arm64`) stay pullable for pinning one platform.
+That pulls `:latest`, and `WAXSEAL_VERSION=1.3.0 docker compose up -d --wait`
+pins a release. [docs/deployment.md](docs/deployment.md) lists everything the
+file leaves out, each as a snippet to paste in: pinning and verifying a release,
+API keys and secrets, memory limits, a read-only rootfs, a consumer sharing the
+daemon's egress IP, `docker run` without compose, and building the image from
+source.
 
-Each release's binaries and image tags, the multi-arch tag and the
-per-architecture ones alike, carry a GitHub build provenance attestation naming
-the commit and workflow run that built them. `gh attestation verify
-oci://ghcr.io/colespringer/waxseal:1.0.0 --repo ColeSpringer/WaxSeal` checks a
-pulled image against it, and `gh attestation verify <binary> --repo
-ColeSpringer/WaxSeal` a downloaded binary.
-
-The container is ready when its healthcheck passes. The daemon binds its socket
-before browser startup but serves only once `/ping` returns `{"ok":true,...}`;
-startup attests the first tenant, caches a GVS token, and runs a full-length
-streaming proof, usually 10-30 seconds. A mint failure stops startup; a failed
-streaming proof is logged and retried by `/player-context` or `/session`. Once
+The container is ready when its healthcheck passes, which is what `--wait`
+returns on. The daemon binds its socket before browser startup but serves only
+once `/ping` returns `{"ok":true,...}`; startup attests the first tenant, caches
+a GVS token, and runs a full-length streaming proof, typically under ten seconds
+on a warm host; the image's healthcheck allows two minutes. A mint failure stops
+startup; a failed streaming proof is logged and retried by `/player-context` or
+`/session`. The first token or context request after that may wait up to 12
+seconds behind the mint-separation gate described under `/player-context`. Once
 ready, call the API:
 
 ```sh
@@ -55,18 +76,15 @@ curl -s localhost:4416/metrics
 ### Running with a consumer
 
 A PO token is bound to the minting host's egress IP, so a consumer that fetches
-media must egress the same IP as WaxSeal. `compose.full.yaml` runs the daemon and
-a consumer in one network namespace to guarantee that; point `CONSUMER_IMAGE` at
-your application, and the daemon stays unpublished:
-
-```sh
-CONSUMER_IMAGE=your/image:tag docker compose -f compose.full.yaml up
-```
-
-Both `compose.yaml` (standalone) and `compose.full.yaml` extend the shared,
-hardened `compose.base.yaml`; see those files for the read-only, resource-limit,
-and multi-tenant options. Publishing beyond loopback requires API keys, described
-under [Authentication and tenants](#authentication-and-tenants).
+media must egress the same IP as WaxSeal. A consumer on the host itself already
+does, and reaches the daemon through the published port. One that runs as its
+own container shares the daemon's network namespace instead, so both leave
+through one address and it reaches the daemon on loopback; the file's `ports:`
+block still publishes the daemon to the host, so drop it if nothing there should
+reach it. The snippet is in
+[docs/deployment.md](docs/deployment.md#run-a-consumer-on-the-same-egress-ip).
+Publishing beyond loopback requires API keys, described under
+[Authentication and tenants](#authentication-and-tenants).
 
 ### From source
 
@@ -134,7 +152,10 @@ when served from the cache or `miss` when freshly minted. A cache miss keeps a
 fresh mint at least 12 seconds clear of the last context establishment on that
 browser session, for the same grading reason described under `/player-context`
 below, so a request that misses the cache just after any establishment on that
-browser session, not only the startup proof, may wait up to that long.
+browser session, not only the startup proof, may wait up to that long. A
+consumer degradation report on the current generation drops its cached tokens at
+once, and the next request that takes the page, a token request included,
+retires the session and serves the replacement.
 
 ```jsonc
 // request
@@ -162,7 +183,7 @@ status-1 protection code embedded in the signed URL.
 // response
 {
   "playability_status": "OK",
-  "player_url": "https://www.youtube.com/s/player/<hash>/player_ias.vflset/en_US/base.js",
+  "player_url": "https://www.youtube.com/s/player/<hash>/<variant>/en_US/base.js",  // the path segment varies (player_ias, player_es6, ...); pass it through as given
   "server_abr_streaming_url": "https://...&n=<scrambled>",   // descramble n with player_url before use
   "video_playback_ustreamer_config": "<base64>",
   "visitor_data": "<base64>",
@@ -184,7 +205,7 @@ status-1 protection code embedded in the signed URL.
     {
       "itag": 251,
       "lmt": "1699999999999999",
-      "xtags": "",                          // clean track
+      "xtags": "",                          // "" when the video has one audio track; multi-track videos label every entry (such as "en-US.4"), and the original track's xtags decode to acont=original
       "mime_type": "audio/webm; codecs=\"opus\"",
       "bitrate": 130000,
       "content_length": 10318791,
@@ -196,8 +217,9 @@ status-1 protection code embedded in the signed URL.
       "audio_track_id": ""                  // empty for the default or only track
     },
     {
-      "itag": 251, "lmt": "1699999999999999", "xtags": "CggKA2RyYxIBMQ", "is_drc": true
-      // same itag and lmt as the clean track, different xtags: the DRC variant.
+      "itag": 251, "lmt": "1699999999999998", "xtags": "CggKA2RyYxIBMQ", "is_drc": true
+      // same itag as the clean track, different lmt and xtags: the DRC variant.
+      // A third variant, xtags "CgcKAnZiEgEx" with is_drc false, can share the itag too.
       // Remaining fields as above. Select by the full tuple, never itag alone.
     }
   ],
@@ -222,12 +244,20 @@ because a context taken within a few seconds of either is graded the same way.
 Contexts served earlier do not extend that window, so back-to-back requests are
 not delayed by one another. The first context after startup or a relaunch may
 wait for both steps; later requests normally find the session proved and the
-window already clear. A context that clears both steps is then served without
-any further, per-request check: the daemon removes the measured cause of a
-graded preview and refuses when it cannot prove the session, but it does not
-itself grade the URL it hands out. The startup self-test performs the proof
-before the daemon accepts traffic. `WAXSEAL_MINT_SEPARATION` overrides the
-spacing with any positive Go duration, for example `20s`.
+window already clear. A context that clears both steps is then confirmed per
+request before it is served. A video at or under the roughly 70 second preview
+cap is served as it is, since a preview cannot truncate it. A longer video is
+seeked past the cap and must buffer beyond the seek target before the daemon
+re-reads and serves the transitioned context; a video only a few seconds over
+the cap must buffer to its end. A context the daemon cannot confirm before its
+budget is retried once in place and then refused as `player-context-failed`
+(502) with no relaunch, counted in `status2_rejections`; that refusal carries no
+`Retry-After` and is worth one quick retry. A confirmed context logs a
+`player-context confirmed` line with the band, buffered end, and outcome; a
+video under the cap logs a `cap-safe` line instead. The startup self-test
+performs the proof before the daemon accepts traffic.
+`WAXSEAL_MINT_SEPARATION` overrides the spacing with any positive Go duration,
+for example `20s`.
 
 A bot check ("Sign in to confirm you're not a bot") describes the browser
 session, not the video, so it is never answered as `video-unavailable` and the
@@ -235,7 +265,23 @@ video is never negative-cached. The wall keys on the visitor identity, and the
 only thing that lifts it is a fresh one: the daemon relaunches once per 10
 minutes on a bot check and serves the request from the replacement, which is the
 common case. A check on the replacement, or one inside that window, is refused as
-`player-context-failed` (502) with a 2 minute `Retry-After`.
+`player-context-failed` (502) with a 2 minute `Retry-After`. The browser
+presents an `en-US,en` language list, so the wall arrives in English and is
+recognised whatever the host's locale. That list rides on the user-agent
+override, which a `--headful` run does not install, so a headful session keeps
+the host's own language and a non-English wall reads there as a timeout.
+
+A broadcast that is on air is refused as `video-unavailable` (422) with `details`
+`LIVE_BROADCAST` and negative-cached like any terminal verdict: it has no length
+to confirm past the cap, and WaxSeal serves finished videos only. A finished
+broadcast is an ordinary video; an upcoming one is refused with YouTube's own
+status, `LIVE_STREAM_OFFLINE`.
+
+A terminal verdict is remembered for 5 minutes in a per-tenant negative cache of
+at most 256 video IDs, shared by the GET and POST forms and keyed by the video ID
+alone. It survives a report, a recycle, and a relaunch, because the video is
+unavailable whatever the session; a repeat inside that window is refused without
+touching the browser and counted in `player_context_negative_cache_hits`.
 
 ### `GET /session`
 
@@ -280,8 +326,8 @@ Report a degraded stream by the `session_generation` from `/session` or
 `reason` must be 1-64 characters from `[A-Za-z0-9_-]`. Reports are scoped and
 rate-limited per tenant: report-driven recycles draw from a budget of 4 that
 refills at one per `--report-debounce` (default `5m`). A report past the budget
-is rejected with `retry_after_seconds` and a `Retry-After` header, and stale or
-future generations are ignored.
+is rejected with `retry_after_seconds` and a `Retry-After` header, and a
+generation other than the current one, older or not yet issued, is ignored.
 
 ```jsonc
 // request
@@ -297,12 +343,21 @@ future generations are ignored.
 ```
 
 `/metrics` counts each report by disposition: `degradation_reports_accepted`
-(applied to the live session), `degradation_reports_rate_limited` (past the
-report budget), `degradation_reports_rejected_stale` (an old or replaced
-generation), `degradation_reports_already_retired` (the current generation,
-already retired by a crash or a prior report; a benign no-op), and
+(retired the live session, or queued its retirement for the next request that
+takes the page), `degradation_reports_rate_limited` (past the report budget),
+`degradation_reports_rejected_stale` (a generation other than the current one:
+replaced, or not yet issued),
+`degradation_reports_already_retired` (the current generation, already retired by
+a crash or a prior report; a benign no-op), and
 `degradation_reports_duplicate_pending` (a repeat report for a generation whose
-retirement is already queued for the next streaming handoff).
+retirement is already queued; it answers `accepted: true`, because the session it
+named is on its way out either way, and counts here rather than under
+`accepted`).
+
+An accepted report drops the reported generation's cached tokens immediately,
+whether or not its retirement had to wait. `accepted: true` with neither
+`retired` nor `retirement_pending` set means the session was already gone when
+the report was applied, a crash having landed first; nothing was left to retire.
 
 ### Authentication and tenants
 
@@ -335,12 +390,35 @@ A liveness check needs no key at all: a keyed daemon answers a keyless `/ping`
 with the shared browser's health rather than `401` (see
 [Operations](#operations)), which is what the image's `HEALTHCHECK` relies on.
 An empty `--key` is a usage error rather than "no key", so a probe whose key
-variable is unset fails loudly instead of quietly checking the browser alone.
-`--tenant-keys` takes comma-separated `label=key` entries or bare keys (which get
-generated labels); labels and keys must be non-empty and unique, and an invalid
-set stops startup before Chromium launches. A keyless daemon on a non-loopback
-host exposes its guest identity through `/session` and `/player-context`, so use
-`--tenant-keys` when exposing the service.
+variable is unset fails loudly instead of quietly checking the browser alone. A
+key that is only whitespace is empty too. On the wire, HTTP parsing strips the
+spaces around a header value, so an `X-API-Key` header holding only spaces
+arrives empty and reads as no key, while `?key=` keeps its value and a blank one
+is a wrong key; `waxseal ping` refuses a blank key before sending anything, and
+it fails when a keyless daemon ignored the `--key` it sent.
+`--tenant-keys` takes `label=key` entries or bare keys (which get generated
+labels), separated by commas or newlines; labels and keys must be non-empty and
+unique, keys must not contain whitespace, and a bare key must not contain `=`, so
+a base64 key with padding needs a label. An invalid set stops startup before
+Chromium launches. A keyless daemon that binds a non-loopback
+address exposes its guest identity through `/session` and `/player-context`, and
+warns at startup naming the address it bound, so use `--tenant-keys` when
+exposing the service.
+
+Both keys reach the daemon from four places: `--tenant-keys` and `--metrics-key`,
+the `--tenant-keys-file` and `--metrics-key-file` paths, and the four environment
+variables `WAXSEAL_TENANT_KEYS`, `WAXSEAL_TENANT_KEYS_FILE`, `WAXSEAL_METRICS_KEY`,
+and `WAXSEAL_METRICS_KEY_FILE`. Flags outrank the environment, and setting a value
+and a file in the same tier is a usage error rather than a silent winner. A file
+is read whole with trailing whitespace removed, and an empty one is a usage error
+rather than a keyless daemon nobody asked for. The same trimming applies to every
+source; a blank or whitespace-only environment variable counts as unset, and a
+blank flag value is a usage error. Prefer a file in a container: a key
+on the command line shows in `ps` and in `docker inspect`, a key in the
+environment shows in `docker inspect`, and a `/run/secrets` path shows only the
+path. Outside swarm, compose bind-mounts a secret's host file as it is and
+ignores the secret's `uid`, `gid`, and `mode`, so that file has to be readable
+by the image's non-root user (uid 10001).
 
 ### Metrics
 
@@ -361,17 +439,22 @@ metrics access. When both are set, `--metrics-public` wins. Both are ignored on 
 keyless daemon.
 
 The full view is `{"tenants":N,"per_tenant":{"<label>":{...}},...}` plus the
-two daemon-wide browser counters below, each tenant object carrying lifetime
+two daemon-wide browser counters below, where `tenants` counts the tenants used
+since start, the same set `per_tenant` lists, so a probe or request on a
+never-used tenant raises it; the startup log's `configured_tenants` is the
+configured count. Each tenant object carries lifetime
 counters (`mints`, `crashes`, `player_contexts`,
 `separation_waits` for requests held back to keep a mint and an establishment
 apart, `unproven_rejections` for contexts refused because the session could not
-prove full-length streaming, the five `degradation_reports_*` dispositions above,
-and so on) plus current state.
+prove full-length streaming, `status2_rejections` for contexts refused because
+the per-request confirmation did not clear the preview cap, the five
+`degradation_reports_*` dispositions above, and so on) plus current state.
 
 These counters are worth knowing exactly:
 
 - `player_context_failures` counts real failed attempts against the browser and
-  nothing else.
+  nothing else, including the first attempt of a request that then succeeds on
+  its in-place retry, so it can exceed the number of failed requests.
 - `player_context_negative_cache_hits` counts requests refused from the
   negative cache without touching the browser. They are counted apart because one
   caller looping on a single unplayable video can drive this by six orders of
@@ -399,17 +482,23 @@ These counters are worth knowing exactly:
   has no browser and cannot get one. Both browser counters describe the shared
   Chromium, not a tenant, so they sit at the top level of both views instead of
   among the summed counters.
+- `separation_waits` counts the waits performed; requests queued behind a wait
+  share it and are not counted.
 - `cache_entries` reports **servable** entries: current generation, not yet
   expired, which is what a token request would actually be served from. A
   consumer degradation report drops that generation's cached tokens, so it takes
-  `cache_entries` for the tenant to 0.
+  `cache_entries` for the tenant to 0. A crash does not drop the cache: a token
+  is not invalidated by the browser that minted it dying, so the replacement
+  serves the same tokens until they expire.
 
 Detail fields are always present so the schema stays stable across retirement,
 crash, and recycle; a field that does not apply is `null` or `""` rather than
 omitted. For example `last_browser_proof_age_secs` is `null` until the first
 proof, which reserves `0` for "just proved", and
 `streaming_seconds_until_recycle` appears only when time-based recycling is
-enabled (`--streaming-max-age` > 0). The redacted view is
+enabled (`--streaming-max-age` > 0) and counts down to a deadline jittered by
+up to ten percent of `--streaming-max-age`, so a fleet does not recycle in
+lockstep. The redacted view is
 `{"redacted":true,"aggregate":{...},...}`: the same counters summed across
 tenants, with no labels and no tenant count, plus the two daemon-wide browser
 counters at top level.
@@ -418,7 +507,8 @@ counters at top level.
 
 Recognized endpoints and unknown paths return
 `{"error":"<message>","code":"<machine-readable-code>"}`. `video-unavailable`
-adds a `details` field with the playability status. `/ping` health bodies do
+adds a `details` field with the playability status, or `LIVE_BROADCAST` for a
+broadcast that is on air. `/ping` health bodies do
 not use this envelope; they report health directly (see
 [Operations](#operations)). Only its `400` and `401` rejections do.
 
@@ -448,14 +538,18 @@ not follow redirects must not expect JSON there. A trailing slash is a distinct
 path, so `/get_pot/` returns the structured **404**.
 
 `/report` decodes strictly: an unknown field, often a typo such as `raeson` for
-`reason`, is rejected with **400 `invalid-request`** naming the key, since its
-optional fields would otherwise be dropped silently. `/get_pot` and
+`reason` or a case variant such as `Reason`, is rejected with **400
+`invalid-request`** naming the key, since its optional fields would otherwise be
+dropped silently. `/get_pot` and
 `/player-context` stay lenient and ignore unknown fields, because `/get_pot` must
 tolerate the extra fields a generic yt-dlp client sends (`proxy`, `bypass_cache`,
 `source_address`) and `/player-context` reads `video_id` from the body or the
 query string. Duplicate keys are lenient everywhere, since `encoding/json` keeps
-the last value. The `client` package parses these into `*client.APIError` with
-matching code constants.
+the last value. A body that is not a JSON object (`null`, a number, an array, a
+string) is rejected with `request body must be a JSON object`, and a body still
+arriving when the 30 second read timeout fires with `request body was not
+received before the read timeout`. The `client` package parses these into
+`*client.APIError` with matching code constants.
 
 ## Operations
 
@@ -469,7 +563,11 @@ teardown (SIGKILL, OOM), a browser may linger briefly; the next startup removes
 abandoned WaxSeal profile directories it can prove are unused, without scanning or
 killing processes, and Chromium generally exits once its profile is gone.
 Profiles live under `$HOME` so snap-confined Chromium can open them and so shared
-hosts keep each daemon's profiles private.
+hosts keep each daemon's profiles private. On SIGINT or SIGTERM the daemon closes
+its listener, so `/ping` fails from the first signal, drains in-flight requests
+for `--shutdown-timeout`, then tears the browser down and exits 0, at any point
+including warm-up. A second signal cuts the drain short. The last log line is
+`waxseal server stopped`.
 
 The `crashes` metric counts unexpected browser loss from Chromium events or a
 failed health probe, not retirement from age, a report, or operation retries. A
@@ -487,7 +585,8 @@ basis may lower it.
 
 Health checks use `/ping`. With a tenant key, or on a keyless daemon where the
 empty key selects the one tenant, it probes that tenant's session and returns
-HTTP 200 with `ok:true` or `ok:false`, `probe:"tenant"`, and an always-present
+HTTP 200 with `ok:true` or `ok:false`, `probe:"tenant"`, `keyed` (whether the
+daemon requires a key at all), and an always-present
 `reason`: `ok`, `no-session` (benign, since a `POST /report` retires the session
 and re-establishment is lazy, so `ok` briefly reads `false`), `busy` (benign: a
 probe failed twice but a request held the page, so nothing was retired and the
@@ -508,10 +607,11 @@ proved the browser, so a healthy probe costs one round trip.
 
 On a keyed daemon, a `/ping` that presents no key is answered at daemon scope
 instead of with `401`. The body says `probe:"daemon"` and carries only `ok`,
-`reason`, `browser_relaunched`, and on failure `error`: the browser check above
-on its own, with `ok` meaning a running Chromium answered, possibly after a
-relaunch. That is less than the redacted `/metrics` already serves anyone,
-which is why the probe needs neither a key nor a loopback source: an
+`probe`, `keyed`, `reason`, `browser_relaunched`, and on failure `error`: the
+browser check above on its own, with `ok` meaning a running Chromium answered,
+possibly after a relaunch. That is less than the redacted `/metrics` already
+serves anyone, which is why the probe needs neither a key nor a loopback
+source: an
 orchestrator's probe arrives from the node, and a port published through
 Docker's proxy arrives from the bridge address, so the source says nothing
 about who is asking. A caller cannot make a healthy browser fail the check, so
@@ -529,10 +629,13 @@ probes do not fail during the benign re-establishment window. A bare `?strict`
 also enables it; a value `strconv.ParseBool` cannot read (`yes`, `on`, `banana`)
 returns **400** rather than quietly running non-strict, so a typo in a probe is
 visible. Size a probe's timeout for the worst case: up to four session round
-trips and a session teardown, two browser round trips and a browser teardown,
-each bounded at 5 seconds, plus a relaunch, which normally takes a second or two
-and is bounded by the 60 second launch handshake; the image's `HEALTHCHECK`
-allows 110. The image runs `waxseal ping --strict` with no key, which checks
+trips and a session teardown, and two browser round trips, each bounded at 5
+seconds; a browser teardown of 7, which is a 2 second graceful close plus the
+launcher's 5 second wait; and a relaunch, which normally takes a second or two
+and is bounded by the 60 second launch handshake. That is 102 seconds, or 105 on
+Windows, which also removes the profile. `waxseal ping` allows itself 108, that
+worst case plus its own connect, transfer, and decode, and takes `--timeout` to
+change it; the image's `HEALTHCHECK` allows 110. The image runs `waxseal ping --strict` with no key, which checks
 the browser on a keyed daemon and the one tenant's session plus the browser on
 a keyless one, and it keeps working once the daemon is keyed. Add `--key <key>`
 to also probe that tenant's session; the CLI sends the key as a header and keeps
@@ -552,10 +655,26 @@ warning. Note that a Debian `chromium` build, which the image runs, reports no
 `Google Chrome` brand at all while its user agent still says `Chrome/<version>`.
 That is what real Debian Chromium looks like, not a bug.
 
+Most daemon settings have both a flag and an environment variable, and where both
+exist the flag outranks the variable. A container reaches for the variable, since
+a flag there means overriding the image's `CMD`. The rows naming no flag have
+only the variable.
+
+| Variable | Sets |
+|---|---|
+| `WAXSEAL_TENANT_KEYS`, `WAXSEAL_TENANT_KEYS_FILE` | `--tenant-keys`, `--tenant-keys-file` |
+| `WAXSEAL_METRICS_KEY`, `WAXSEAL_METRICS_KEY_FILE` | `--metrics-key`, `--metrics-key-file` |
+| `WAXSEAL_STREAMING_MAX_AGE` | `--streaming-max-age` |
+| `WAXSEAL_REPORT_DEBOUNCE` | `--report-debounce` |
+| `WAXSEAL_SHUTDOWN_TIMEOUT` | `--shutdown-timeout` |
+| `WAXSEAL_MINT_SEPARATION` | the mint-to-establishment gate, which has no flag; an unparseable value stops startup |
+| `WAXSEAL_CHROME_BIN` | the browser binary, for every command |
+| `WAXSEAL_UA_HINTS` | the client-hint source, `real` or `synthetic` |
+
 WaxSeal is meant for loopback or a trusted network and does not implement CORS;
-because it mints tokens, browser-origin access is out of scope. Run
-`go run ./cmd/waxseal server --help` for the rest: session recycling, report
-debounce, bind address, headful mode, and metrics access.
+because it mints tokens, browser-origin access is out of scope.
+`go run ./cmd/waxseal server --help` describes every flag and lists the three
+environment-only variables.
 
 ## Development
 
@@ -564,11 +683,15 @@ go test ./...                              # offline unit tests; no browser or n
 (cd provider && go test ./...)             # the nested module's offline tests
 go test -tags live ./internal/cdp          # real-Chromium CDP pipe-transport tests
 (cd provider && go test -tags e2e ./...)   # provider network e2e; needs WAXSEAL_URL/WAXSEAL_KEY
-make vet                                   # what CI vets: both modules, plus a windows cross-vet
+make vet                                   # both modules, plus a windows cross-vet (CI vets Windows natively)
+make fmt-check                             # fail if any file needs gofmt
 make test                                  # both modules' offline tests, race-enabled
 make live                                  # the live CDP tests above
 make tidy-check                            # fail if go mod tidy would change either module
 make vulncheck                             # govulncheck over both modules
+make consumer-check                        # build provider/ as an external go get sees it
+make compose-check                         # validate compose.yaml and check it pulls the published image
+make verify-assets                         # rebuild the browser bundle and diff it against the committed one
 make deps                                  # install browser-bundle build dependencies
 make jsbundle-browser                      # regenerate internal/browser/bg_browser_bundle.js
 ```
@@ -611,9 +734,23 @@ The `client` package is a reusable, consumer-agnostic HTTP client; the
 `provider/` module adapts it to the token-provider interface a streaming
 consumer expects.
 
+`provider/` builds against this checkout through a `replace`, while its `require`
+names the root version a consumer resolves, the `replace` being ignored there. So
+a change that adds a root member `provider/` uses is pushed first and pinned
+second: `go list -m github.com/colespringer/waxseal@<sha>` prints the
+pseudo-version of the pushed commit, then `go mod edit
+-require=github.com/colespringer/waxseal@<pseudo-version>` and `go mod tidy` from
+`provider/`; after each root tag the pin moves to the tag. `make consumer-check`
+builds the module with the `replace` dropped, and the release gate runs it, so a
+stale pin stops a release rather than a consumer.
+
+Debug logging (`-v`) includes full video IDs and the `id`, `expire`, and `spc`
+parameters of streaming URLs, which INFO lines leave out.
+
 CLI exit codes: `0` success, `1` runtime failure, `2` usage error, `3` unavailable
-video, `130` interruption. A bot check is a runtime failure (`1`), not an
-unavailable video: it describes the browser session rather than the video.
+video, `130` interruption of a one-shot command; `server` exits 0 on a requested
+stop. A bot check is a runtime failure (`1`), not an unavailable video: it
+describes the browser session rather than the video.
 
 Some coverage stays out of `go test ./...` because it needs a display or a long
 run: **headful mode** (`go run ./cmd/waxseal server --headful`) to watch a real

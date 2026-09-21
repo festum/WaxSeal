@@ -5,9 +5,9 @@ import (
 	"time"
 )
 
-// RetryWaitForTest exposes the retry rule to the external test package, so a
-// test can assert that a refusal earns no retry without reaching for the wire.
-func RetryWaitForTest(err error) (time.Duration, bool) { return retryWait(err) }
+// RealSleep is the retry's wait as shipped, captured before any test swaps it,
+// for an arm that needs the wait to honour the context rather than a recorder.
+var RealSleep = sleep
 
 // SetSleepForTest swaps the retry's wait for a recorder and returns a function
 // restoring the real one.

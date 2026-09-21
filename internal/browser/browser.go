@@ -83,6 +83,12 @@ func (e *UnplayableError) Error() string {
 
 func (e *UnplayableError) Unwrap() error { return ErrUnplayable }
 
+// LiveBroadcastStatus is the details value of a 422 for a broadcast that is on
+// air. It is WaxSeal's own token, not a playabilityStatus: the player says OK
+// for a live stream, but the stream has no length to confirm past the preview
+// cap and the consumer downloads finished media only.
+const LiveBroadcastStatus = "LIVE_BROADCAST"
+
 // ErrBotCheck marks a playabilityStatus that describes the browser session
 // rather than the video: YouTube's "Sign in to confirm you're not a bot". It
 // deliberately does not unwrap to ErrUnplayable, so the minter relaunches the
@@ -107,10 +113,11 @@ func (e *BotCheckError) Unwrap() error { return ErrBotCheck }
 // age gate ("Sign in to confirm your age") share LOGIN_REQUIRED with it and stay
 // per-video verdicts, which is why the status cannot decide this.
 //
-// reason is user-facing text, so this reads English. WaxSeal pins no browser
-// locale, and a wall phrased in another language falls through to the per-video
-// path: the video is negative-cached and the session is not relaunched. See the
-// entry in docs/deferred-work.md.
+// reason is user-facing text, and this reads English because the browser presents
+// acceptLanguage, so the phrase is the same whatever the host's locale. A wall
+// YouTube rephrases reads as pending instead: the page never becomes the
+// requested video, and the establish timeout names the status and reason it sat
+// on, which is where that shows up.
 func isBotCheck(reason string) bool {
 	return strings.Contains(strings.ToLower(reason), "not a bot")
 }
@@ -173,6 +180,15 @@ const (
 
 // uaHintsEnv names the kill switch for the client-hint source.
 const uaHintsEnv = "WAXSEAL_UA_HINTS"
+
+// acceptLanguage is the language list an overridden page presents. The wall's
+// reason is user-facing text YouTube localizes from Accept-Language, so pinning
+// it is what makes isBotCheck's English phrase the one WaxSeal sees on any host.
+// The value is Chrome's pref-style list, not a header: Chrome appends the
+// q-values and mirrors the raw list into navigator.languages, so this is exactly
+// what an en-US Chrome presents. Headful runs skip NormalizeUA and keep the
+// host's own language.
+const acceptLanguage = "en-US,en"
 
 // uaHintsUnknownOnce keeps an unrecognised WAXSEAL_UA_HINTS to one warning per
 // process, since every session constructor resolves the same value.
@@ -342,7 +358,7 @@ func Launch(ctx context.Context, videoID string, opts Options) (*Session, error)
 	if err := validateLaunchOptions(opts); err != nil {
 		return nil, err
 	}
-	browser, profile, err := launchChromium(opts)
+	browser, profile, err := launchChromium(ctx, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -405,10 +421,11 @@ type profileHandle struct {
 // whether a locked file can be deleted. It is safe on a zero-value handle.
 func (h profileHandle) cleanup() { cleanupProfile(h) }
 
-// launchChromium starts Chromium over a CDP pipe. The caller must close the
-// returned browser and call profileHandle.cleanup to remove the profile and
-// release its lock.
-func launchChromium(opts Options) (*cdp.Browser, profileHandle, error) {
+// launchChromium starts Chromium over a CDP pipe. ctx bounds the version
+// handshake alongside launchTimeout, so a signal during startup does not wait
+// the whole minute out. The caller must close the returned browser and call
+// profileHandle.cleanup to remove the profile and release its lock.
+func launchChromium(ctx context.Context, opts Options) (*cdp.Browser, profileHandle, error) {
 	bin := opts.ChromeBin
 	if bin == "" {
 		b, err := DetectChrome()
@@ -432,7 +449,7 @@ func launchChromium(opts Options) (*cdp.Browser, profileHandle, error) {
 	// a golden in internal/cdp. It also omits enable-automation so
 	// navigator.webdriver stays false. The pipe transport gives startup a
 	// cancellable version handshake owned by this process.
-	browser, err := cdp.Spawn(context.Background(), bin, cdp.BuildArgs(profileDir, opts.Headful), cdp.SpawnOptions{
+	browser, err := cdp.Spawn(ctx, bin, cdp.BuildArgs(profileDir, opts.Headful), cdp.SpawnOptions{
 		LaunchTimeout: launchTimeout,
 		Logger:        opts.Logger,
 	})
@@ -440,6 +457,7 @@ func launchChromium(opts Options) (*cdp.Browser, profileHandle, error) {
 		handle.cleanup()
 		return nil, profileHandle{}, fmt.Errorf("waxseal: launch chromium: %w", err)
 	}
+	opts.Logger.Info("waxseal: chromium launched", "pid", browser.PID(), "profile", profileDir)
 	return browser, handle, nil
 }
 
@@ -512,6 +530,9 @@ func setupSession(ctx context.Context, browser *cdp.Browser, videoID string, opt
 	if err = s.captureSTS(navCtx); err != nil {
 		return nil, err
 	}
+	if res, err := s.page.Context(navCtx).Eval(landingPlayabilityJS); err == nil {
+		warnLandingPlayability(opts.Logger, videoID, res.Str())
+	}
 	opts.Logger.Info("waxseal: identity",
 		"visitor_data_len", len(s.id.VisitorData),
 		"client_version", s.id.ClientVersion,
@@ -533,8 +554,32 @@ func setupSession(ctx context.Context, browser *cdp.Browser, videoID string, opt
 	return s, nil
 }
 
-// errPoolClosed is returned when a pool operation runs after Close.
-var errPoolClosed = errors.New("waxseal: browser pool is closed")
+// landingPlayabilityJS reads the watch page's own player response status.
+const landingPlayabilityJS = `() => { try { const s = (window.ytInitialPlayerResponse || {}).playabilityStatus || {}; return JSON.stringify({Status: s.status || '', Reason: s.reason || ''}); } catch (e) { return '{}'; } }`
+
+// warnLandingPlayability names a landing video the page refused to play.
+// Attestation does not depend on it, but a streaming proof would fall back to
+// another candidate, and a wall shows up here before anywhere else. A wall is
+// called one: it is the session that is blocked, not the video, and every
+// other candidate will meet it too.
+func warnLandingPlayability(log *slog.Logger, videoID, raw string) {
+	var ps struct{ Status, Reason string }
+	if json.Unmarshal([]byte(raw), &ps) != nil || ps.Status == "" || ps.Status == "OK" {
+		return
+	}
+	if isBotCheck(ps.Reason) {
+		log.Warn("waxseal: the landing page met a bot check; this session is walled, and a streaming proof will not find a candidate that is not",
+			"video", videoID, "status", ps.Status, "reason", ps.Reason)
+		return
+	}
+	log.Warn("waxseal: landing video is not playable; attestation continues, a streaming proof falls back to another candidate",
+		"video", videoID, "status", ps.Status, "reason", ps.Reason)
+}
+
+// ErrPoolClosed is returned when a pool operation runs after Close. It is
+// exported so a caller outside this package can tell a shut-down pool apart from
+// a launch that failed.
+var ErrPoolClosed = errors.New("waxseal: browser pool is closed")
 
 // browserInstance groups a Chromium connection with the resources that must be
 // released with it. Pool relaunches replace the entire instance.
@@ -571,8 +616,8 @@ func (i *browserInstance) teardown() (ran bool) {
 }
 
 // launchInstance launches Chromium and groups its resources for teardown.
-func launchInstance(opts Options) (*browserInstance, error) {
-	b, profile, err := launchChromium(opts)
+func launchInstance(ctx context.Context, opts Options) (*browserInstance, error) {
+	b, profile, err := launchChromium(ctx, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -609,14 +654,19 @@ type Pool struct {
 	relaunchStreak int           // consecutive relaunches within the stability window
 }
 
-// LaunchPool starts the shared Chromium. Close it to tear everything down.
-func LaunchPool(opts Options) (*Pool, error) {
+// LaunchPool starts the shared Chromium. ctx bounds that first launch, so a
+// signal during startup stops it. Close the pool to tear everything down.
+//
+// Later relaunches deliberately do not take a caller's context: they are
+// single-flighted and every waiter parks on the one launch, so one request's
+// deadline must not abort the launch the rest are waiting for.
+func LaunchPool(ctx context.Context, opts Options) (*Pool, error) {
 	opts = withDefaults(opts)
 	if err := validateLaunchOptions(opts); err != nil {
 		return nil, err
 	}
-	p := &Pool{opts: opts, newInstance: func() (*browserInstance, error) { return launchInstance(opts) }, ping: pingInstance}
-	inst, err := p.newInstance()
+	p := &Pool{opts: opts, newInstance: func() (*browserInstance, error) { return launchInstance(context.Background(), opts) }, ping: pingInstance}
+	inst, err := launchInstance(ctx, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -629,7 +679,7 @@ func (p *Pool) acquire() (*browserInstance, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.closed || p.cur == nil {
-		return nil, errPoolClosed
+		return nil, ErrPoolClosed
 	}
 	return p.cur, nil
 }
@@ -653,7 +703,7 @@ func (p *Pool) NewSession(ctx context.Context, videoID string) (*Session, error)
 			return nil, fmt.Errorf("waxseal: new browser context: %w", err)
 		}
 		p.opts.Logger.Warn("waxseal: pooled chromium is unreachable; relaunching", "err", err)
-		inst, err = p.relaunch(inst)
+		inst, err = p.relaunch(ctx, inst)
 		if err != nil {
 			return nil, err
 		}
@@ -736,7 +786,7 @@ func (r Recovery) String() string {
 // is returned as is.
 func (p *Pool) Health(ctx context.Context) (Recovery, error) {
 	if p == nil {
-		return RecoveryNone, errPoolClosed
+		return RecoveryNone, ErrPoolClosed
 	}
 	inst, err := p.acquire()
 	if err != nil {
@@ -776,7 +826,10 @@ func (p *Pool) Health(ctx context.Context) (Recovery, error) {
 // launched, and reports rec on success. cause is what the probe saw, for the log.
 func (p *Pool) replace(rec Recovery, stale *browserInstance, cause error) (Recovery, error) {
 	p.opts.Logger.Warn("waxseal: pooled chromium is gone; relaunching for the probe", "recovery", rec, "err", cause)
-	if _, err := p.relaunch(stale); err != nil {
+	// The browser this replaces is already gone, so the replacement is not the
+	// probe's to abandon: leaving on the probe's deadline would leave the pool
+	// with nothing current. The launch has its own handshake timeout.
+	if _, err := p.relaunch(context.Background(), stale); err != nil {
 		return RecoveryNone, err
 	}
 	return rec, nil
@@ -815,17 +868,20 @@ func (e *RelaunchBackoffError) Error() string {
 }
 
 // relaunch replaces stale with a new browser instance. Concurrent callers that
-// observed the same stale instance wait for the same relaunch.
+// observed the same stale instance wait for the same relaunch, and ctx bounds
+// that wait: a request whose own budget is gone leaves rather than holding on
+// for someone else's launch handshake. It does not bound the launch itself,
+// which belongs to whichever caller started it.
 //
 // Attempts are counted before launch so the backoff also covers browsers that
 // start successfully and die during session setup. The streak resets only after
 // relaunchStableWindow without another relaunch.
-func (p *Pool) relaunch(stale *browserInstance) (*browserInstance, error) {
+func (p *Pool) relaunch(ctx context.Context, stale *browserInstance) (*browserInstance, error) {
 	for {
 		p.mu.Lock()
 		if p.closed {
 			p.mu.Unlock()
-			return nil, errPoolClosed
+			return nil, ErrPoolClosed
 		}
 		if p.cur != stale {
 			cur := p.cur // Another caller replaced the stale instance.
@@ -835,7 +891,19 @@ func (p *Pool) relaunch(stale *browserInstance) (*browserInstance, error) {
 		if p.relaunching != nil {
 			ch := p.relaunching
 			p.mu.Unlock()
-			<-ch // Wait for the in-progress relaunch, then check again.
+			select {
+			case <-ch: // The in-progress relaunch finished; check again.
+			case <-ctx.Done():
+				// Both can be ready at once, and a bare select would pick between
+				// them at random. Prefer the finished relaunch: its outcome is what
+				// the caller came for, and the cancellation says nothing about the
+				// browser.
+				select {
+				case <-ch:
+				default:
+					return nil, fmt.Errorf("waxseal: relaunch wait abandoned: %w", ctx.Err())
+				}
+			}
 			continue
 		}
 		now := time.Now()
@@ -872,7 +940,7 @@ func (p *Pool) relaunch(stale *browserInstance) (*browserInstance, error) {
 		if p.closed {
 			p.mu.Unlock()
 			inst.teardown() // Close won the race; discard the replacement.
-			return nil, errPoolClosed
+			return nil, ErrPoolClosed
 		}
 		p.cur = inst
 		p.mu.Unlock()
@@ -1109,7 +1177,8 @@ func uaOverrideFromMetadata(m *uaMetadata) *cdp.NetworkSetUserAgentOverride {
 		return nil
 	}
 	return &cdp.NetworkSetUserAgentOverride{
-		UserAgent: unheadless(m.UA),
+		UserAgent:      unheadless(m.UA),
+		AcceptLanguage: acceptLanguage,
 		UserAgentMetadata: &cdp.UserAgentMetadata{
 			Brands:          cdpBrands(m.Brands),
 			FullVersionList: cdpBrands(m.Hints.FullVersionList),
@@ -1151,7 +1220,8 @@ func uaOverride(realUA string) *cdp.NetworkSetUserAgentOverride {
 	}
 	full := major + ".0.0.0"
 	return &cdp.NetworkSetUserAgentOverride{
-		UserAgent: fixed,
+		UserAgent:      fixed,
+		AcceptLanguage: acceptLanguage,
 		UserAgentMetadata: &cdp.UserAgentMetadata{
 			Brands: []*cdp.UserAgentBrandVersion{
 				{Brand: "Chromium", Version: major},
@@ -1677,6 +1747,7 @@ const playerLoadJS = `(videoId) => {
 		window.__wsErrH = handler;
 		try { if (p.addEventListener) p.addEventListener('onError', handler); } catch (e) {}
 		try { if (p.stopVideo) p.stopVideo(); } catch (e) {}
+		try { window.__wsPrevResp = p.getPlayerResponse ? p.getPlayerResponse() : null; } catch (e) { window.__wsPrevResp = null; }
 		p.loadVideoById(videoId);
 		return true;
 	} catch (e) { return false; }
@@ -1706,6 +1777,7 @@ const playerContextExtractJS = `(videoId) => {
 		const j = p.getPlayerResponse();
 		const errMark = window.__wsErr;
 		const status = (j && j.playabilityStatus && j.playabilityStatus.status) || '';
+		const mf = (j && j.microformat && j.microformat.playerMicroformatRenderer) || {};
 		const evidence = {
 			playability_status: status,
 			reason: (j && j.playabilityStatus && j.playabilityStatus.reason) || '',
@@ -1713,6 +1785,8 @@ const playerContextExtractJS = `(videoId) => {
 			err_gen_match: !!(errMark && errMark.gen === window.__wsGen),
 			err_video_id: (errMark && errMark.vid) || '',
 			video_id_match: !!(j && j.videoDetails && j.videoDetails.videoId === videoId),
+			response_changed: !!j && j !== window.__wsPrevResp,
+			is_live_now: !!(j && j.videoDetails && j.videoDetails.isLive === true) || !!(mf.liveBroadcastDetails && mf.liveBroadcastDetails.isLiveNow === true),
 		};
 		if (!evidence.video_id_match) return JSON.stringify(Object.assign({ error: 'pending: player response not yet for ' + videoId }, evidence));
 		if (status && status !== 'OK') return JSON.stringify(Object.assign({ error: 'unplayable: ' + status }, evidence));
@@ -1722,7 +1796,6 @@ const playerContextExtractJS = `(videoId) => {
 		const buffered = (v && v.buffered && v.buffered.length) ? v.buffered.end(v.buffered.length - 1) : 0;
 		if (buffered <= 0) return JSON.stringify(Object.assign({ error: 'pending: session not established (no buffered media yet)' }, evidence));
 		const vd = j.videoDetails;
-		const mf = (j.microformat && j.microformat.playerMicroformatRenderer) || {};
 		const thumbs = ((vd.thumbnail && vd.thumbnail.thumbnails) || [])
 			.filter(function (t) { return t && t.url; })
 			.map(function (t) { return { url: t.url, width: Number(t.width || 0), height: Number(t.height || 0) }; });
@@ -1746,6 +1819,7 @@ const playerContextExtractJS = `(videoId) => {
 		})();
 		return JSON.stringify({
 			playability_status: status,
+			video_id_match: true,
 			player_url: playerJs ? new URL(playerJs, location.origin).href : '',
 			server_abr_streaming_url: sd.serverAbrStreamingUrl,
 			video_playback_ustreamer_config: urc.videoPlaybackUstreamerConfig || '',
@@ -1756,7 +1830,7 @@ const playerContextExtractJS = `(videoId) => {
 			description: vd.shortDescription || '',
 			thumbnails: thumbs,
 			is_live_content: vd.isLiveContent === true,
-			is_live_now: vd.isLive === true || !!(mf.liveBroadcastDetails && mf.liveBroadcastDetails.isLiveNow),
+			is_live_now: vd.isLive === true || !!(mf.liveBroadcastDetails && mf.liveBroadcastDetails.isLiveNow === true),
 			is_upcoming: vd.isUpcoming === true,
 			publish_date: mf.publishDate || '',
 			audio_formats: audioFormats,
@@ -1772,6 +1846,9 @@ const playerContextExtractJS = `(videoId) => {
 // deleted.
 const playerContextCleanupJS = `() => {
 	try { const p = document.getElementById('movie_player'); if (p && p.stopVideo) p.stopVideo(); } catch (e) {}
+	// The load snapshot is a whole player response; holding it between requests
+	// keeps that graph alive in the renderer for nothing. The next load sets it.
+	try { window.__wsPrevResp = null; } catch (e) {}
 	try {
 		delete document.visibilityState;
 		if (Object.getOwnPropertyDescriptor(document, 'visibilityState')) Object.defineProperty(document, 'visibilityState', { get: () => 'hidden', configurable: true });
@@ -1793,6 +1870,13 @@ type playerContextRaw struct {
 	ErrGenMatch  bool   `json:"err_gen_match"`  // error marker belongs to the current load generation
 	ErrVideoID   string `json:"err_video_id"`   // video reported by the player when onError fired
 	VideoIDMatch bool   `json:"video_id_match"` // player response belongs to the requested video
+	// ResponseChanged reports that the player response is a different object
+	// from the one the load started with, so its status belongs to this load
+	// even when the refusal carries no videoDetails. It stays true for the rest
+	// of the request, including the re-read after a seek: the snapshot is taken
+	// once per load, not once per poll, so this says "not the previous load's",
+	// never "changed since the last poll".
+	ResponseChanged bool `json:"response_changed"`
 }
 
 // confirmTerminal returns a terminal error only when the evidence belongs to
@@ -1810,11 +1894,25 @@ func confirmTerminal(raw playerContextRaw, videoID string) error {
 	if isBotCheck(raw.Reason) {
 		return &BotCheckError{Status: raw.PlayabilityStatus, Reason: raw.Reason}
 	}
+	// A non-OK status is this load's verdict when the response names the video
+	// or is no longer the one the load started with (a refusal carries no
+	// videoDetails, so only the second test can tie it to this load).
+	fresh := raw.PlayabilityStatus != "" && raw.PlayabilityStatus != "OK" && (raw.VideoIDMatch || raw.ResponseChanged)
 	if raw.ErrGenMatch && raw.ErrVideoID == videoID && isUnavailableCode(raw.ErrCode) {
-		return &UnplayableError{Status: "ERROR", Detail: fmt.Sprintf("player onError %d", raw.ErrCode)}
+		status, detail := "ERROR", fmt.Sprintf("player onError %d", raw.ErrCode)
+		if fresh {
+			status = raw.PlayabilityStatus
+			if raw.Reason != "" {
+				detail = raw.Reason + " (" + detail + ")"
+			}
+		}
+		return &UnplayableError{Status: status, Detail: detail}
 	}
-	if raw.PlayabilityStatus != "" && raw.PlayabilityStatus != "OK" && raw.VideoIDMatch {
+	if fresh {
 		return &UnplayableError{Status: raw.PlayabilityStatus, Detail: raw.Reason}
+	}
+	if raw.VideoIDMatch && raw.IsLiveNow {
+		return &UnplayableError{Status: LiveBroadcastStatus, Detail: "broadcast is on air; WaxSeal serves finished videos only"}
 	}
 	return nil
 }
@@ -1997,7 +2095,9 @@ func (s *Session) establish(ctx context.Context, page pageDriver, videoID string
 	// Wait once before the first read so the asynchronous stop and load operations
 	// cannot expose state left by a previous request for the same video.
 	evalErrs := 0
-	lastReason := "" // the page's most recent pending reason, for the deadline message
+	// The page's most recent pending reason, and the last non-OK playability
+	// status with its reason, for the deadline message.
+	lastReason, lastStatus, lastStatusReason := "", "", ""
 	for {
 		select {
 		case <-ctx.Done():
@@ -2009,7 +2109,7 @@ func (s *Session) establish(ctx context.Context, page pageDriver, videoID string
 		// it fails on the derived context and would report a bare cancellation
 		// instead of what the page was actually waiting for.
 		if time.Now().After(deadline) {
-			return playerContextRaw{}, deadlineError(lastReason)
+			return playerContextRaw{}, deadlineError(lastReason, lastStatus, lastStatusReason)
 		}
 		_, _ = page.Eval(playerDriveJS)
 		obj, evalErr := page.Eval(playerContextExtractJS, videoID)
@@ -2023,7 +2123,7 @@ func (s *Session) establish(ctx context.Context, page pageDriver, videoID string
 				// that one case only: any other error is a real extraction failure
 				// and must not be masked, even past the deadline.
 				if errors.Is(evalErr, context.DeadlineExceeded) && time.Now().After(deadline) {
-					return playerContextRaw{}, deadlineError(lastReason)
+					return playerContextRaw{}, deadlineError(lastReason, lastStatus, lastStatusReason)
 				}
 				return playerContextRaw{}, fmt.Errorf("waxseal: player-context extract: %w", evalErr)
 			}
@@ -2041,21 +2141,29 @@ func (s *Session) establish(ctx context.Context, page pageDriver, videoID string
 			return raw, nil // established context captured
 		}
 		lastReason = raw.Error
+		if raw.PlayabilityStatus != "" && raw.PlayabilityStatus != "OK" {
+			lastStatus, lastStatusReason = raw.PlayabilityStatus, raw.Reason
+		}
 		if time.Now().After(deadline) {
-			return playerContextRaw{}, deadlineError(lastReason)
+			return playerContextRaw{}, deadlineError(lastReason, lastStatus, lastStatusReason)
 		}
 	}
 }
 
-// deadlineError renders the establish timeout. reason is the page's most recent
+// deadlineError renders the establish timeout. pending is the page's most recent
 // pending explanation, which is the load-bearing part of the message; an empty
 // one means the page never answered at all, which is worth saying rather than
-// leaving the error bare.
-func deadlineError(reason string) error {
-	if reason == "" {
-		return fmt.Errorf("waxseal: player-context: no player response before the deadline")
+// leaving the error bare. status and reason are the last non-OK
+// playabilityStatus the page showed, and they are what makes a wall WaxSeal
+// could not recognise diagnosable from this one line.
+func deadlineError(pending, status, reason string) error {
+	if pending == "" {
+		pending = "no player response before the deadline"
 	}
-	return fmt.Errorf("waxseal: player-context: %s", reason)
+	if status == "" {
+		return fmt.Errorf("waxseal: player-context: %s", pending)
+	}
+	return fmt.Errorf("waxseal: player-context: %s; last playabilityStatus %q: %q", pending, status, reason)
 }
 
 // The full-length probe seeks beyond the roughly 70-second status-2 preview cap
@@ -2497,7 +2605,7 @@ func (s *Session) confirmPastCap(ctx context.Context, page pageDriver, target in
 			lastProgressAt = time.Now()
 		} else if time.Since(lastProgressAt) > tm.stallWindow {
 			probe.Outcome = OutcomeTargetNotBuffered
-			probe.Reason = fmt.Sprintf("playback and buffering stalled at %.1fs (state %d, buffered end %.1f); never reached the %ds target", b.Current, b.State, b.BufferedEnd, target)
+			probe.Reason = fmt.Sprintf("playback and buffering stalled at %.1fs (state %d, buffered end %.1f) before the confirm accepted a sample past the %ds target", b.Current, b.State, b.BufferedEnd, target)
 			return probe, nil
 		}
 	}
@@ -2620,9 +2728,10 @@ func reduceStreamingURL(rawURL string) string {
 //     clear the cap with tolerance room, so require buffering to reach the true
 //     end.
 //
-// Unknown length verifies at the full-length target. This fails closed for live,
-// premiere, or otherwise unreadable durations: long content can still confirm,
-// while short unknown-length content is refused and left to the consumer fallback.
+// A broadcast that is on air is refused in confirmTerminal before any of this
+// runs. Unknown length on a finished video still verifies at the full-length
+// target: long content can confirm, while short unknown-length content is
+// refused and left to the consumer fallback.
 func (s *Session) establishStatus1(ctx context.Context, page pageDriver, videoID string, establishBudget, confirmBudget time.Duration) (playerContextRaw, error) {
 	raw, err := s.establish(ctx, page, videoID, time.Now().Add(establishBudget))
 	if err != nil {

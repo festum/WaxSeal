@@ -115,7 +115,7 @@ func TestValidateLaunchOptions(t *testing.T) {
 // before it starts Chromium: an invalid LandingURL/StopAfterLoad combination
 // returns the validation error straight away rather than a launch failure.
 func TestLaunchPoolValidatesOptions(t *testing.T) {
-	_, err := LaunchPool(Options{LandingURL: "http://127.0.0.1:1/"})
+	_, err := LaunchPool(context.Background(), Options{LandingURL: "http://127.0.0.1:1/"})
 	if err == nil {
 		t.Fatal("LaunchPool with LandingURL but no StopAfterLoad = nil error, want the validation error")
 	}
@@ -131,7 +131,7 @@ func TestLaunchPoolValidatesOptions(t *testing.T) {
 // producer's bytes.
 func TestUAOverride(t *testing.T) {
 	const realUA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
-	const want = `{"userAgent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36","userAgentMetadata":{"brands":[{"brand":"Chromium","version":"149"},{"brand":"Not)A;Brand","version":"24"}],"fullVersionList":[{"brand":"Chromium","version":"149.0.0.0"},{"brand":"Not)A;Brand","version":"24.0.0.0"}],"fullVersion":"149.0.0.0","platform":"Linux","platformVersion":"","architecture":"x86","model":"","mobile":false,"bitness":"64"}}`
+	const want = `{"userAgent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36","acceptLanguage":"en-US,en","userAgentMetadata":{"brands":[{"brand":"Chromium","version":"149"},{"brand":"Not)A;Brand","version":"24"}],"fullVersionList":[{"brand":"Chromium","version":"149.0.0.0"},{"brand":"Not)A;Brand","version":"24.0.0.0"}],"fullVersion":"149.0.0.0","platform":"Linux","platformVersion":"","architecture":"x86","model":"","mobile":false,"bitness":"64"}}`
 
 	got, err := json.Marshal(uaOverride(realUA))
 	if err != nil {
@@ -215,6 +215,11 @@ func TestUAOverrideFromMetadata(t *testing.T) {
 		}
 		if md.PlatformVersion != "6.18.0" {
 			t.Errorf("platformVersion = %q, want the reported 6.18.0", md.PlatformVersion)
+		}
+		// The capture reports no language, so the real-hint path has to carry the
+		// pin itself or an overridden page falls back to the host's locale.
+		if got.AcceptLanguage != acceptLanguage {
+			t.Errorf("acceptLanguage = %q, want %q", got.AcceptLanguage, acceptLanguage)
 		}
 	})
 
@@ -363,11 +368,13 @@ var sessionFilledContextKeys = map[string]string{
 
 // TestPlayerContextExtractJSEmitsEveryKey pins that the extraction snippet names
 // every documented key in the object literal it returns on success, bar the ones
-// the session fills itself. The JS runs only in Chromium, so a key dropped from
-// that literal would otherwise surface as an empty field in a live run. Only that
-// literal is searched, and only for a whole property name, so a key that survives
-// elsewhere in the snippet, or as the tail of another key, cannot satisfy the
-// check.
+// the session fills itself, and every grading field in the evidence block it
+// attaches to a pending or unplayable payload. The JS runs only in Chromium, so a
+// key dropped from either literal would otherwise surface as an empty field in a
+// live run, and a missing evidence key reads as a zero value that confirmTerminal
+// grades on. Only those literals are searched, and only for a whole property
+// name, so a key that survives elsewhere in the snippet, or as the tail of
+// another key, cannot satisfy the check.
 func TestPlayerContextExtractJSEmitsEveryKey(t *testing.T) {
 	const open = "return JSON.stringify({\n"
 	start := strings.Index(playerContextExtractJS, open)
@@ -381,15 +388,47 @@ func TestPlayerContextExtractJSEmitsEveryKey(t *testing.T) {
 	}
 	literal = literal[:end]
 	typ := reflect.TypeOf(PlayerContext{})
+	names := func(t *testing.T, in, key string) {
+		t.Helper()
+		if !regexp.MustCompile(`(^|[\s{,])` + regexp.QuoteMeta(key) + `:`).MatchString(in) {
+			t.Errorf("playerContextExtractJS never emits %q", key)
+		}
+	}
 	for i := range typ.NumField() {
 		name, _, _ := strings.Cut(typ.Field(i).Tag.Get("json"), ",")
 		if _, ok := sessionFilledContextKeys[name]; ok {
 			continue
 		}
-		if !regexp.MustCompile(`(^|[\s{,])` + regexp.QuoteMeta(name) + `:`).MatchString(literal) {
-			t.Errorf("playerContextExtractJS success literal never emits %q", name)
-		}
+		names(t, literal, name)
 	}
+	// Not a PlayerContext key: the success payload sets it so video_id_match means
+	// one thing on every payload rather than reading false on the one that matched.
+	names(t, literal, "video_id_match")
+
+	const evidenceOpen = "const evidence = {\n"
+	start = strings.Index(playerContextExtractJS, evidenceOpen)
+	if start < 0 {
+		t.Fatal("playerContextExtractJS has no evidence literal")
+	}
+	evidence := playerContextExtractJS[start+len(evidenceOpen):]
+	if end = strings.Index(evidence, "};"); end < 0 {
+		t.Fatal("playerContextExtractJS evidence literal is unterminated")
+	}
+	evidence = evidence[:end]
+	raw := reflect.TypeOf(playerContextRaw{})
+	for i := range raw.NumField() {
+		f := raw.Field(i)
+		name, _, _ := strings.Cut(f.Tag.Get("json"), ",")
+		// The embedded context is the success literal's business, and every payload
+		// sets error itself rather than taking it from the evidence block.
+		if f.Anonymous || name == "" || name == "error" {
+			continue
+		}
+		names(t, evidence, name)
+	}
+	// On the embedded struct, so the loop above cannot reach it, and the one
+	// grading field both confirmTerminal and the establish deadline read.
+	names(t, evidence, "playability_status")
 }
 
 // TestConfirmTerminal covers stale evidence that must not mark the current video
@@ -456,7 +495,48 @@ func TestConfirmTerminal(t *testing.T) {
 			r.PlayabilityStatus = "LOGIN_REQUIRED"
 			r.Reason = "This video is private"
 			r.VideoIDMatch = true
+		}), ErrUnplayable, "LOGIN_REQUIRED"},
+		// The onError branch keeps its literal only when the page has no fresh
+		// status to report; a fresh non-OK status is the verdict.
+		{"onError 150 with a fresh LOGIN_REQUIRED and no videoDetails", raw(func(r *playerContextRaw) {
+			r.ErrCode = 150
+			r.ErrGenMatch = true
+			r.ErrVideoID = want
+			r.PlayabilityStatus = "LOGIN_REQUIRED"
+			r.Reason = "Private video"
+			r.ResponseChanged = true
+		}), ErrUnplayable, "LOGIN_REQUIRED"},
+		// The response object is still the previous load's, so its status is not
+		// this video's verdict; the onError literal stands.
+		{"onError 150 while the response is still the previous load's", raw(func(r *playerContextRaw) {
+			r.ErrCode = 150
+			r.ErrGenMatch = true
+			r.ErrVideoID = want
+			r.PlayabilityStatus = "LOGIN_REQUIRED"
+			r.Reason = "Private video"
+			r.ResponseChanged = false
 		}), ErrUnplayable, "ERROR"},
+		// A refusal without videoDetails is terminal on its own once the response
+		// is the new load's, without waiting for onError.
+		{"non-OK status, no videoDetails, response changed", raw(func(r *playerContextRaw) {
+			r.PlayabilityStatus = "LOGIN_REQUIRED"
+			r.Reason = "Private video"
+			r.ResponseChanged = true
+		}), ErrUnplayable, "LOGIN_REQUIRED"},
+		{"non-OK status, no videoDetails, response unchanged", raw(func(r *playerContextRaw) {
+			r.PlayabilityStatus = "LOGIN_REQUIRED"
+			r.Reason = "Private video"
+		}), nil, ""},
+		// An on-air broadcast is refused before any confirmation runs.
+		{"live broadcast on air", raw(func(r *playerContextRaw) {
+			r.PlayabilityStatus = "OK"
+			r.VideoIDMatch = true
+			r.IsLiveNow = true
+		}), ErrUnplayable, LiveBroadcastStatus},
+		{"live flag on another video's response", raw(func(r *playerContextRaw) {
+			r.PlayabilityStatus = "OK"
+			r.IsLiveNow = true
+		}), nil, ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -483,6 +563,15 @@ func TestConfirmTerminal(t *testing.T) {
 			}
 			if gotStatus != tt.wantStatus {
 				t.Errorf("status = %q, want %q", gotStatus, tt.wantStatus)
+			}
+			// When a fresh status wins over an onError code, the detail keeps
+			// both: the player's reason, and the code it also raised.
+			if ue, ok := errors.AsType[*UnplayableError](err); ok && tt.wantStatus == "LOGIN_REQUIRED" && tt.raw.ErrCode != 0 {
+				for _, sub := range []string{tt.raw.Reason, fmt.Sprintf("onError %d", tt.raw.ErrCode)} {
+					if !strings.Contains(ue.Detail, sub) {
+						t.Errorf("detail = %q, want it to contain %q", ue.Detail, sub)
+					}
+				}
 			}
 		})
 	}
@@ -1043,5 +1132,43 @@ func TestHTTPCookieFromCDP(t *testing.T) {
 		if got := httpCookieFromCDP(&cdp.Cookie{SameSite: in}).SameSite; got != want {
 			t.Errorf("SameSite(%q) = %v, want %v", in, got, want)
 		}
+	}
+}
+
+// setupSession cannot be driven by a fake page (it takes a real *cdp.Browser),
+// so the eval-to-warning mapping is tested on its own. A landing video the page
+// refused is only ever a warning: attestation does not read it.
+func TestWarnLandingPlayability(t *testing.T) {
+	for _, tc := range []struct {
+		name, raw string
+		wantWarn  bool
+	}{
+		{"playable", `{"Status":"OK","Reason":""}`, false},
+		{"no status read", `{}`, false},
+		{"unparseable", `not json`, false},
+		{"login required", `{"Status":"LOGIN_REQUIRED","Reason":"Private video"}`, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs strings.Builder
+			warnLandingPlayability(slog.New(slog.NewTextHandler(&logs, nil)), "vid", tc.raw)
+			if got := strings.Contains(logs.String(), "landing video is not playable"); got != tc.wantWarn {
+				t.Errorf("warned = %v, want %v (log %q)", got, tc.wantWarn, logs.String())
+			}
+			if tc.wantWarn && !strings.Contains(logs.String(), "Private video") {
+				t.Errorf("log = %q, want it to carry the player's reason", logs.String())
+			}
+		})
+	}
+
+	// A wall is the session's problem, not the video's, so it says so rather
+	// than implying another candidate would work.
+	var logs strings.Builder
+	warnLandingPlayability(slog.New(slog.NewTextHandler(&logs, nil)), "vid",
+		`{"Status":"LOGIN_REQUIRED","Reason":"Sign in to confirm you\u2019re not a bot"}`)
+	if !strings.Contains(logs.String(), "bot check") {
+		t.Errorf("log = %q, want the wall named", logs.String())
+	}
+	if strings.Contains(logs.String(), "falls back to another candidate") {
+		t.Errorf("log = %q, want it not to promise a fallback that is also walled", logs.String())
 	}
 }

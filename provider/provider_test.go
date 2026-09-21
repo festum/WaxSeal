@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"reflect"
 	"regexp"
 	"slices"
 	"strings"
@@ -168,6 +167,11 @@ func TestProvidePlayerContextMapping(t *testing.T) {
 	}
 	if pc.Title != "Big Buck Bunny" || pc.Author != "Blender" || pc.LengthSeconds != 634 {
 		t.Errorf("metadata: title=%q author=%q len=%d", pc.Title, pc.Author, pc.LengthSeconds)
+	}
+	// The identity the URL was issued to has to travel with it, or WaxTap streams
+	// the context under a user agent the daemon never minted it for.
+	if pc.UserAgent != "Mozilla/5.0 (X11; Linux x86_64) Chrome/149.0.0.0" {
+		t.Errorf("user agent = %q, want the one the context was minted under", pc.UserAgent)
 	}
 	// Without the generation WaxTap cannot name this context's session in a report,
 	// so a capped stream would have no escape.
@@ -727,7 +731,7 @@ func TestProviderTranslatesRefusals(t *testing.T) {
 			if !strings.Contains(sre.Reason, tt.want) {
 				t.Errorf("reason = %q, want it to contain %q", sre.Reason, tt.want)
 			}
-			if _, retry := provider.RetryWaitForTest(err); retry {
+			if _, retry := waxtap.SidecarRetryWait(err); retry {
 				t.Error("a contract mismatch earned a retry")
 			}
 		})
@@ -752,10 +756,10 @@ func TestInvalidateSessionRateLimited(t *testing.T) {
 	}
 }
 
-// The adapter retries once on WaxTap's own sidecar rule, so a consumer behaves
-// the same whichever adapter it wires: after the daemon's stated wait on a
-// transient refusal, after a short poke on one that stated none, and never at
-// all on a verdict or a stated wait too long to serve.
+// The arms below run WaxTap's own rule through call, so a consumer behaves the
+// same whichever adapter it wires: after the daemon's stated wait on a transient
+// refusal, after a short poke on one that stated none, and never at all on a
+// verdict or a stated wait too long to serve.
 func TestProviderRetriesOnceAfterStatedWait(t *testing.T) {
 	// slept records the waits served instead of serving them, so the table runs at
 	// full speed and can assert on the wait itself.
@@ -798,6 +802,11 @@ func TestProviderRetriesOnceAfterStatedWait(t *testing.T) {
 			name:      "a 5xx that stated no wait earns the poke",
 			replies:   []reply{refusal(503, "", "no-session"), ok200},
 			wantCalls: 2, wantWaits: []time.Duration{500 * time.Millisecond},
+		},
+		{
+			name:      "a stated wait at the cap is served",
+			replies:   []reply{refusal(502, "60", "player-context-failed"), ok200},
+			wantCalls: 2, wantWaits: []time.Duration{60 * time.Second},
 		},
 		{
 			name:      "a stated wait past the maximum is reported, not slept through",
@@ -868,15 +877,52 @@ func TestProviderRetriesOnceAfterStatedWait(t *testing.T) {
 		}
 	})
 
-	t.Run("a budget too short for the wait gets the refusal now", func(t *testing.T) {
+	// The arms below run WaxTap's pause policy through this adapter on the
+	// caller's own budget, so a wrapper that dropped the context, or slept before
+	// asking, would pass the table above and fail here: a budget has to clear the
+	// wait plus a second of headroom, one that does not gets the refusal instead
+	// of a sleep it cannot finish, and a wait the context ends early returns the
+	// refusal for a deadline and the cancellation for a caller giving up.
+	//
+	// refuseAll answers every request with a 502 stating retryAfter and counts
+	// them, for the arms that never reach a second attempt.
+	refuseAll := func(calls *int, retryAfter string) http.HandlerFunc {
+		return func(w http.ResponseWriter, _ *http.Request) {
+			*calls++
+			w.Header().Set("Retry-After", retryAfter)
+			w.WriteHeader(http.StatusBadGateway)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": "refused", "code": "player-context-failed"})
+		}
+	}
+	t.Run("a budget that clears the wait plus the headroom retries", func(t *testing.T) {
 		slept = nil
 		var calls int
 		p, done := newProvider(func(w http.ResponseWriter, _ *http.Request) {
 			calls++
-			w.Header().Set("Retry-After", "30")
+			if calls > 1 {
+				_ = json.NewEncoder(w).Encode(ok200.body)
+				return
+			}
+			w.Header().Set("Retry-After", "1")
 			w.WriteHeader(http.StatusBadGateway)
 			_ = json.NewEncoder(w).Encode(map[string]any{"error": "refused", "code": "player-context-failed"})
 		})
+		defer done()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := p.ProvidePlayerContext(ctx, "VID"); err != nil {
+			t.Fatalf("ProvidePlayerContext: %v", err)
+		}
+		if calls != 2 || !slices.Equal(slept, []time.Duration{time.Second}) {
+			t.Errorf("requests = %d, waits = %v, want 2 and one 1s wait", calls, slept)
+		}
+	})
+
+	t.Run("a budget too short for the wait gets the refusal now", func(t *testing.T) {
+		slept = nil
+		var calls int
+		p, done := newProvider(refuseAll(&calls, "30"))
 		defer done()
 
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -887,6 +933,53 @@ func TestProviderRetriesOnceAfterStatedWait(t *testing.T) {
 		}
 		if calls != 1 || len(slept) != 0 {
 			t.Errorf("requests = %d, waits = %v, want one request and no wait", calls, slept)
+		}
+	})
+
+	t.Run("a deadline that expires during the wait returns the refusal", func(t *testing.T) {
+		undo := provider.SetSleepForTest(func(context.Context, time.Duration) error { return context.DeadlineExceeded })
+		defer undo()
+		var calls int
+		p, done := newProvider(refuseAll(&calls, "1"))
+		defer done()
+
+		_, err := p.ProvidePlayerContext(context.Background(), "VID")
+		if _, ok := errors.AsType[*waxtap.SidecarResponseError](err); !ok {
+			t.Fatalf("err = %v (%T), want the refusal the deadline cut short, not a bare timeout", err, err)
+		}
+		if calls != 1 {
+			t.Errorf("requests = %d, want one: a wait cut short by a deadline earns no retry", calls)
+		}
+	})
+
+	t.Run("a caller that leaves during the wait gets its cancellation, not the wait", func(t *testing.T) {
+		// The real wait, handed the caller's context, which the caller ends the
+		// moment the wait starts: after the refusal, so a retry is due, and before
+		// any of the wait has been served. A wait given a context of its own would
+		// hold the caller for the whole stated wait, which is long enough here to
+		// be unmistakable and is never served when the wiring is right.
+		const stated = 30 * time.Second
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		undo := provider.SetSleepForTest(func(ctx context.Context, d time.Duration) error {
+			cancel()
+			return provider.RealSleep(ctx, d)
+		})
+		defer undo()
+		var calls int
+		p, done := newProvider(refuseAll(&calls, "30"))
+		defer done()
+
+		start := time.Now()
+		_, err := p.ProvidePlayerContext(ctx, "VID")
+		if elapsed := time.Since(start); elapsed >= stated {
+			t.Errorf("the call took %v: the caller's cancellation did not end the %v wait", elapsed, stated)
+		}
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v (%T), want the cancellation to outrank the refusal", err, err)
+		}
+		if calls != 1 {
+			t.Errorf("requests = %d, want one: the caller gave up", calls)
 		}
 	})
 
@@ -988,17 +1081,47 @@ func TestNonEnvelopeBodyIsNotEchoed(t *testing.T) {
 	}
 }
 
-// The tripwire docs/upstream-requests.md names for the open user_agent ask.
-// /player-context sends the field and potoken.PlayerContext has nowhere to put
-// it, so the adapter drops it. When upstream grows the field this fails, which
-// is the signal to map it and close the entry.
-func TestPlayerContextUserAgentHasNowhereToGoUpstream(t *testing.T) {
-	if _, ok := reflect.TypeOf(potoken.PlayerContext{}).FieldByName("UserAgent"); ok {
-		t.Error("potoken.PlayerContext now has a UserAgent field: map client.PlayerContext.UserAgent onto it, " +
-			"pin it in TestProvidePlayerContextMapping, and close the entry in docs/upstream-requests.md and docs/deferred-work.md")
+// The daemon's own error travels in Cause, for a caller that knows this adapter.
+// It is a field rather than an unwrap, so classification through the sidecar
+// error and the line it prints are both exactly what they were. A 400 is used
+// rather than a 5xx so the call is not retried: this is about the error the
+// first attempt produced.
+func TestSidecarErrorCarriesCause(t *testing.T) {
+	p, done := newProvider(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]any{"error": "video_id is required", "code": "invalid-request"})
+	})
+	defer done()
+
+	_, err := p.ProvidePlayerContext(context.Background(), "VID")
+	sre := sidecarResponseErr(t, err)
+	apiErr, ok := errors.AsType[*client.APIError](sre.Cause)
+	if !ok {
+		t.Fatalf("Cause = %#v, want the *client.APIError the client returned", sre.Cause)
 	}
-	// The daemon does send it, so the only thing missing is somewhere to put it.
-	if _, ok := reflect.TypeOf(client.PlayerContext{}).FieldByName("UserAgent"); !ok {
-		t.Error("client.PlayerContext lost its UserAgent field; /player-context exports user_agent")
+	if apiErr.Path != "/player-context" || !apiErr.Envelope {
+		t.Errorf("cause = %+v, want the daemon's own player-context envelope", apiErr)
+	}
+	if _, ok := errors.AsType[*client.APIError](err); ok {
+		t.Error("errors.AsType reached the cause through the sidecar error")
+	}
+	bare := *sre
+	bare.Cause = nil
+	if sre.Error() != bare.Error() {
+		t.Errorf("Error() = %q, want the same line as without a Cause (%q)", sre.Error(), bare.Error())
+	}
+
+	// A body that was not the daemon's envelope holds raw bytes from whatever
+	// answered instead. Reason already refuses to echo them; Cause must not carry
+	// them out of this package by another route.
+	p2, done2 := newProvider(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte("<html>proxy at internal-host.corp: session=SUPERSECRET</html>"))
+	})
+	defer done2()
+	_, err = p2.ProvidePlayerContext(context.Background(), "VID")
+	if cause := sidecarResponseErr(t, err).Cause; cause != nil {
+		t.Errorf("Cause = %#v, want nil: the body was not the daemon's envelope", cause)
 	}
 }

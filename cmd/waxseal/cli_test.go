@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -46,6 +47,41 @@ func TestGenerateRequiresBinding(t *testing.T) {
 	}
 	if out.String() != "{}\n" {
 		t.Errorf("stdout = %q, want %q", out.String(), "{}\n")
+	}
+}
+
+// pflag reads the shorthand form "-c=" as the value "=", so the binding a
+// caller thought was empty becomes a one-character one and the daemon mints
+// against it.
+func TestGenerateShorthandEqualsIsUsageError(t *testing.T) {
+	code, stdout, stderr := runCLI("-c=")
+	if code != 2 {
+		t.Errorf("exit = %d, want 2 (stderr=%q)", code, stderr)
+	}
+	if stdout != "{}\n" {
+		t.Errorf("stdout = %q, want %q (the bgutil contract holds for every failure)", stdout, "{}\n")
+	}
+	if !strings.Contains(stderr, "-c=") {
+		t.Errorf("stderr = %q, want it to name the shorthand form", stderr)
+	}
+}
+
+// A one-shot mint logs at warn, so the things a caller should act on reach
+// stderr: an ignored WAXSEAL_UA_HINTS, a fallback-only token, the profile
+// reaper. This is the only test in the package that may trigger the UA-hints
+// warning, which internal/browser guards with a process-wide sync.Once.
+func TestGenerateWarnsAtDefaultLevel(t *testing.T) {
+	t.Setenv("WAXSEAL_CHROME_BIN", filepath.Join(t.TempDir(), "missing"))
+	t.Setenv("WAXSEAL_UA_HINTS", "banana")
+	code, _, stderr := runCLI("-c", "aqz-KE-bpKQ")
+	if code != 1 {
+		t.Errorf("exit = %d, want 1 (stderr=%q)", code, stderr)
+	}
+	if !strings.Contains(stderr, "ignoring WAXSEAL_UA_HINTS") {
+		t.Errorf("stderr = %q, want the ignored-variable warning. "+
+			"internal/browser guards it with a process-wide sync.Once, so if another "+
+			"test in this package now sets an unrecognised WAXSEAL_UA_HINTS, it spent "+
+			"the warning before this ran", stderr)
 	}
 }
 
@@ -201,65 +237,108 @@ func TestBindListenerBracketedIPv6(t *testing.T) {
 	}
 }
 
-func TestIsExposedHost(t *testing.T) {
-	for _, h := range []string{"localhost", "127.0.0.1", "::1", "[::1]"} {
-		if isExposedHost(h) {
-			t.Errorf("isExposedHost(%q) = true, want false (loopback)", h)
+// The listener's own address is what decides exposure: "LOCALHOST" and a host
+// name both resolve before the bind, and 0.0.0.0 binds dual-stack.
+func TestIsExposedAddr(t *testing.T) {
+	addr := func(ip string) *net.TCPAddr { return &net.TCPAddr{IP: net.ParseIP(ip), Port: 4416} }
+	for _, ip := range []string{"127.0.0.1", "127.0.1.1", "::1"} {
+		if isExposedAddr(addr(ip)) {
+			t.Errorf("isExposedAddr(%q) = true, want false (loopback)", ip)
 		}
 	}
-	for _, h := range []string{"0.0.0.0", "::", "[::]", "192.168.1.5", "[2001:db8::1]", "example.com", ""} {
-		if !isExposedHost(h) {
-			t.Errorf("isExposedHost(%q) = false, want true (exposed)", h)
+	for _, ip := range []string{"0.0.0.0", "::", "192.168.1.5", "2001:db8::1"} {
+		if !isExposedAddr(addr(ip)) {
+			t.Errorf("isExposedAddr(%q) = false, want true (exposed)", ip)
 		}
 	}
 }
 
 // TestWarnKeylessExposure checks that the guest-identity warning is emitted only
-// for keyless daemons bound to an exposed address.
+// for keyless daemons bound to an exposed address, and that it names the address
+// the daemon actually bound.
 func TestWarnKeylessExposure(t *testing.T) {
 	cases := []struct {
 		keyed    bool
-		host     string
+		ip       string
 		wantWarn bool
 	}{
 		{false, "0.0.0.0", true},    // keyless and exposed
 		{false, "::", true},         // keyless and exposed through IPv6 any
 		{false, "127.0.0.1", false}, // loopback stays local
-		{false, "localhost", false}, // loopback name stays local
+		{false, "::1", false},       // IPv6 loopback stays local
 		{true, "0.0.0.0", false},    // keys protect exposed hosts
 	}
 	for _, tt := range cases {
 		var buf bytes.Buffer
-		warnKeylessExposure(slog.New(slog.NewTextHandler(&buf, nil)), tt.keyed, tt.host)
+		a := &net.TCPAddr{IP: net.ParseIP(tt.ip), Port: 4416}
+		warnKeylessExposure(slog.New(slog.NewTextHandler(&buf, nil)), tt.keyed, a)
 		warned := strings.Contains(buf.String(), "keyless daemon exposes")
 		if warned != tt.wantWarn {
-			t.Errorf("warnKeylessExposure(keyed=%v, host=%q): warned=%v, want %v (log=%q)",
-				tt.keyed, tt.host, warned, tt.wantWarn, buf.String())
+			t.Errorf("warnKeylessExposure(keyed=%v, addr=%q): warned=%v, want %v (log=%q)",
+				tt.keyed, tt.ip, warned, tt.wantWarn, buf.String())
+		}
+		if warned && !strings.Contains(buf.String(), "addr="+a.String()) {
+			t.Errorf("log = %q, want it to name the bound address", buf.String())
 		}
 	}
 }
 
+// clearServerEnv removes every environment variable the server command reads, so
+// a test sees only what it passes and configuration parsing reaches the step it
+// is about regardless of the caller's environment. The variables are removed
+// rather than emptied, because an empty value is a meaningful one for the three
+// duration settings.
+func clearServerEnv(t *testing.T) {
+	t.Helper()
+	for _, name := range []string{
+		"WAXSEAL_STREAMING_MAX_AGE", "WAXSEAL_REPORT_DEBOUNCE", "WAXSEAL_SHUTDOWN_TIMEOUT",
+		"WAXSEAL_MINT_SEPARATION",
+		"WAXSEAL_TENANT_KEYS", "WAXSEAL_TENANT_KEYS_FILE",
+		"WAXSEAL_METRICS_KEY", "WAXSEAL_METRICS_KEY_FILE",
+	} {
+		// t.Setenv has no unset form, but it is what records the restore and marks
+		// the test as unsafe for t.Parallel, so it runs first and the unset follows.
+		t.Setenv(name, "")
+		if err := os.Unsetenv(name); err != nil {
+			t.Fatalf("unset %s: %v", name, err)
+		}
+	}
+}
+
+// keyFile writes content to a scratch file and returns its path.
+func keyFile(t *testing.T, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "secret")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write key file: %v", err)
+	}
+	return path
+}
+
 func TestServerInvalidPortUsageError(t *testing.T) {
-	// Ensure configuration parsing reaches bindListener regardless of the caller's
-	// environment.
-	t.Setenv("WAXSEAL_STREAMING_MAX_AGE", "")
-	t.Setenv("WAXSEAL_REPORT_DEBOUNCE", "")
-	t.Setenv("WAXSEAL_SHUTDOWN_TIMEOUT", "")
-	code, _, stderr := runCLI("server", "--port", "99999999")
+	clearServerEnv(t)
+	code, stdout, stderr := runCLI("server", "--port", "99999999")
 	if code != 2 {
 		t.Errorf("exit = %d, want 2 (stderr=%q)", code, stderr)
 	}
 	if !strings.Contains(stderr, "invalid --port") {
 		t.Errorf("stderr = %q, want it to mention the invalid port", stderr)
 	}
+	// Configuration is decided before anything is announced, so the refusal is
+	// the first thing in the log rather than the end of a startup narration.
+	first, _, _ := strings.Cut(stdout, "\n")
+	if !strings.Contains(first, "startup: invalid configuration") {
+		t.Errorf("first log line = %q, want the configuration refusal", first)
+	}
+	if before, _, found := strings.Cut(stdout, "startup: invalid configuration"); found && strings.Contains(before, "streaming-max-age set") {
+		t.Errorf("log = %q, want no settings announced before the refusal", stdout)
+	}
 }
 
 // Invalid tenant-key configurations are usage errors. Error messages must not
 // reveal API keys.
 func TestServerInvalidTenantKeysUsageError(t *testing.T) {
-	t.Setenv("WAXSEAL_STREAMING_MAX_AGE", "")
-	t.Setenv("WAXSEAL_REPORT_DEBOUNCE", "")
-	t.Setenv("WAXSEAL_SHUTDOWN_TIMEOUT", "")
+	clearServerEnv(t)
 	for _, tc := range []struct {
 		name, keys, wantMsg string
 	}{
@@ -300,9 +379,7 @@ func TestServerMetricsFlagsParse(t *testing.T) {
 // A --metrics-key equal to a tenant key is a usage error (exit 2). The message
 // names the colliding tenant label and never leaks key material.
 func TestServerMetricsKeyCollisionUsageError(t *testing.T) {
-	t.Setenv("WAXSEAL_STREAMING_MAX_AGE", "")
-	t.Setenv("WAXSEAL_REPORT_DEBOUNCE", "")
-	t.Setenv("WAXSEAL_SHUTDOWN_TIMEOUT", "")
+	clearServerEnv(t)
 	code, _, stderr := runCLI("server", "--tenant-keys", "alice=KEYA,bob=KEYB", "--metrics-key", "KEYA")
 	if code != 2 {
 		t.Errorf("exit = %d, want 2 (stderr=%q)", code, stderr)
@@ -315,6 +392,251 @@ func TestServerMetricsKeyCollisionUsageError(t *testing.T) {
 	}
 	if strings.Contains(stderr, "KEYA") || strings.Contains(stderr, "KEYB") {
 		t.Errorf("stderr leaks key material: %q", stderr)
+	}
+}
+
+// Tenant keys reach the daemon from a flag, a file flag, or either environment
+// variable, flags outranking envs, and a tier that sets both its value and its
+// file is refused rather than picking one. Every arm carries key material a
+// duplicate label makes unusable, so the daemon names the source it read and
+// exits 2 before it binds or launches anything.
+func TestServerTenantKeySources(t *testing.T) {
+	clearServerEnv(t)
+	const (
+		fromA = "dupA=K1,dupA=K2" // parses to: duplicate tenant label "dupA"
+		fromB = "dupB=K1,dupB=K2"
+	)
+	for _, tc := range []struct {
+		name    string
+		args    []string
+		env     map[string]string
+		file    string // written to a scratch file the args or env may name
+		want    []string
+		notWant []string
+	}{
+		{
+			name: "the flag is read",
+			args: []string{"--tenant-keys", fromA},
+			want: []string{`duplicate tenant label "dupA"`},
+		},
+		{
+			name: "the file flag is read",
+			file: fromA,
+			args: []string{"--tenant-keys-file", "$FILE"},
+			want: []string{`duplicate tenant label "dupA"`},
+		},
+		{
+			name: "the value env is read",
+			env:  map[string]string{"WAXSEAL_TENANT_KEYS": fromA},
+			want: []string{`duplicate tenant label "dupA"`},
+		},
+		{
+			name: "the file env is read",
+			file: fromA,
+			env:  map[string]string{"WAXSEAL_TENANT_KEYS_FILE": "$FILE"},
+			want: []string{`duplicate tenant label "dupA"`},
+		},
+		{
+			name:    "a flag outranks an env",
+			args:    []string{"--tenant-keys", fromA},
+			env:     map[string]string{"WAXSEAL_TENANT_KEYS": fromB},
+			want:    []string{"dupA"},
+			notWant: []string{"dupB"},
+		},
+		{
+			// A compose file that leaves a variable blank has said nothing, so the
+			// file beside it wins instead of colliding with it.
+			name: "a blank value env leaves the file env alone",
+			file: fromA,
+			env:  map[string]string{"WAXSEAL_TENANT_KEYS": "", "WAXSEAL_TENANT_KEYS_FILE": "$FILE"},
+			want: []string{`duplicate tenant label "dupA"`},
+		},
+		{
+			name: "a trailing newline is not part of the value",
+			file: fromA + "\n",
+			args: []string{"--tenant-keys-file", "$FILE"},
+			want: []string{`duplicate tenant label "dupA"`},
+		},
+		{
+			name: "the flag and its file are mutually exclusive",
+			file: fromB,
+			args: []string{"--tenant-keys", fromA, "--tenant-keys-file", "$FILE"},
+			want: []string{"--tenant-keys", "--tenant-keys-file", "mutually exclusive"},
+		},
+		{
+			name: "the two envs are mutually exclusive",
+			file: fromB,
+			env:  map[string]string{"WAXSEAL_TENANT_KEYS": fromA, "WAXSEAL_TENANT_KEYS_FILE": "$FILE"},
+			want: []string{"WAXSEAL_TENANT_KEYS", "WAXSEAL_TENANT_KEYS_FILE", "mutually exclusive"},
+		},
+		{
+			name: "an empty file is refused",
+			file: "\n",
+			args: []string{"--tenant-keys-file", "$FILE"},
+			want: []string{"--tenant-keys-file", "is empty", "$FILE"},
+		},
+		{
+			// Whitespace is the same nothing a blank variable is, so the file
+			// beside it still wins.
+			name: "a whitespace-only value env counts as unset",
+			file: fromA,
+			env:  map[string]string{"WAXSEAL_TENANT_KEYS": "  ", "WAXSEAL_TENANT_KEYS_FILE": "$FILE"},
+			want: []string{`duplicate tenant label "dupA"`},
+		},
+		{
+			// A flag the operator typed is a choice, so a blank one is loud
+			// rather than a silent fall-through to the environment.
+			name: "a blank value flag is refused",
+			args: []string{"--tenant-keys", ""},
+			want: []string{"--tenant-keys is empty"},
+		},
+		{
+			name:    "a blank value flag does not silently win over the env",
+			args:    []string{"--tenant-keys", " "},
+			env:     map[string]string{"WAXSEAL_TENANT_KEYS": fromB},
+			want:    []string{"--tenant-keys is empty"},
+			notWant: []string{"dupB"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runKeySourceCase(t, "K1", "K2", tc.file, tc.args, tc.env, tc.want, tc.notWant)
+		})
+	}
+}
+
+// The metrics key reaches the daemon from the same four sources. Each arm names
+// a key that collides with a tenant key, so the refusal names the tenant label
+// the resolved value matched, which is what says which source was read: no other
+// path reports the value without serving traffic.
+func TestServerMetricsKeySources(t *testing.T) {
+	clearServerEnv(t)
+	const tenants = "alice=KEYA,bob=KEYB"
+	for _, tc := range []struct {
+		name    string
+		args    []string
+		env     map[string]string
+		file    string
+		want    []string
+		notWant []string
+	}{
+		{
+			name: "the flag is read",
+			args: []string{"--metrics-key", "KEYA"},
+			want: []string{"metrics key collides", "alice"},
+		},
+		{
+			name: "the file flag is read",
+			file: "KEYB",
+			args: []string{"--metrics-key-file", "$FILE"},
+			want: []string{"metrics key collides", "bob"},
+		},
+		{
+			name: "the value env is read",
+			env:  map[string]string{"WAXSEAL_METRICS_KEY": "KEYA"},
+			want: []string{"metrics key collides", "alice"},
+		},
+		{
+			name: "the file env is read",
+			file: "KEYB",
+			env:  map[string]string{"WAXSEAL_METRICS_KEY_FILE": "$FILE"},
+			want: []string{"metrics key collides", "bob"},
+		},
+		{
+			name:    "a flag outranks an env",
+			args:    []string{"--metrics-key", "KEYA"},
+			env:     map[string]string{"WAXSEAL_METRICS_KEY": "KEYB"},
+			want:    []string{"alice"},
+			notWant: []string{"bob"},
+		},
+		{
+			// The collision is an exact match, so a file that an editor wrapped in a
+			// newline or a byte-order mark only reaches it once both are gone. Left
+			// in, they give a key that matches nothing and explains nothing.
+			name: "surrounding whitespace and a BOM are not part of the value",
+			file: "\ufeff  KEYA\n",
+			args: []string{"--metrics-key-file", "$FILE"},
+			want: []string{"metrics key collides", "alice"},
+		},
+		{
+			name: "the flag and its file are mutually exclusive",
+			file: "KEYB",
+			args: []string{"--metrics-key", "KEYA", "--metrics-key-file", "$FILE"},
+			want: []string{"--metrics-key", "--metrics-key-file", "mutually exclusive"},
+		},
+		{
+			name: "the two envs are mutually exclusive",
+			file: "KEYB",
+			env:  map[string]string{"WAXSEAL_METRICS_KEY": "KEYA", "WAXSEAL_METRICS_KEY_FILE": "$FILE"},
+			want: []string{"WAXSEAL_METRICS_KEY", "WAXSEAL_METRICS_KEY_FILE", "mutually exclusive"},
+		},
+		{
+			name: "an empty file is refused",
+			file: "  \n",
+			args: []string{"--metrics-key-file", "$FILE"},
+			want: []string{"--metrics-key-file", "is empty", "$FILE"},
+		},
+		{
+			// Trimming is applied to every source, not only to a file.
+			name: "the flag value is trimmed",
+			args: []string{"--metrics-key", " KEYA "},
+			want: []string{"metrics key collides", "alice"},
+		},
+		{
+			name: "a metrics key with whitespace inside is refused",
+			args: []string{"--metrics-key", "KE YA"},
+			want: []string{"metrics key", "whitespace"},
+		},
+		{
+			name: "a blank metrics key flag is refused",
+			args: []string{"--metrics-key", ""},
+			want: []string{"--metrics-key is empty"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			args := append([]string{"--tenant-keys", tenants}, tc.args...)
+			runKeySourceCase(t, "KEYA", "KEYB", tc.file, args, tc.env, tc.want, tc.notWant)
+		})
+	}
+}
+
+// runKeySourceCase runs one key-source arm. A "$FILE" placeholder in args or env
+// is replaced with the scratch file's path, and the path is also substituted into
+// the wanted strings so an arm can require it by name. Every arm is expected to
+// exit 2 before the daemon binds or launches, and none of them may put key
+// material on stderr.
+func runKeySourceCase(t *testing.T, secretA, secretB, file string, args []string, env map[string]string, want, notWant []string) {
+	t.Helper()
+	path := ""
+	if file != "" {
+		path = keyFile(t, file)
+	}
+	fill := func(s string) string { return strings.ReplaceAll(s, "$FILE", path) }
+	for name, value := range env {
+		t.Setenv(name, fill(value))
+	}
+	cmdArgs := []string{"server"}
+	for _, a := range args {
+		cmdArgs = append(cmdArgs, fill(a))
+	}
+
+	code, _, stderr := runCLI(cmdArgs...)
+	if code != 2 {
+		t.Fatalf("exit = %d, want 2 (stderr=%q)", code, stderr)
+	}
+	for _, w := range want {
+		if !strings.Contains(stderr, fill(w)) {
+			t.Errorf("stderr = %q, want it to contain %q", stderr, fill(w))
+		}
+	}
+	for _, w := range notWant {
+		if strings.Contains(stderr, w) {
+			t.Errorf("stderr = %q, want it not to name %q: the other source won", stderr, w)
+		}
+	}
+	for _, secret := range []string{secretA, secretB} {
+		if strings.Contains(stderr, secret) {
+			t.Errorf("stderr leaks key material: %q", stderr)
+		}
 	}
 }
 
@@ -337,9 +659,7 @@ func TestValidateLandingVideo(t *testing.T) {
 
 // Every command validates its landing video before launching Chromium.
 func TestCommandsRejectInvalidLandingVideo(t *testing.T) {
-	t.Setenv("WAXSEAL_STREAMING_MAX_AGE", "")
-	t.Setenv("WAXSEAL_REPORT_DEBOUNCE", "")
-	t.Setenv("WAXSEAL_SHUTDOWN_TIMEOUT", "")
+	clearServerEnv(t)
 	for _, tc := range []struct {
 		name string
 		args []string
@@ -434,6 +754,48 @@ func TestMaybeWarnURLBinding(t *testing.T) {
 	}
 }
 
+// WAXSEAL_MINT_SEPARATION has no flag, but it is decided before startup like
+// the three duration flags: a value that does not parse stops the daemon rather
+// than warning past it after Chromium is already up.
+func TestResolveMintSeparation(t *testing.T) {
+	for _, tc := range []struct {
+		name, env string
+		want      time.Duration
+		wantErr   bool
+		wantLog   string
+	}{
+		{name: "unset", want: minter.DefaultMintSeparation, wantLog: "mint-separation set"},
+		{name: "explicit", env: "20s", want: 20 * time.Second, wantLog: "mint-separation set"},
+		{name: "unparseable", env: "banana", wantErr: true},
+		{name: "negative", env: "-1s", wantErr: true},
+		{name: "large", env: "5m", want: 5 * time.Minute, wantLog: "large"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("WAXSEAL_MINT_SEPARATION", tc.env)
+			var buf bytes.Buffer
+			got, err := resolveMintSeparation(slog.New(slog.NewTextHandler(&buf, nil)))
+			if tc.wantErr {
+				if _, ok := errors.AsType[*usageError](err); !ok {
+					t.Fatalf("err = %v (%T), want a *usageError", err, err)
+				}
+				if !strings.Contains(err.Error(), "WAXSEAL_MINT_SEPARATION") {
+					t.Errorf("err = %q, want it to name the variable", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("err = %v, want nil", err)
+			}
+			if got != tc.want {
+				t.Errorf("mint separation = %v, want %v", got, tc.want)
+			}
+			if !strings.Contains(buf.String(), tc.wantLog) {
+				t.Errorf("log = %q, want it to contain %q", buf.String(), tc.wantLog)
+			}
+		})
+	}
+}
+
 // TestPingAddrSchemeGuard checks the --addr guard uses a scheme-only test, not
 // the broader watch-URL detector. A doubled scheme is a usage error rejected
 // before any network call; a bare host:port with a youtube.com host must pass the
@@ -461,14 +823,16 @@ func TestPingAddrSchemeGuard(t *testing.T) {
 
 // runPingGuard runs runPing with an already-cancelled context so a request that
 // clears the address guards fails immediately at the network call instead of
-// dialing. That isolates the guard behavior without a live server.
+// dialing. That isolates the guard behavior without a live server. It carries
+// the flag's own default, since nothing here binds the flags that would supply
+// one and a zero budget is its own usage error.
 func runPingGuard(t *testing.T, addr string) error {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	cmd := &cobra.Command{}
 	cmd.SetContext(ctx)
-	return runPing(cmd, &pingOpts{addr: addr})
+	return runPing(cmd, &pingOpts{addr: addr, timeout: pingTimeout})
 }
 
 // resolveSMA binds the flag before resolving it so Changed reflects command-line
@@ -660,9 +1024,10 @@ func TestResolveShutdownTimeout(t *testing.T) {
 	}
 }
 
-// The 60 second default has to cover first-session establishment (documented at
-// 10 to 30 seconds) with real headroom, or a routine stop under load goes back
-// to severing connections the way the bare 5 second literal it replaced did.
+// The 60 second default has to cover first-session establishment (documented as
+// typically under ten seconds) with real headroom, or a routine stop under load
+// goes back to severing connections the way the bare 5 second literal it
+// replaced did.
 func TestDefaultShutdownTimeoutCoversEstablishment(t *testing.T) {
 	if defaultShutdownTimeout < 45*time.Second {
 		t.Errorf("defaultShutdownTimeout = %v, want at least 45s", defaultShutdownTimeout)
@@ -737,6 +1102,20 @@ func TestDoctorLandingURLRequiresStopAfterLoad(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "--landing-url needs --stop-after-load") {
 		t.Errorf("stderr = %q, want it to name the missing flag", stderr)
+	}
+	// A blank value is a typo or an unset variable, not a request for the
+	// default: with or without --stop-after-load, it is refused before launch.
+	for _, args := range [][]string{
+		{"doctor", "--landing-url", ""},
+		{"doctor", "--stop-after-load", "--landing-url", ""},
+	} {
+		code, _, stderr := runCLI(args...)
+		if code != 2 {
+			t.Errorf("%v: exit = %d, want 2 (stderr=%q)", args, code, stderr)
+		}
+		if !strings.Contains(stderr, "--landing-url is empty") {
+			t.Errorf("%v: stderr = %q, want it to name the empty flag", args, stderr)
+		}
 	}
 }
 
