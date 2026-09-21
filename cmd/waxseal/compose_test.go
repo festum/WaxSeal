@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/colespringer/waxseal/internal/readmedoc"
+	"github.com/festum/waxseal/internal/readmedoc"
 )
 
 // TestREADMEEmbedsComposeFile holds the compose block the README's quick start
