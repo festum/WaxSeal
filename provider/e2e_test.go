@@ -4,6 +4,7 @@ package provider_test
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -12,11 +13,13 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/festum/waxseal/client"
 	"github.com/festum/waxseal/provider"
@@ -29,7 +32,8 @@ import (
 // names an external daemon, each test starts a fresh daemon and browser session.
 // All video IDs are freely licensed: Big Buck Bunny and Tears of Steel under
 // Creative Commons (Blender Foundation); the NASA clip is U.S.-government public
-// domain. The long videos exist only to seek past the status-2 preview cap.
+// domain. The long videos run well past the status-2 preview cap, so a capped
+// stream shows as a truncation.
 const (
 	bbbVideoID      = "aqz-KE-bpKQ" // Big Buck Bunny (Blender, CC-BY), approximately 635 seconds
 	bbbURL          = "https://www.youtube.com/watch?v=" + bbbVideoID
@@ -43,11 +47,9 @@ const (
 	clientWeb        = "WEB"         // info.Client for the plain WEB chain
 )
 
-// startColdDaemon uses WAXSEAL_URL when set. Otherwise, it starts an isolated
-// keyless daemon and warms one session.
-//
-// The in-process path omits SelfTest so the first endpoint call exercises on-demand
-// establishment.
+// startColdDaemon uses WAXSEAL_URL when set. Otherwise it starts an isolated
+// keyless daemon and warms one session, without SelfTest, so the first endpoint
+// call exercises on-demand establishment.
 func startColdDaemon(t *testing.T) string {
 	t.Helper()
 	if ext := os.Getenv("WAXSEAL_URL"); ext != "" {
@@ -71,12 +73,10 @@ func startColdDaemon(t *testing.T) string {
 // around the status-2 confirm path.
 const waxsealE2ELogLevelEnv = "WAXSEAL_E2E_LOG_LEVEL"
 
-// testDaemonLogger builds the in-process daemon's logger so its info-level
-// diagnostics, including the status-2 confirm outcome logged around the
-// preview-cap confirmation, reach "go test -v" output instead of server.New's
-// default discard logger. Every browser session the daemon launches shares this
-// logger, so both the warm-time proof and later per-request player-context calls
-// are covered.
+// testDaemonLogger routes the in-process daemon's logs, including the status-2
+// confirm outcome, to "go test -v" output instead of the server's default
+// discard logger. Every browser session the daemon launches shares it, so
+// warm-up and every later request log here.
 func testDaemonLogger(t *testing.T) *slog.Logger {
 	level := slog.LevelInfo
 	if strings.EqualFold(os.Getenv(waxsealE2ELogLevelEnv), "debug") {
@@ -87,16 +87,11 @@ func testDaemonLogger(t *testing.T) *slog.Logger {
 	return slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: level}))
 }
 
-// testLogWriter adapts an io.Writer to t.Log, so each slog record becomes one
-// test log line instead of going to the default discard handler. Writing through
-// t.Log from a goroutine other than the test's own is safe as long as it happens
-// before the test function returns; every write here happens inside a handler for
-// a request the test is still synchronously waiting on, or during Warm, which the
-// test also calls synchronously, so that normally holds. close is registered with
-// t.Cleanup as a last-resort guard: once closed is set, Write drops the record
-// instead of calling t.Log, so a daemon goroutine that logs after the test has
-// already returned can never panic the test binary. close also waits for any
-// Write already inside t.Log, so it cannot return while one is in flight.
+// testLogWriter is an io.Writer over t.Log, so each slog record becomes one
+// test log line. Calling t.Log after the test returns panics. The daemon
+// normally logs while the test waits on Warm or a request; close, registered
+// with t.Cleanup, covers a goroutine that logs later: once closed is set, Write
+// drops the record, and close waits for any Write already inside t.Log.
 type testLogWriter struct {
 	t *testing.T
 
@@ -111,8 +106,7 @@ func (w *testLogWriter) close() {
 }
 
 func (w *testLogWriter) Write(p []byte) (int, error) {
-	// The lock is held across t.Log, not just the closed check: releasing it first
-	// would let close observe an unset flag, return, and allow the test to finish
+	// Hold the lock across t.Log, not only the check, so close cannot return
 	// while this call is still on its way into t.Log.
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -124,20 +118,17 @@ func (w *testLogWriter) Write(p []byte) (int, error) {
 }
 
 // newInProcessDaemon binds a loopback listener and registers server cleanup. The
-// listener comes back open, for the caller to hand to srv.Serve: the caller
-// warms the daemon first, and a warm-up that fails does so before Serve has
-// taken ownership, which is why the close is a cleanup here. Holding the port
-// from the start also means nothing else can take it between selection and
-// serving.
+// listener comes back open for the caller to hand to srv.Serve after warming;
+// its close is a cleanup here because a failed warm-up returns before Serve
+// owns it. Holding the port from the start keeps anything else from taking it.
 func newInProcessDaemon(t *testing.T, cfg server.Config) (*server.Server, string, net.Listener) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("grab free port: %v", err)
 	}
-	// Registered before the server's own cleanup, so it runs after it: Shutdown
-	// drains first, and this is the no-op close that follows unless Serve never
-	// ran.
+	// Registered before the server's cleanup, so it runs after Shutdown; it is a
+	// no-op unless Serve never ran.
 	t.Cleanup(func() { _ = ln.Close() })
 	addr := ln.Addr().String()
 
@@ -157,12 +148,10 @@ func newInProcessDaemon(t *testing.T, cfg server.Config) (*server.Server, string
 	return srv, addr, ln
 }
 
-// waitDaemonReady waits for the server goroutine to start serving.
-//
-// Each attempt carries its own timeout because the listener is already bound
-// when this runs: a request that arrives before Serve does is accepted into the
-// backlog and waits there rather than being refused, so without one the deadline
-// below could never be reached.
+// waitDaemonReady waits for the server goroutine to start serving. Each attempt
+// has its own timeout: the listener is already bound, so a request sent before
+// Serve starts waits in the backlog instead of being refused, and without one
+// the deadline below would never be reached.
 func waitDaemonReady(t *testing.T, base string) {
 	t.Helper()
 	hc := &http.Client{Timeout: time.Second}
@@ -197,14 +186,10 @@ func classifyStream(n, contentLength int64) string {
 
 // streamWEBContext builds a WaxTap client over the attested player-context path
 // and streams videoURL to completion, reporting whether WaxTap fell back to
-// plain WEB and the consumer-reported warnings. io.Copy reports bytes copied
-// before an error alongside it, so n is the byte offset the stream reached
-// before a truncation (often the consumer's own error, which already names the
-// segment) stopped it. A copy error is reported here, with the byte offset,
-// contentLength, and consumer warnings together; ok reports whether the stream
-// completed without one, so a caller can skip requireFullLength's own floor
-// check on the same byte count instead of reporting the identical truncation a
-// second time.
+// plain WEB and the consumer's warnings. A copy error is reported here, with n
+// (the byte offset reached), contentLength, and the warnings, and leaves ok
+// false so the caller can skip requireFullLength instead of reporting the same
+// truncation twice.
 func streamWEBContext(t *testing.T, ctx context.Context, p *provider.Provider, sess *potoken.Session, videoURL string) (n int64, info waxtap.StreamInfo, fellBack bool, warnings []string, ok bool) {
 	t.Helper()
 	var fb atomic.Bool
@@ -250,9 +235,9 @@ func streamWEBContext(t *testing.T, ctx context.Context, p *provider.Provider, s
 	return
 }
 
-// describeWarnings renders the warnings streamWEBContext collected for a failure
-// message, or a placeholder when the caller never wired up an Events callback (so
-// nil does not read as "the consumer reported nothing").
+// describeWarnings renders collected warnings for a failure message. An empty
+// list reads "none captured", since a caller without an Events callback
+// collects nothing even when the consumer warned.
 func describeWarnings(warnings []string) string {
 	if len(warnings) == 0 {
 		return "warnings: none captured"
@@ -260,15 +245,15 @@ func describeWarnings(warnings []string) string {
 	return "warnings: " + strings.Join(warnings, "; ")
 }
 
-// requireFullLength asserts a long-video stream cleared the status-2 preview cap.
-// warnings is whatever streamWEBContext collected from the consumer during the
-// stream; a truncation failure names the byte offset reached, the contentLength
-// the consumer reported, and those warnings together, so the failure is readable
-// without rerunning under a debugger.
+// requireFullLength asserts a stream reached 98% of the consumer's
+// contentLength and cleared fullLengthFloor, which also covers an unknown
+// contentLength. A known contentLength under the floor, a short video, skips
+// the floor. A failure names the byte offset reached, contentLength, and the
+// warnings streamWEBContext collected.
 func requireFullLength(t *testing.T, n int64, info waxtap.StreamInfo, label string, warnings []string) {
 	t.Helper()
 	consumerReported := describeWarnings(warnings)
-	if n <= fullLengthFloor {
+	if n <= fullLengthFloor && (info.ContentLength <= 0 || info.ContentLength > fullLengthFloor) {
 		t.Errorf("%s: truncated at byte offset %d (<= %d floor); contentLength=%d; %s",
 			label, n, fullLengthFloor, info.ContentLength, consumerReported)
 	}
@@ -346,8 +331,7 @@ func TestSessionOnlyFullLengthHTTP(t *testing.T) {
 	if info.Client != clientWeb {
 		t.Errorf("info.Client = %q, want %q (plain WEB)", info.Client, clientWeb)
 	}
-	// This path streams through waxtap.New directly, with no Events callback, so
-	// there are no consumer-reported warnings to pass here.
+	// No Events callback on this path, so there are no warnings to pass.
 	requireFullLength(t, n, info, "session only", nil)
 	t.Logf("session only: %d bytes (%s; contentLength=%d)", n, classifyStream(n, info.ContentLength), info.ContentLength)
 }
@@ -373,7 +357,8 @@ func TestPlayerContextCrossVideoFullLengthHTTP(t *testing.T) {
 	t.Logf("cross-video player-context (%s): %d bytes (%s; contentLength=%d)", tearsVideoID, n, classifyStream(n, info.ContentLength), info.ContentLength)
 }
 
-// A short first request must not prevent a later long video from streaming fully.
+// A short first request must stream in full and must not keep a later long
+// video from streaming fully.
 func TestPlayerContextShortThenLongHTTP(t *testing.T) {
 	base := startColdDaemon(t)
 	p := provider.New(client.New(base, client.WithAPIKey(os.Getenv("WAXSEAL_KEY"))))
@@ -382,12 +367,19 @@ func TestPlayerContextShortThenLongHTTP(t *testing.T) {
 
 	// The short video ends before the preview cap.
 	t.Logf("short video stream start (wall clock): %s", time.Now().Format("2006-01-02T15:04:05.000Z07:00"))
-	nShort, infoShort, fellBackShort, warningsShort, _ := streamWEBContext(t, ctx, p, nil, shortURL)
+	nShort, infoShort, fellBackShort, warningsShort, okShort := streamWEBContext(t, ctx, p, nil, shortURL)
 	if fellBackShort {
 		t.Errorf("WEB player-context fell back for the short video")
 	}
-	if nShort <= 0 {
-		t.Errorf("short video streamed no bytes")
+	if okShort {
+		// Without a contentLength, requireFullLength would judge this ~1 MB video
+		// by the long-video floor, so name what is missing instead.
+		if infoShort.ContentLength <= 0 {
+			t.Errorf("short video first: contentLength unknown, so full length cannot be checked (%d bytes streamed); %s",
+				nShort, describeWarnings(warningsShort))
+		} else {
+			requireFullLength(t, nShort, infoShort, "short video first", warningsShort)
+		}
 	}
 	t.Logf("short video first: %d bytes (%s; contentLength=%d; warnings=%v)", nShort, classifyStream(nShort, infoShort.ContentLength), infoShort.ContentLength, warningsShort)
 
@@ -407,8 +399,7 @@ func TestLazyTenantFirstCallFullLengthHTTP(t *testing.T) {
 		t.Skip("lazy-tenant test requires an in-process daemon")
 	}
 	const warmKey, lazyKey = "KEYWARM", "KEYLAZY"
-	// TenantKeys maps API key to tenant label (see server.Config), so key the map by
-	// the API key, not the label.
+	// TenantKeys maps API key to tenant label, not the reverse.
 	srv, addr, ln := newInProcessDaemon(t, server.Config{TenantKeys: map[string]string{warmKey: "warm", lazyKey: "lazy"}})
 	warmCtx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	if err := srv.Warm(warmCtx, warmKey); err != nil { // warm only the "warm" tenant
@@ -476,12 +467,12 @@ func TestPlayerContextUnavailableFastHTTP(t *testing.T) {
 	c := client.New(base, client.WithAPIKey(os.Getenv("WAXSEAL_KEY")))
 
 	// call measures a request made with an independent deadline.
-	call := func(videoID string, d time.Duration) (*client.PlayerContext, error, time.Duration) {
+	call := func(videoID string, d time.Duration) (*client.PlayerContext, time.Duration, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), d)
 		defer cancel()
 		start := time.Now()
 		pc, err := c.PlayerContext(ctx, videoID)
-		return pc, err, time.Since(start)
+		return pc, time.Since(start), err
 	}
 
 	requireUnavailable := func(t *testing.T, err error) {
@@ -508,9 +499,8 @@ func TestPlayerContextUnavailableFastHTTP(t *testing.T) {
 
 	before := readEscalationMetrics(t, base)
 
-	// Allow time for first-use establishment while still detecting the old
-	// relaunch path, which took about 80 seconds.
-	_, err, elapsed := call(deadID, 60*time.Second)
+	// 60 s fits first-use establishment; the slow relaunch path takes about 80 s.
+	_, elapsed, err := call(deadID, 60*time.Second)
 	requireUnavailable(t, err)
 	t.Logf("dead id returned 422 in %v", elapsed)
 
@@ -533,16 +523,15 @@ func TestPlayerContextUnavailableFastHTTP(t *testing.T) {
 		t.Errorf("player_context_failures did not increase from %d to %d", before.PlayerContextFailures, after.PlayerContextFailures)
 	}
 
-	// A repeat request should be served from the negative cache. Both counters are
-	// read from one scrape on each side of that single call, so the window they
-	// describe is the repeat and nothing else. Reusing the earlier snapshot for
-	// player_context_failures instead would straddle the assertions above and
-	// blame the counter split for any unrelated traffic on a shared daemon.
+	// A repeat should be served from the negative cache. Both counters come from
+	// one scrape on each side of that single call, so their window is the repeat
+	// alone; reusing the earlier snapshot would blame the counter split for any
+	// unrelated traffic on a shared daemon.
 	beforeRepeat := readMetrics(t, base)
 	negBefore := beforeRepeat.counter(t, "player_context_negative_cache_hits")
 	pcfBefore := beforeRepeat.counter(t, "player_context_failures")
 
-	_, err2, elapsed2 := call(deadID, 10*time.Second)
+	_, elapsed2, err2 := call(deadID, 10*time.Second)
 	requireUnavailable(t, err2)
 	if elapsed2 > 2*time.Second {
 		t.Errorf("negative-cache repeat took %v, want near-instant", elapsed2)
@@ -558,7 +547,7 @@ func TestPlayerContextUnavailableFastHTTP(t *testing.T) {
 	}
 
 	// A valid ID immediately afterward must still establish.
-	pc, err3, _ := call(bbbVideoID, 90*time.Second)
+	pc, _, err3 := call(bbbVideoID, 90*time.Second)
 	if err3 != nil {
 		t.Fatalf("good id after dead id: %v", err3)
 	}
@@ -567,73 +556,327 @@ func TestPlayerContextUnavailableFastHTTP(t *testing.T) {
 	}
 }
 
-// TestPlayerContextMetadataLive checks that the metadata WaxTap asked for
-// arrives from a real player response, not just from the wire structs. The
-// landing page is the watch page, so the player's own /player response is a WEB
-// response and carries a microformat; the publish-date assertion still hedges,
-// because a response without one is legal and leaves the field empty.
-func TestPlayerContextMetadataLive(t *testing.T) {
+// multitrackVideoEnv names a video with several audio tracks for
+// TestPlayerContextFieldsHTTP's multitrack subtest. The suite's freely licensed
+// videos have one track each, and the labels WaxTap ranks the original track by
+// only appear on a multi-track video, so the operator supplies one.
+const multitrackVideoEnv = "WAXSEAL_E2E_MULTITRACK_VIDEO"
+
+// TestPlayerContextFieldsHTTP checks real contexts, as the provider hands them
+// to WaxTap, against what WaxTap consumes: one subtest per concern, on one
+// daemon. The first subtest that needs the Big Buck Bunny context fetches it,
+// so a focused multitrack run skips that fetch and a Big Buck Bunny failure
+// stays in its own subtests. The player's /player response on the watch page
+// is a WEB response and carries a microformat, but a response without one is
+// legal, so the publish-date check accepts an empty field.
+func TestPlayerContextFieldsHTTP(t *testing.T) {
 	base := startColdDaemon(t)
-	c := client.New(base, client.WithAPIKey(os.Getenv("WAXSEAL_KEY")))
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	p := provider.New(client.New(base, client.WithAPIKey(os.Getenv("WAXSEAL_KEY"))))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	pc, err := c.PlayerContext(ctx, bbbVideoID)
-	if err != nil {
-		t.Fatalf("PlayerContext(%s): %v", bbbVideoID, err)
+	var (
+		bbbOnce sync.Once
+		bbbPC   potoken.PlayerContext
+		bbbErr  error
+	)
+	bbb := func(t *testing.T) potoken.PlayerContext {
+		t.Helper()
+		bbbOnce.Do(func() { bbbPC, bbbErr = p.ProvidePlayerContext(ctx, bbbVideoID) })
+		if bbbErr != nil {
+			t.Fatalf("ProvidePlayerContext(%s): %v", bbbVideoID, bbbErr)
+		}
+		return bbbPC
 	}
 
-	if !strings.HasPrefix(pc.ChannelID, "UC") {
-		t.Errorf("channel_id = %q, want the owner's UC... id", pc.ChannelID)
-	}
-	if pc.Description == "" {
-		t.Error("description is empty; videoDetails.shortDescription was not read")
-	}
-	if len(pc.Thumbnails) == 0 {
-		t.Error("thumbnails is empty; the ladder was not read")
-	}
-	for i, th := range pc.Thumbnails {
-		if th.URL == "" {
-			t.Errorf("thumbnails[%d] has no url", i)
+	// The metadata WaxTap asked for has to arrive from a real player response,
+	// not only from the wire structs.
+	t.Run("metadata", func(t *testing.T) {
+		pc := bbb(t)
+		if !strings.HasPrefix(pc.ChannelID, "UC") {
+			t.Errorf("channel_id = %q, want the owner's UC... id", pc.ChannelID)
 		}
-		if th.Width <= 0 || th.Height <= 0 {
-			t.Errorf("thumbnails[%d] = %dx%d, want positive dimensions", i, th.Width, th.Height)
+		if pc.Description == "" {
+			t.Error("description is empty; videoDetails.shortDescription was not read")
 		}
-	}
-	// Big Buck Bunny is an ordinary uploaded VOD, so all three flags are false.
-	if pc.IsLiveContent || pc.IsLiveNow || pc.IsUpcoming {
-		t.Errorf("live flags = %v/%v/%v, want all false for a VOD", pc.IsLiveContent, pc.IsLiveNow, pc.IsUpcoming)
-	}
-	switch {
-	case pc.PublishDate == "":
-		t.Log("publish_date is empty: this player response carried no microformat, which is legal; the field is documented as empty when absent")
-	default:
-		if _, err := time.Parse(time.RFC3339, pc.PublishDate); err != nil {
-			if _, dErr := time.Parse("2006-01-02", pc.PublishDate); dErr != nil {
-				t.Errorf("publish_date = %q parses as neither RFC 3339 (%v) nor 2006-01-02 (%v)", pc.PublishDate, err, dErr)
-			} else {
-				t.Logf("publish_date = %q (bare date)", pc.PublishDate)
+		if len(pc.Thumbnails) == 0 {
+			t.Error("thumbnails is empty; the ladder was not read")
+		}
+		for i, th := range pc.Thumbnails {
+			if th.URL == "" {
+				t.Errorf("thumbnails[%d] has no url", i)
 			}
-		} else {
-			t.Logf("publish_date = %q (RFC 3339)", pc.PublishDate)
+			if th.Width <= 0 || th.Height <= 0 {
+				t.Errorf("thumbnails[%d] = %dx%d, want positive dimensions", i, th.Width, th.Height)
+			}
+		}
+		// Big Buck Bunny is an ordinary uploaded VOD, so all three flags are false.
+		if pc.IsLiveContent || pc.IsLiveNow || pc.IsUpcoming {
+			t.Errorf("live flags = %v/%v/%v, want all false for a VOD", pc.IsLiveContent, pc.IsLiveNow, pc.IsUpcoming)
+		}
+		switch {
+		case pc.PublishDate == "":
+			t.Log("publish_date is empty: this player response carried no microformat, which is legal; the field is documented as empty when absent")
+		default:
+			if _, err := time.Parse(time.RFC3339, pc.PublishDate); err != nil {
+				if _, dErr := time.Parse("2006-01-02", pc.PublishDate); dErr != nil {
+					t.Errorf("publish_date = %q parses as neither RFC 3339 (%v) nor 2006-01-02 (%v)", pc.PublishDate, err, dErr)
+				} else {
+					t.Logf("publish_date = %q (bare date)", pc.PublishDate)
+				}
+			} else {
+				t.Logf("publish_date = %q (RFC 3339)", pc.PublishDate)
+			}
+		}
+		// The context's identity must be the one /session exports, or a consumer
+		// that streams under the context would present a different browser than
+		// the one the URL was issued to.
+		if pc.UserAgent == "" {
+			t.Error("user_agent is empty; the session identity was not carried onto the context")
+		}
+		sess, err := p.Session(ctx)
+		if err != nil {
+			t.Fatalf("Session: %v", err)
+		}
+		if pc.UserAgent != sess.UserAgent {
+			t.Errorf("user_agent = %q, want /session's %q", pc.UserAgent, sess.UserAgent)
+		}
+		if pc.ClientVersion != "" && sess.ClientVersion != "" && pc.ClientVersion != sess.ClientVersion {
+			t.Errorf("client_version = %q, want /session's %q", pc.ClientVersion, sess.ClientVersion)
+		}
+		t.Logf("metadata: channel_id=%s title=%q author=%q description_len=%d thumbnails=%d user_agent=%q",
+			pc.ChannelID, pc.Title, pc.Author, len(pc.Description), len(pc.Thumbnails), pc.UserAgent)
+	})
+
+	// audio_formats must carry what WaxTap's SABR selection reads (see
+	// checkFormats). Big Buck Bunny has one audio track, so no entry carries an
+	// audio role, but its itags have come in clean, DRC, and vb renditions, and
+	// the tags let the two-way drc check tell an untouched value from a
+	// rewritten one. A daemon that drops xtags from an is_drc rendition fails in
+	// checkFormats; a day with no tagged rendition has nothing to check and skips.
+	t.Run("formats", func(t *testing.T) {
+		pc := bbb(t)
+		tagged, drc := 0, 0
+		for i, pairs := range checkFormats(t, pc.AudioFormats) {
+			if pairs != nil {
+				tagged++
+			}
+			if pc.AudioFormats[i].IsDrc {
+				drc++
+			}
+		}
+		if tagged == 0 && drc == 0 {
+			t.Skip("no entry carries xtags or is_drc: this video offers no tagged rendition to check today")
+		}
+	})
+
+	// Original-track labeling only shows on a multi-track video. The daemon
+	// must name every entry's track and state the player's default flag; WaxTap,
+	// given the same context, must rank every track, find one original, and
+	// select it.
+	t.Run("multitrack", func(t *testing.T) {
+		id := os.Getenv(multitrackVideoEnv)
+		if id == "" {
+			t.Skipf("%s names no video with several audio tracks", multitrackVideoEnv)
+		}
+		pc, err := p.ProvidePlayerContext(ctx, id)
+		if err != nil {
+			t.Fatalf("ProvidePlayerContext(%s): %v", id, err)
+		}
+		tracks := make(map[string]int)
+		for _, f := range pc.AudioFormats {
+			if f.AudioTrackID != "" {
+				tracks[f.AudioTrackID]++
+			}
+		}
+		if len(tracks) < 2 {
+			t.Fatalf("%s names %s, which offers %d audio track(s) %v; this subtest needs a video with several", multitrackVideoEnv, id, len(tracks), tracks)
+		}
+		checkFormats(t, pc.AudioFormats)
+		defaults := 0
+		for i, f := range pc.AudioFormats {
+			if f.AudioTrackID == "" {
+				t.Errorf("audio_formats[%d] (itag %d) names no track on a multi-track video", i, f.Itag)
+			}
+			switch {
+			case f.AudioIsDefault == nil:
+				t.Errorf("audio_formats[%d] (itag %d, track %q) states no audio_is_default; the player marks every track of a multi-track video", i, f.Itag, f.AudioTrackID)
+			case *f.AudioIsDefault:
+				defaults++
+			}
+		}
+		if defaults == 0 {
+			t.Error("no entry states audio_is_default true; the player marks its default track and the daemon dropped it")
+		}
+
+		// WaxTap reads the audio role from xtags, falls back to the default flag,
+		// and selects by the result. It gets this context from memory, so its
+		// verdict is on the entries checked above, not a second fetch.
+		yt := youtube.New(youtube.Config{PlayerContextProvider: potoken.PlayerContextProviderFunc(
+			func(context.Context, string) (potoken.PlayerContext, error) { return pc, nil })})
+		ext, err := yt.ExtractWebContext(ctx, id)
+		if err != nil {
+			t.Fatalf("WaxTap rejected the context: %v", err)
+		}
+		formats := ext.Video().Formats
+		originals := make(map[string]int)
+		for i, f := range formats {
+			track := ""
+			if f.AudioTrack != nil {
+				track = f.AudioTrack.ID
+			}
+			switch f.IsOriginal {
+			case format.Unknown:
+				t.Errorf("WaxTap could not rank Formats[%d] (itag %d, track %q): neither xtags nor audio_is_default decided", i, f.Itag, track)
+			case format.Yes:
+				originals[track]++
+			}
+		}
+		if len(originals) != 1 {
+			t.Errorf("WaxTap ranks %d tracks as the original (%v), want exactly one", len(originals), originals)
+		}
+		idx, err := format.BestForTarget(formats, format.MinimizeLoss(), format.Target{})
+		if err != nil {
+			t.Fatalf("BestForTarget: %v", err)
+		}
+		if formats[idx].IsOriginal != format.Yes {
+			t.Errorf("selection picked Formats[%d] (itag %d, original %v), want the original track", idx, formats[idx].Itag, formats[idx].IsOriginal)
+		}
+		t.Logf("multitrack %s: %d entries over %d tracks, %d state default; WaxTap ranks %v as the original and selects itag %d",
+			id, len(pc.AudioFormats), len(tracks), defaults, originals, formats[idx].Itag)
+	})
+}
+
+// checkFormats runs the checks every context's audio_formats must pass and
+// returns each entry's decoded xtags pairs (nil for an entry with none). Each
+// (itag, lmt, xtags) triple must be unique, so a reload finds the rendition it
+// was streaming. xtags must be the player's value (see xtagsPairs), and its
+// drc=1 tag must mark exactly the entries is_drc marks, since WaxTap declares
+// DRC on the wire from is_drc. An entry without a track id states no default
+// flag, since the flag lives in the player's audioTrack.
+func checkFormats(t *testing.T, formats []potoken.PlayerContextFormat) []map[string]string {
+	t.Helper()
+	if len(formats) == 0 {
+		t.Fatal("audio_formats is empty")
+	}
+	type encoding struct {
+		itag       int
+		lmt, xtags string
+	}
+	seen := make(map[encoding]int)
+	decoded := make([]map[string]string, len(formats))
+	for i, f := range formats {
+		key := encoding{f.Itag, f.LMT, f.XTags}
+		if prev, dup := seen[key]; dup {
+			t.Errorf("audio_formats[%d] repeats the (itag, lmt, xtags) triple of audio_formats[%d]: %+v", i, prev, key)
+		}
+		seen[key] = i
+		if f.LMT == "" {
+			t.Errorf("audio_formats[%d] (itag %d) has no lmt", i, f.Itag)
+		}
+		if f.AudioTrackID == "" && f.AudioIsDefault != nil {
+			t.Errorf("audio_formats[%d] (itag %d) states audio_is_default=%v without a track id", i, f.Itag, *f.AudioIsDefault)
+		}
+		if f.XTags == "" {
+			if f.IsDrc {
+				t.Errorf("audio_formats[%d] (itag %d) has is_drc set but no xtags to carry the drc tag", i, f.Itag)
+			}
+			continue
+		}
+		pairs, err := xtagsPairs(f.XTags)
+		if err != nil {
+			t.Errorf("audio_formats[%d] (itag %d) xtags %q is not the player's value: %v", i, f.Itag, f.XTags, err)
+			continue
+		}
+		decoded[i] = pairs
+		t.Logf("audio_formats[%d]: itag %d lmt %s track %q xtags %s decodes to %v (is_drc=%v, audio_is_default=%s)",
+			i, f.Itag, f.LMT, f.AudioTrackID, f.XTags, pairs, f.IsDrc, stated(f.AudioIsDefault))
+		if drc := pairs["drc"] == "1"; drc != f.IsDrc {
+			t.Errorf("audio_formats[%d] (itag %d): xtags says drc=%q but is_drc is %v", i, f.Itag, pairs["drc"], f.IsDrc)
 		}
 	}
-	// The context's identity must be the one /session exports, or a consumer that
-	// streams under the context would present a different browser than the one the
-	// URL was issued to.
-	if pc.UserAgent == "" {
-		t.Error("user_agent is empty; the session identity was not carried onto the context")
+	return decoded
+}
+
+// stated renders a tri-state flag for a log line.
+func stated(b *bool) string {
+	if b == nil {
+		return "unstated"
 	}
-	sess, err := c.Session(ctx)
+	return strconv.FormatBool(*b)
+}
+
+// xtagsPairs decodes an xtags value as the contract states it: unpadded
+// base64url over a protobuf of repeated pairs (field 1, each {key=1, value=2}),
+// unknown fields skipped, and the first non-empty value of a repeated key kept,
+// as WaxTap keeps it. It is stricter than WaxTap, which accepts padding and
+// either alphabet, because it checks that the daemon passed the player's value
+// on untouched: SABR keys the rendition on those bytes, so a re-encoding WaxTap
+// could still read would cost the consumer a reload. The decoder skips CR and
+// LF, which the player never sends.
+func xtagsPairs(s string) (map[string]string, error) {
+	b, err := base64.RawURLEncoding.Strict().DecodeString(s)
 	if err != nil {
-		t.Fatalf("Session: %v", err)
+		return nil, err
 	}
-	if pc.UserAgent != sess.UserAgent {
-		t.Errorf("user_agent = %q, want /session's %q", pc.UserAgent, sess.UserAgent)
+	pairs := make(map[string]string)
+	for len(b) > 0 {
+		num, typ, n := protowire.ConsumeTag(b)
+		if n < 0 {
+			return nil, protowire.ParseError(n)
+		}
+		b = b[n:]
+		if num != 1 || typ != protowire.BytesType {
+			if n = protowire.ConsumeFieldValue(num, typ, b); n < 0 {
+				return nil, protowire.ParseError(n)
+			}
+			b = b[n:]
+			continue
+		}
+		pair, n := protowire.ConsumeBytes(b)
+		if n < 0 {
+			return nil, protowire.ParseError(n)
+		}
+		b = b[n:]
+		key, value, err := xtagsPair(pair)
+		if err != nil {
+			return nil, err
+		}
+		if pairs[key] == "" {
+			pairs[key] = value
+		}
 	}
-	if pc.ClientVersion != "" && sess.ClientVersion != "" && pc.ClientVersion != sess.ClientVersion {
-		t.Errorf("client_version = %q, want /session's %q", pc.ClientVersion, sess.ClientVersion)
+	return pairs, nil
+}
+
+// xtagsPair decodes one {key=1, value=2} pair.
+func xtagsPair(b []byte) (key, value string, err error) {
+	for len(b) > 0 {
+		num, typ, n := protowire.ConsumeTag(b)
+		if n < 0 {
+			return "", "", protowire.ParseError(n)
+		}
+		b = b[n:]
+		if (num != 1 && num != 2) || typ != protowire.BytesType {
+			if n = protowire.ConsumeFieldValue(num, typ, b); n < 0 {
+				return "", "", protowire.ParseError(n)
+			}
+			b = b[n:]
+			continue
+		}
+		v, n := protowire.ConsumeString(b)
+		if n < 0 {
+			return "", "", protowire.ParseError(n)
+		}
+		if !utf8.ValidString(v) {
+			return "", "", fmt.Errorf("field %d is not UTF-8: %q", num, v)
+		}
+		b = b[n:]
+		if num == 1 {
+			key = v
+		} else {
+			value = v
+		}
 	}
-	t.Logf("metadata: channel_id=%s title=%q author=%q description_len=%d thumbnails=%d user_agent=%q",
-		pc.ChannelID, pc.Title, pc.Author, len(pc.Description), len(pc.Thumbnails), pc.UserAgent)
+	return key, value, nil
 }
