@@ -24,10 +24,14 @@ jobs:
       - run: go build ./...
       - run: go vet ./...
       - run: go test -race ./...
-      # Install Chrome explicitly rather than rely on the runner image. In
-      # setup-chrome v2, "stable" is Chrome for Testing and floats, so a new
-      # release can move these tests; pin a version if determinism matters more.
-      # WAXSEAL_REQUIRE_CHROME fails on a missing browser instead of skipping.
+      # Real-Chromium CDP live tests. Install Chrome explicitly so a browser is
+      # guaranteed present, not incidental to the ubuntu-latest image. From the
+      # action's v2 on, the stable channel resolves to Chrome for Testing rather
+      # than the official Chrome build. It still floats, so a new stable release
+      # can legitimately move these tests. Pin a version here if deterministic CI
+      # matters more. The WAXSEAL_REQUIRE_CHROME hook makes a missing browser fail
+      # loudly instead of skipping. The tests drive a local Chromium over the pipe
+      # transport and need no network.
       - id: setup-chrome
         uses: browser-actions/setup-chrome@2e1d749697dd1612b833dba4a722266286fbefcd # v2.1.2
         with:
