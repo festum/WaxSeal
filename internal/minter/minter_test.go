@@ -160,13 +160,13 @@ func newTestMinterFull(mint func(id string) (browser.MintResult, error), playerC
 // TestMinterSingleFlightAttestation: many concurrent callers during one launch
 // coalesce into a single attestation.
 func TestMinterSingleFlightAttestation(t *testing.T) {
-	var launches int64
+	var launches atomic.Int64
 	var once sync.Once
 	launchStarted := make(chan struct{})
 	release := make(chan struct{})
 	m := newBareMinter(0, 0)
 	m.launch = func(context.Context) (minterSession, error) {
-		atomic.AddInt64(&launches, 1)
+		launches.Add(1)
 		once.Do(func() { close(launchStarted) })
 		<-release // hold the launch open so concurrent callers pile up
 		return &fakeSession{mint: func(string) (browser.MintResult, error) { return browser.MintResult{}, nil }}, nil
@@ -174,18 +174,16 @@ func TestMinterSingleFlightAttestation(t *testing.T) {
 
 	ctx := context.Background()
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() { defer wg.Done(); _ = m.Warm(ctx) }()
+	wg.Go(func() { _ = m.Warm(ctx) })
 	<-launchStarted // one launch is now in flight
-	for i := 0; i < 9; i++ {
-		wg.Add(1)
-		go func() { defer wg.Done(); _ = m.Warm(ctx) }()
+	for range 9 {
+		wg.Go(func() { _ = m.Warm(ctx) })
 	}
 	time.Sleep(50 * time.Millisecond) // let the 9 reach the single-flight wait
 	close(release)
 	wg.Wait()
 
-	if got := atomic.LoadInt64(&launches); got != 1 {
+	if got := launches.Load(); got != 1 {
 		t.Fatalf("launches = %d, want 1 (single-flight should coalesce)", got)
 	}
 	if got := m.metrics.Attestations.Load(); got != 1 {
@@ -198,9 +196,9 @@ func TestMinterSingleFlightAttestation(t *testing.T) {
 // "a 403-driven retry must not re-attest" guarantee). A new binding mints again
 // on the same session (still one attestation).
 func TestMinterCacheNoReattest(t *testing.T) {
-	var mints int64
+	var mints atomic.Int64
 	m, launches, _, _ := newTestMinter(func(id string) (browser.MintResult, error) {
-		atomic.AddInt64(&mints, 1)
+		mints.Add(1)
 		return browser.MintResult{Kind: "integrity", Token: "tok-" + id, TokenLen: 4, Identifier: id, Lifetime: 3600}, nil
 	})
 	ctx := context.Background()
@@ -220,14 +218,14 @@ func TestMinterCacheNoReattest(t *testing.T) {
 		t.Errorf("cached token = %q, want same as first %q", r2.Token, r1.Token)
 	}
 	// One mint, not two: the pre-mint alone satisfied both requests above.
-	if got := atomic.LoadInt64(&mints); got != 1 {
+	if got := mints.Load(); got != 1 {
 		t.Errorf("mints = %d, want 1 (the pre-mint; both requests asked for the pre-minted binding)", got)
 	}
 	// A different scope and binding mints again, but still on the one attestation.
 	if _, c3, _ := m.Mint(ctx, "player", "vid"); c3 {
 		t.Errorf("new binding should not be a cache hit")
 	}
-	if got := atomic.LoadInt64(&mints); got != 2 {
+	if got := mints.Load(); got != 2 {
 		t.Errorf("mints = %d, want 2 (pre-mint + the player/vid binding)", got)
 	}
 	if got := atomic.LoadInt64(launches); got != 1 {
@@ -321,14 +319,14 @@ func TestMinterStreamingRecycleNotOnTokenOnly(t *testing.T) {
 // TestMinterEscalationLadder: a mint that fails twice triggers one in-place retry
 // then a relaunch (re-attest) on a fresh session; the old session is closed.
 func TestMinterEscalationLadder(t *testing.T) {
-	var attempt int64
+	var attempt atomic.Int64
 	// Attempt 1 is the attestation pre-mint, 2 and 3 are the request's mint and
 	// its in-place retry, 4 is the relaunch's pre-mint, and 5 is the request's
 	// mint on the replacement. Mint does not recheck the cache after a relaunch,
 	// so 4 cannot serve the request either way; it fails so that 5 is visibly the
 	// attempt that produces the token.
 	m, launches, sessions, smu := newTestMinter(func(string) (browser.MintResult, error) {
-		if n := atomic.AddInt64(&attempt, 1); n <= 4 {
+		if n := attempt.Add(1); n <= 4 {
 			return browser.MintResult{}, fmt.Errorf("transient failure %d", n)
 		}
 		return browser.MintResult{Kind: "integrity", Token: "ok", Lifetime: 3600}, nil
@@ -370,9 +368,9 @@ func TestMinterEscalationLadder(t *testing.T) {
 // IP. A cache-missing request relaunches, and the generation bump invalidates
 // the old generation's cached tokens.
 func TestMinterCrashKeepsCacheThenRelaunchInvalidates(t *testing.T) {
-	var mints int64
+	var mints atomic.Int64
 	m, launches, sessions, smu := newTestMinter(func(id string) (browser.MintResult, error) {
-		n := atomic.AddInt64(&mints, 1)
+		n := mints.Add(1)
 		return browser.MintResult{Kind: "integrity", Token: fmt.Sprintf("tok%d", n), Lifetime: 3600}, nil
 	})
 	ctx := context.Background()
@@ -434,11 +432,11 @@ func TestMinterCrashKeepsCacheThenRelaunchInvalidates(t *testing.T) {
 // attested session without a fresh attestation. The URL depends on the browser's
 // provenance rather than a new mint.
 func TestMinterPlayerContextReusesWarmSession(t *testing.T) {
-	var calls int64
+	var calls atomic.Int64
 	m, launches, _, _ := newTestMinterFull(
 		func(string) (browser.MintResult, error) { return browser.MintResult{Lifetime: 3600}, nil },
 		func(videoID string) (browser.PlayerContext, error) {
-			atomic.AddInt64(&calls, 1)
+			calls.Add(1)
 			return browser.PlayerContext{
 				PlayabilityStatus:     "OK",
 				ServerAbrStreamingURL: "https://r1.googlevideo.com/videoplayback?n=scram-" + videoID,
@@ -462,7 +460,7 @@ func TestMinterPlayerContextReusesWarmSession(t *testing.T) {
 	if got := atomic.LoadInt64(launches); got != 1 {
 		t.Errorf("launches = %d, want 1 (player-context reuses the warm session)", got)
 	}
-	if got := atomic.LoadInt64(&calls); got != 1 {
+	if got := calls.Load(); got != 1 {
 		t.Errorf("player-context calls = %d, want 1", got)
 	}
 }
@@ -471,11 +469,11 @@ func TestMinterPlayerContextReusesWarmSession(t *testing.T) {
 // in-place retry then a relaunch+re-attest on a fresh session, mirroring the mint
 // escalation ladder; the failed session is closed.
 func TestMinterPlayerContextEscalation(t *testing.T) {
-	var attempt int64
+	var attempt atomic.Int64
 	m, launches, sessions, smu := newTestMinterFull(
 		func(string) (browser.MintResult, error) { return browser.MintResult{Lifetime: 3600}, nil },
 		func(string) (browser.PlayerContext, error) {
-			if n := atomic.AddInt64(&attempt, 1); n <= 2 {
+			if n := attempt.Add(1); n <= 2 {
 				return browser.PlayerContext{}, fmt.Errorf("transient failure %d", n)
 			}
 			return browser.PlayerContext{PlayabilityStatus: "OK", ServerAbrStreamingURL: "https://r/ok", VisitorData: "vd"}, nil
@@ -547,7 +545,7 @@ func TestMinterPlayerContextUnplayableNoEscalation(t *testing.T) {
 // known-unplayable video is served from the negative cache: the session's
 // PlayerContext is not called again (no mintMu, no eval).
 func TestMinterPlayerContextUnplayableNegativeCache(t *testing.T) {
-	var calls int64
+	var calls atomic.Int64
 	var logs bytes.Buffer
 	m := newBareMinter(0, 0)
 	m.log = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -555,7 +553,7 @@ func TestMinterPlayerContextUnplayableNegativeCache(t *testing.T) {
 		return &fakeSession{
 			mint: func(string) (browser.MintResult, error) { return browser.MintResult{Lifetime: 3600}, nil },
 			playerCtx: func(string) (browser.PlayerContext, error) {
-				atomic.AddInt64(&calls, 1)
+				calls.Add(1)
 				return browser.PlayerContext{}, &browser.UnplayableError{Status: "LOGIN_REQUIRED", Detail: "Private video"}
 			},
 		}, nil
@@ -570,7 +568,7 @@ func TestMinterPlayerContextUnplayableNegativeCache(t *testing.T) {
 	if _, _, err := m.PlayerContext(ctx, "vid"); !errors.Is(err, browser.ErrUnplayable) {
 		t.Fatalf("second: err = %v, want ErrUnplayable (from negative cache)", err)
 	}
-	if got := atomic.LoadInt64(&calls); got != 1 {
+	if got := calls.Load(); got != 1 {
 		t.Errorf("session PlayerContext calls = %d, want 1 (second served from negative cache)", got)
 	}
 	// The two refusals are counted apart: one real attempt against the browser,
@@ -589,7 +587,7 @@ func TestMinterPlayerContextUnplayableNegativeCache(t *testing.T) {
 	if got := strings.Count(logs.String(), "video unavailable; verdict cached"); got != 1 {
 		t.Errorf("verdict-cached lines = %d, want exactly 1 (log=%q)", got, logs.String())
 	}
-	for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+	for line := range strings.SplitSeq(strings.TrimSpace(logs.String()), "\n") {
 		if !strings.Contains(line, "video unavailable; verdict cached") {
 			continue
 		}
@@ -756,11 +754,11 @@ func TestMinterPlayerContextCancelNoEscalation(t *testing.T) {
 // confirmation failure gets one in-place retry and then a refusal, with no
 // relaunch, and that status2_rejections counts the request once.
 func TestMinterPlayerContextStatus2OneRetryNoRelaunch(t *testing.T) {
-	var calls int64
+	var calls atomic.Int64
 	m, launches, sessions, smu := newTestMinterFull(
 		func(string) (browser.MintResult, error) { return browser.MintResult{Lifetime: 3600}, nil },
 		func(string) (browser.PlayerContext, error) {
-			atomic.AddInt64(&calls, 1)
+			calls.Add(1)
 			return browser.PlayerContext{}, fmt.Errorf("%w: budget expired", browser.ErrStatus2Unconfirmed)
 		},
 	)
@@ -772,7 +770,7 @@ func TestMinterPlayerContextStatus2OneRetryNoRelaunch(t *testing.T) {
 	if err == nil || !errors.Is(err, browser.ErrStatus2Unconfirmed) {
 		t.Fatalf("err = %v, want ErrStatus2Unconfirmed", err)
 	}
-	if got := atomic.LoadInt64(&calls); got != 2 {
+	if got := calls.Load(); got != 2 {
 		t.Errorf("session PlayerContext calls = %d, want 2 (initial + one in-place retry)", got)
 	}
 	if got := atomic.LoadInt64(launches); got != 1 {
@@ -797,11 +795,11 @@ func TestMinterPlayerContextStatus2OneRetryNoRelaunch(t *testing.T) {
 // TestMinterPlayerContextStatus2TransientClears covers the recovery case: the
 // single in-place retry succeeds, with no relaunch and no rejection counted.
 func TestMinterPlayerContextStatus2TransientClears(t *testing.T) {
-	var calls int64
+	var calls atomic.Int64
 	m, launches, _, _ := newTestMinterFull(
 		func(string) (browser.MintResult, error) { return browser.MintResult{Lifetime: 3600}, nil },
 		func(string) (browser.PlayerContext, error) {
-			if n := atomic.AddInt64(&calls, 1); n == 1 {
+			if n := calls.Add(1); n == 1 {
 				return browser.PlayerContext{}, fmt.Errorf("%w: budget expired", browser.ErrStatus2Unconfirmed)
 			}
 			return browser.PlayerContext{PlayabilityStatus: "OK", ServerAbrStreamingURL: "https://r/ok", VisitorData: "vd"}, nil
@@ -833,11 +831,11 @@ func TestMinterPlayerContextStatus2TransientClears(t *testing.T) {
 // the in-place retry without relaunching Chromium. The error is not
 // negative-cached.
 func TestMinterPlayerContextIncompleteNoRelaunch(t *testing.T) {
-	var calls int64
+	var calls atomic.Int64
 	m, launches, sessions, smu := newTestMinterFull(
 		func(string) (browser.MintResult, error) { return browser.MintResult{Lifetime: 3600}, nil },
 		func(string) (browser.PlayerContext, error) {
-			atomic.AddInt64(&calls, 1)
+			calls.Add(1)
 			return browser.PlayerContext{}, fmt.Errorf("%w: no audio formats", browser.ErrIncompleteContext)
 		},
 	)
@@ -849,7 +847,7 @@ func TestMinterPlayerContextIncompleteNoRelaunch(t *testing.T) {
 	if err == nil || !errors.Is(err, browser.ErrIncompleteContext) {
 		t.Fatalf("err = %v, want ErrIncompleteContext", err)
 	}
-	if got := atomic.LoadInt64(&calls); got != 2 {
+	if got := calls.Load(); got != 2 {
 		t.Errorf("session PlayerContext calls = %d, want 2 (initial + one in-place retry)", got)
 	}
 	if got := atomic.LoadInt64(launches); got != 1 {
@@ -862,7 +860,7 @@ func TestMinterPlayerContextIncompleteNoRelaunch(t *testing.T) {
 	if _, _, err := m.PlayerContext(ctx, "vid"); !errors.Is(err, browser.ErrIncompleteContext) {
 		t.Fatalf("second request err = %v, want ErrIncompleteContext (not negative-cached)", err)
 	}
-	if got := atomic.LoadInt64(&calls); got != 4 {
+	if got := calls.Load(); got != 4 {
 		t.Errorf("session calls after a second request = %d, want 4 (not negative-cached)", got)
 	}
 	smu.Lock()
@@ -877,7 +875,7 @@ func TestMinterPlayerContextIncompleteNoRelaunch(t *testing.T) {
 // stays bounded and keeps the newest unplayable id.
 func TestMinterNegCacheBoundedEvicts(t *testing.T) {
 	m := newBareMinter(0, 0)
-	for i := 0; i < minterNegCacheMax; i++ {
+	for i := range minterNegCacheMax {
 		m.negCachePut(fmt.Sprintf("vid%05d", i), browser.ErrUnplayable)
 	}
 	if got := len(m.negCache); got != minterNegCacheMax {
@@ -896,13 +894,13 @@ func TestMinterNegCacheBoundedEvicts(t *testing.T) {
 // matching cachePut: only a new key may force an eviction.
 func TestMinterNegCacheRefreshNoEvict(t *testing.T) {
 	m := newBareMinter(0, 0)
-	for i := 0; i < minterNegCacheMax; i++ {
+	for i := range minterNegCacheMax {
 		m.negCachePut(fmt.Sprintf("vid%05d", i), browser.ErrUnplayable)
 	}
 	if got := len(m.negCache); got != minterNegCacheMax {
 		t.Fatalf("setup: negCache size = %d, want %d", got, minterNegCacheMax)
 	}
-	for i := 0; i < 8; i++ { // distinct existing keys; eviction order is randomized
+	for i := range 8 { // distinct existing keys; eviction order is randomized
 		m.negCachePut(fmt.Sprintf("vid%05d", i), browser.ErrUnplayable)
 		if got := len(m.negCache); got != minterNegCacheMax {
 			t.Fatalf("after refreshing an existing key, negCache size = %d, want %d (a live entry was evicted)", got, minterNegCacheMax)
@@ -915,7 +913,7 @@ func TestMinterNegCacheRefreshNoEvict(t *testing.T) {
 func TestMinterCacheBoundedEvicts(t *testing.T) {
 	m := newBareMinter(0, 0)
 	m.gen = 1 // production never caches at gen 0
-	for i := 0; i < minterCacheMax; i++ {
+	for i := range minterCacheMax {
 		m.cachePut(fmt.Sprintf("gvs|vd%05d", i), browser.MintResult{Lifetime: 3600}, m.gen)
 	}
 	if got := len(m.cache); got != minterCacheMax {
@@ -944,7 +942,7 @@ func TestMinterCacheEvictsNearestExpiry(t *testing.T) {
 	m.gen = 1
 	now := time.Now()
 	m.cache["gvs|soonest"] = cachedToken{gen: m.gen, expiry: now.Add(time.Minute)} // least remaining life
-	for i := 0; i < minterCacheMax-1; i++ {
+	for i := range minterCacheMax - 1 {
 		m.cache[fmt.Sprintf("gvs|live%05d", i)] = cachedToken{gen: m.gen, expiry: now.Add(time.Hour)}
 	}
 	if got := len(m.cache); got != minterCacheMax {
@@ -968,7 +966,7 @@ func TestMinterCachePutReclaimsExpired(t *testing.T) {
 	m := newBareMinter(0, 0)
 	m.gen = 1
 	past := time.Now().Add(-time.Hour)
-	for i := 0; i < minterCacheMax; i++ {
+	for i := range minterCacheMax {
 		m.cache[fmt.Sprintf("gvs|expired%05d", i)] = cachedToken{gen: m.gen, expiry: past} // current gen, expired
 	}
 	if got := len(m.cache); got != minterCacheMax {
@@ -1149,7 +1147,7 @@ func TestGrantExpiryRecyclesSession(t *testing.T) {
 // attestations counter shows it.
 func TestShortGrantDoesNotRelaunchForever(t *testing.T) {
 	m, launches, _, _ := newTestMinter(agedMint(minterCacheMargin - time.Minute))
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		if _, _, err := m.Mint(context.Background(), "pot", fmt.Sprintf("vd%d", i)); err != nil {
 			t.Fatalf("mint %d: %v", i, err)
 		}
@@ -1170,7 +1168,7 @@ func TestShortGrantDoesNotRelaunchForever(t *testing.T) {
 // requests keep the one attestation.
 func TestGrantZeroExpiryKeepsSession(t *testing.T) {
 	m, launches, _, _ := newTestMinter(okMint) // Lifetime only, zero ExpiresAt
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		if _, _, err := m.Mint(context.Background(), "pot", fmt.Sprintf("vd%d", i)); err != nil {
 			t.Fatalf("mint %d: %v", i, err)
 		}
@@ -1281,9 +1279,9 @@ func TestMinterHealthLivePing(t *testing.T) {
 // A health probe that fails twice retires the idle session and counts the
 // browser loss.
 func TestMinterHealthDeadPingRetires(t *testing.T) {
-	var probes int64
+	var probes atomic.Int64
 	m, sessions, smu := newPingMinter(func() error {
-		atomic.AddInt64(&probes, 1)
+		probes.Add(1)
 		return errors.New("cdp connection closed")
 	})
 	if err := m.Warm(context.Background()); err != nil {
@@ -1292,7 +1290,7 @@ func TestMinterHealthDeadPingRetires(t *testing.T) {
 	if _, _, err := m.Health(context.Background()); err == nil {
 		t.Fatal("Health = nil, want the probe error")
 	}
-	if got := atomic.LoadInt64(&probes); got != 2 {
+	if got := probes.Load(); got != 2 {
 		t.Errorf("probes = %d, want 2: a failure is confirmed before anything is retired", got)
 	}
 	if got := m.metrics.Crashes.Load(); got != 1 {
@@ -1312,9 +1310,9 @@ func TestMinterHealthDeadPingRetires(t *testing.T) {
 // HEALTHCHECK runs `waxseal ping --strict` every 30 seconds, so acting on a
 // single failure would forge a browser-death signal on a healthy daemon.
 func TestMinterHealthTransientPingRecoversOnConfirmation(t *testing.T) {
-	var probes int64
+	var probes atomic.Int64
 	m, sessions, smu := newPingMinter(func() error {
-		if atomic.AddInt64(&probes, 1) == 1 {
+		if probes.Add(1) == 1 {
 			return context.DeadlineExceeded // the failure mode this guards
 		}
 		return nil
@@ -1329,7 +1327,7 @@ func TestMinterHealthTransientPingRecoversOnConfirmation(t *testing.T) {
 	if snap.Generation != 1 {
 		t.Errorf("generation = %d, want 1 (the original session)", snap.Generation)
 	}
-	if got := atomic.LoadInt64(&probes); got != 2 {
+	if got := probes.Load(); got != 2 {
 		t.Errorf("probes = %d, want 2 (the failure plus its confirmation)", got)
 	}
 	if got := m.metrics.Crashes.Load(); got != 0 {
@@ -1580,10 +1578,10 @@ func TestMinterHealthPersistentSupersedeReportsNoSession(t *testing.T) {
 // and the log says the streaming proof passed: a failing proof already logs, so
 // without this a reader cannot tell a passing proof from one that never ran.
 func TestMinterSelfTestCachesGVSMint(t *testing.T) {
-	var mints int64
+	var mints atomic.Int64
 	var logs bytes.Buffer
 	m, _, _, _ := newTestMinter(func(id string) (browser.MintResult, error) {
-		atomic.AddInt64(&mints, 1)
+		mints.Add(1)
 		return browser.MintResult{Kind: "integrity", Token: "gvs-" + id, TokenLen: 5, Identifier: id, Lifetime: 3600}, nil
 	})
 	m.log = slog.New(slog.NewTextHandler(&logs, nil))
@@ -1594,14 +1592,14 @@ func TestMinterSelfTestCachesGVSMint(t *testing.T) {
 	if !strings.Contains(logs.String(), "streaming proof passed") {
 		t.Errorf("log = %q, want the passing proof named", logs.String())
 	}
-	if got := atomic.LoadInt64(&mints); got != 1 {
+	if got := mints.Load(); got != 1 {
 		t.Errorf("mints during self-test = %d, want 1", got)
 	}
 	// The default fake identity reports visitor_data "vd".
 	if _, cached, err := m.Mint(ctx, "gvs", "vd"); err != nil || !cached {
 		t.Errorf("gvs/vd after self-test: cached=%v err=%v, want cached=true", cached, err)
 	}
-	if got := atomic.LoadInt64(&mints); got != 1 {
+	if got := mints.Load(); got != 1 {
 		t.Errorf("mints after the cache hit = %d, want 1", got)
 	}
 }
@@ -1638,9 +1636,9 @@ func TestMinterSelfTestMintFailuresCounted(t *testing.T) {
 func TestMinterSelfTestMintRetrySucceeds(t *testing.T) {
 	defer func(d time.Duration) { selfTestMintRetryDelay = d }(selfTestMintRetryDelay)
 	selfTestMintRetryDelay = time.Millisecond
-	var attempt int64
+	var attempt atomic.Int64
 	m, launches, _, _ := newTestMinter(func(string) (browser.MintResult, error) {
-		if atomic.AddInt64(&attempt, 1) == 1 {
+		if attempt.Add(1) == 1 {
 			return browser.MintResult{}, errors.New("temporary mint failure")
 		}
 		return browser.MintResult{Kind: "integrity", Token: "ok", Lifetime: 3600}, nil
@@ -1815,7 +1813,7 @@ func TestMinterPOTOnlyTrafficDoesNotRecycle(t *testing.T) {
 	m.mu.Lock()
 	m.streamingDeadline = time.Now().Add(-time.Hour) // long past the window
 	m.mu.Unlock()
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		if _, _, err := m.Mint(ctx, "gvs", fmt.Sprintf("vd%d", i)); err != nil {
 			t.Fatalf("mint %d: %v", i, err)
 		}
@@ -1841,7 +1839,7 @@ func TestMinterStreamingMaxAgeZeroNeverRecycles(t *testing.T) {
 	if !zero {
 		t.Error("streamingDeadline should be zero when streamingMaxAge=0")
 	}
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		if _, gen, err := m.PlayerContext(ctx, "vid"); err != nil || gen != 1 {
 			t.Fatalf("player-context %d: gen=%d err=%v, want gen=1 (no staleness recycle)", i, gen, err)
 		}
@@ -1988,11 +1986,11 @@ func TestMinterReportBurstThenRateLimited(t *testing.T) {
 // release is called.
 func startBlockingPlayerContext(t *testing.T) (m *Minter, sessions *[]*fakeSession, smu *sync.Mutex, release func(), done <-chan struct{}) {
 	t.Helper()
-	var pcCount int64
+	var pcCount atomic.Int64
 	entered := make(chan struct{})
 	rel := make(chan struct{})
 	pcFn := func(string) (browser.PlayerContext, error) {
-		if atomic.AddInt64(&pcCount, 1) == 1 {
+		if pcCount.Add(1) == 1 {
 			close(entered)
 			<-rel // hold mintMu open
 		}
@@ -2071,7 +2069,7 @@ func TestReportDuplicatePendingIsCounted(t *testing.T) {
 	m, _, _, release, done := startBlockingPlayerContext(t)
 	defer func() { release(); <-done }()
 
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		res := m.ReportDegraded(1, "vid", "cap")
 		if !res.Accepted || !res.RetirementPending {
 			t.Fatalf("report %d = %+v, want Accepted && RetirementPending", i+1, res)
@@ -2131,18 +2129,16 @@ func TestMinterReportConcurrentAtMostOnce(t *testing.T) {
 		t.Fatalf("warm: %v", err)
 	}
 	var wg sync.WaitGroup
-	var retired int64
-	for i := 0; i < 24; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	var retired atomic.Int64
+	for range 24 {
+		wg.Go(func() {
 			if m.ReportDegraded(1, "vid", "cap").Retired {
-				atomic.AddInt64(&retired, 1)
+				retired.Add(1)
 			}
-		}()
+		})
 	}
 	wg.Wait()
-	if got := atomic.LoadInt64(&retired); got != 1 {
+	if got := retired.Load(); got != 1 {
 		t.Errorf("Retired=true count = %d, want exactly 1 (gen-guarded retire)", got)
 	}
 	if got := m.metrics.ReportDrivenRecycles.Load(); got != 1 {
@@ -2162,16 +2158,15 @@ func TestMinterReportConcurrentAtMostOnce(t *testing.T) {
 // A report that loses the retire race to another goroutine must not spend
 // report budget. Many rounds make the race show up without relying on timing.
 func TestMinterReportNoopRetireDoesNotSpendBudget(t *testing.T) {
-	for round := 0; round < 200; round++ {
+	for round := range 200 {
 		m, _, _, _ := newStreamingMinter(0, nil)
 		if err := m.Warm(context.Background()); err != nil { // gen 1
 			t.Fatalf("round %d warm: %v", round, err)
 		}
 		var res ReportResult
 		var wg sync.WaitGroup
-		wg.Add(2)
-		go func() { defer wg.Done(); res = m.ReportDegraded(1, "vid", "cap") }()
-		go func() { defer wg.Done(); m.retire(1, "concurrent retirement", false) }()
+		wg.Go(func() { res = m.ReportDegraded(1, "vid", "cap") })
+		wg.Go(func() { m.retire(1, "concurrent retirement", false) })
 		wg.Wait()
 
 		m.mu.Lock()
@@ -2235,10 +2230,10 @@ func TestMinterRetireClearsSuspect(t *testing.T) {
 
 // PlayerContext returns the generation that produced its context.
 func TestMinterGenerationIdentifiesContext(t *testing.T) {
-	var n int64
+	var n atomic.Int64
 	m := newBareMinter(0, 0)
 	m.launch = func(context.Context) (minterSession, error) {
-		k := atomic.AddInt64(&n, 1)
+		k := n.Add(1)
 		return &fakeSession{
 			id:   browser.Identity{VisitorData: fmt.Sprintf("vd-%d", k)},
 			mint: okMint,
@@ -2263,10 +2258,10 @@ func TestMinterGenerationIdentifiesContext(t *testing.T) {
 
 // Health does not combine fields from different generations.
 func TestMinterHealthSnapshotSingleGeneration(t *testing.T) {
-	var n int64
+	var n atomic.Int64
 	m := newBareMinter(0, 0)
 	m.launch = func(context.Context) (minterSession, error) {
-		k := atomic.AddInt64(&n, 1)
+		k := n.Add(1)
 		return &fakeSession{
 			id:          browser.Identity{VisitorData: fmt.Sprintf("vd-%d", k)},
 			mint:        okMint,
@@ -2461,7 +2456,7 @@ func TestCounterKeysAligned(t *testing.T) {
 func TestJitterWithinBounds(t *testing.T) {
 	d := time.Hour // a var, so the bound conversions truncate at runtime
 	lo, hi := time.Duration(0.9*float64(d)), time.Duration(1.1*float64(d))
-	for i := 0; i < 2000; i++ {
+	for range 2000 {
 		j := jitter(d)
 		if j < lo || j > hi {
 			t.Fatalf("jitter(%v) = %v, out of [%v, %v]", d, j, lo, hi)
@@ -2488,21 +2483,19 @@ func TestMinterConcurrentReportPlayerContextHealth(t *testing.T) {
 	deadline := time.Now().Add(150 * time.Millisecond)
 	var wg sync.WaitGroup
 	worker := func(fn func()) {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for time.Now().Before(deadline) {
 				fn()
 			}
-		}()
+		})
 	}
-	for i := 0; i < 4; i++ {
+	for range 4 {
 		worker(func() { _, _, _ = m.PlayerContext(ctx, "vid") })
 	}
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		worker(func() { m.ReportDegraded(m.Generation(), "vid", "cap") })
 	}
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		worker(func() { _, _, _ = m.Health(ctx); m.MetricsSnapshot() })
 	}
 	wg.Wait()
@@ -2725,9 +2718,9 @@ func TestEnsurePremintsGVSToken(t *testing.T) {
 // A failed pre-mint still publishes the session: the next token request mints on
 // demand.
 func TestEnsurePremintFailureStillPublishes(t *testing.T) {
-	var attempt int64
+	var attempt atomic.Int64
 	m, launches, _, _ := newTestMinterFull(func(string) (browser.MintResult, error) {
-		if atomic.AddInt64(&attempt, 1) == 1 {
+		if attempt.Add(1) == 1 {
 			return browser.MintResult{}, errors.New("pre-mint failed")
 		}
 		return browser.MintResult{Kind: "integrity", Token: "later", Lifetime: 3600}, nil
@@ -2757,9 +2750,9 @@ func TestEnsurePremintFailureStillPublishes(t *testing.T) {
 	// missing, also caches under both scopes. It needs a fresh minter: SelfTest
 	// must trigger the launch itself, or the gvs entry is already filled when it
 	// checks.
-	var attempt2 int64
+	var attempt2 atomic.Int64
 	m2, _, _, _ := newTestMinterFull(func(string) (browser.MintResult, error) {
-		if atomic.AddInt64(&attempt2, 1) == 1 {
+		if attempt2.Add(1) == 1 {
 			return browser.MintResult{}, errors.New("pre-mint failed")
 		}
 		return browser.MintResult{Kind: "integrity", Token: "later", Lifetime: 3600}, nil
@@ -3019,15 +3012,15 @@ func TestSeparationWaitHonoursContext(t *testing.T) {
 // The self-test reuses the token the attestation already minted instead of
 // spending a second in-page mint on the same binding.
 func TestSelfTestSkipsMintWhenPreminted(t *testing.T) {
-	var mints int64
+	var mints atomic.Int64
 	m, _, _, _ := newTestMinter(func(id string) (browser.MintResult, error) {
-		atomic.AddInt64(&mints, 1)
+		mints.Add(1)
 		return browser.MintResult{Kind: "integrity", Token: "tok-" + id, Lifetime: 3600}, nil
 	})
 	if err := m.SelfTest(context.Background()); err != nil {
 		t.Fatalf("SelfTest: %v", err)
 	}
-	if got := atomic.LoadInt64(&mints); got != 1 {
+	if got := mints.Load(); got != 1 {
 		t.Errorf("fake mints = %d, want 1 (the pre-mint; the self-test reused it)", got)
 	}
 	if got := m.metrics.Mints.Load(); got != 1 {
@@ -3069,9 +3062,9 @@ func TestSelfTestPrewarmsBothVisitorDataScopes(t *testing.T) {
 		// The first mint call is the attestation pre-mint inside ensure(); make it
 		// fail so the entry is missing when SelfTest checks the cache, forcing the
 		// fallback mint. The fallback's own first attempt then succeeds.
-		var calls int64
+		var calls atomic.Int64
 		m, _, _, _ := newTestMinter(func(id string) (browser.MintResult, error) {
-			if atomic.AddInt64(&calls, 1) == 1 {
+			if calls.Add(1) == 1 {
 				return browser.MintResult{}, errors.New("premint broken")
 			}
 			return browser.MintResult{Kind: "integrity", Token: "tok-" + id, Lifetime: 3600}, nil
@@ -3192,10 +3185,10 @@ func TestPlayerContextProvesBeforeFirstContext(t *testing.T) {
 		proofsWhenContextTaken = append(proofsWhenContextTaken, fs.proofCount())
 		return browser.PlayerContext{ServerAbrStreamingURL: "https://r/ok", VisitorData: "vd"}, nil
 	}
-	var launches int64
+	var launches atomic.Int64
 	m := newBareMinter(0, 0)
 	m.launch = func(context.Context) (minterSession, error) {
-		atomic.AddInt64(&launches, 1)
+		launches.Add(1)
 		return fs, nil
 	}
 	ctx := context.Background()
@@ -3215,7 +3208,7 @@ func TestPlayerContextProvesBeforeFirstContext(t *testing.T) {
 	if proofsWhenContextTaken[0] != 1 {
 		t.Errorf("proofs completed when the first context was taken = %d, want 1 (the proof runs first)", proofsWhenContextTaken[0])
 	}
-	if got := atomic.LoadInt64(&launches); got != 1 {
+	if got := launches.Load(); got != 1 {
 		t.Errorf("launches = %d, want 1", got)
 	}
 	m.mu.Lock()
@@ -3233,19 +3226,19 @@ func TestPlayerContextProvesBeforeFirstContext(t *testing.T) {
 // request is refused without relaunching, without asking the page for a context,
 // and without marking the video unplayable.
 func TestPlayerContextRefusesWhenProofFails(t *testing.T) {
-	var pcCalls int64
+	var pcCalls atomic.Int64
 	fs := &fakeSession{
 		mint:         okMint,
 		establishErr: errors.New("full-length proof failed"),
 		playerCtx: func(string) (browser.PlayerContext, error) {
-			atomic.AddInt64(&pcCalls, 1)
+			pcCalls.Add(1)
 			return browser.PlayerContext{ServerAbrStreamingURL: "https://r/ok", VisitorData: "vd"}, nil
 		},
 	}
-	var launches int64
+	var launches atomic.Int64
 	m := newBareMinter(0, 0)
 	m.launch = func(context.Context) (minterSession, error) {
-		atomic.AddInt64(&launches, 1)
+		launches.Add(1)
 		return fs, nil
 	}
 	ctx := context.Background()
@@ -3257,10 +3250,10 @@ func TestPlayerContextRefusesWhenProofFails(t *testing.T) {
 	if got := m.metrics.UnprovenRejections.Load(); got != 1 {
 		t.Errorf("unproven_rejections = %d, want 1", got)
 	}
-	if got := atomic.LoadInt64(&pcCalls); got != 0 {
+	if got := pcCalls.Load(); got != 0 {
 		t.Errorf("session player-context calls = %d, want 0 (an unproven session hands out nothing)", got)
 	}
-	if got := atomic.LoadInt64(&launches); got != 1 {
+	if got := launches.Load(); got != 1 {
 		t.Errorf("launches = %d, want 1 (a failed proof must not relaunch)", got)
 	}
 	if fs.closed.Load() {
@@ -3483,7 +3476,7 @@ func TestProofCooldownWarnOncePerWindow(t *testing.T) {
 	}
 
 	// Three more requests land inside the same cool-down window.
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		if _, _, err := m.PlayerContext(ctx, "vid"); !errors.Is(err, ErrUnproven) {
 			t.Fatalf("repeat request %d err = %v, want ErrUnproven", i, err)
 		}
@@ -3500,10 +3493,10 @@ func TestProofCooldownWarnOncePerWindow(t *testing.T) {
 // relaunches the session exactly once and re-proves on the new session, like the
 // mint and player-context ladders' second level.
 func TestPlayerContextProofSecondFailureRelaunchesAfterCooldown(t *testing.T) {
-	var launches int64
+	var launches atomic.Int64
 	m := newBareMinter(0, 0)
 	m.launch = func(context.Context) (minterSession, error) {
-		n := atomic.AddInt64(&launches, 1)
+		n := launches.Add(1)
 		if n == 1 {
 			return &fakeSession{mint: okMint, establishErr: errors.New("full-length proof failed")}, nil
 		}
@@ -3514,7 +3507,7 @@ func TestPlayerContextProofSecondFailureRelaunchesAfterCooldown(t *testing.T) {
 	if _, _, err := m.PlayerContext(ctx, "vid"); !errors.Is(err, ErrUnproven) {
 		t.Fatalf("first request err = %v, want ErrUnproven", err)
 	}
-	if got := atomic.LoadInt64(&launches); got != 1 {
+	if got := launches.Load(); got != 1 {
 		t.Fatalf("launches = %d, want 1", got)
 	}
 	gen1 := m.Generation()
@@ -3536,7 +3529,7 @@ func TestPlayerContextProofSecondFailureRelaunchesAfterCooldown(t *testing.T) {
 	if gen2 == gen1 {
 		t.Errorf("generation = %d, want a new generation after the second failure relaunched", gen2)
 	}
-	if got := atomic.LoadInt64(&launches); got != 2 {
+	if got := launches.Load(); got != 2 {
 		t.Errorf("launches = %d, want 2 (exactly one relaunch)", got)
 	}
 	if got := m.metrics.Escalations.Load(); got != 1 {
@@ -3657,10 +3650,10 @@ func TestSelfTestFailureStartsCooldown(t *testing.T) {
 // PlayerContext failure on that generation is the second and relaunches exactly
 // once, as in a PlayerContext-only streak.
 func TestSelfTestFailureThenPlayerContextRelaunchesAfterCooldown(t *testing.T) {
-	var launches int64
+	var launches atomic.Int64
 	m := newBareMinter(0, 0)
 	m.launch = func(context.Context) (minterSession, error) {
-		n := atomic.AddInt64(&launches, 1)
+		n := launches.Add(1)
 		if n == 1 {
 			return &fakeSession{mint: okMint, establishErr: errors.New("full-length proof failed")}, nil
 		}
@@ -3672,7 +3665,7 @@ func TestSelfTestFailureThenPlayerContextRelaunchesAfterCooldown(t *testing.T) {
 		t.Fatalf("SelfTest = %v, want nil after a logged establishment failure", err)
 	}
 	gen1 := m.Generation()
-	if got := atomic.LoadInt64(&launches); got != 1 {
+	if got := launches.Load(); got != 1 {
 		t.Fatalf("launches after self-test = %d, want 1", got)
 	}
 	if got := m.metrics.Escalations.Load(); got != 0 {
@@ -3695,7 +3688,7 @@ func TestSelfTestFailureThenPlayerContextRelaunchesAfterCooldown(t *testing.T) {
 	if gen2 == gen1 {
 		t.Errorf("generation = %d, want a new generation: the self-test failure's second failure must relaunch", gen2)
 	}
-	if got := atomic.LoadInt64(&launches); got != 2 {
+	if got := launches.Load(); got != 2 {
 		t.Errorf("launches = %d, want 2 (exactly one relaunch)", got)
 	}
 	if got := m.metrics.Escalations.Load(); got != 1 {
@@ -3763,10 +3756,10 @@ func TestEnsureResetsMarksOnNewGeneration(t *testing.T) {
 // exactly once, and the fresh generation's own failure starts its own cool-down
 // independent of the generation it replaced.
 func TestPlayerContextProofSecondFailureRelaunchAlsoFails(t *testing.T) {
-	var launches int64
+	var launches atomic.Int64
 	m := newBareMinter(0, 0)
 	m.launch = func(context.Context) (minterSession, error) {
-		atomic.AddInt64(&launches, 1)
+		launches.Add(1)
 		return &fakeSession{mint: okMint, establishErr: errors.New("full-length proof failed")}, nil
 	}
 	ctx := context.Background()
@@ -3789,7 +3782,7 @@ func TestPlayerContextProofSecondFailureRelaunchAlsoFails(t *testing.T) {
 	if gen2 == gen1 {
 		t.Errorf("generation = %d, want a new generation after the relaunch", gen2)
 	}
-	if got := atomic.LoadInt64(&launches); got != 2 {
+	if got := launches.Load(); got != 2 {
 		t.Errorf("launches = %d, want 2 (exactly one relaunch)", got)
 	}
 	if got := m.metrics.Escalations.Load(); got != 1 {
@@ -3846,11 +3839,11 @@ func TestPlayerContextProofDeadlineExceededRecordsFailure(t *testing.T) {
 // proof ladder or another relaunch produced it, is recorded and refused without
 // relaunching. Only a successful proof frees the relaunch.
 func TestPlayerContextProofRelaunchSpentOncePerStreak(t *testing.T) {
-	var launches int64
+	var launches atomic.Int64
 	var gen3Session *fakeSession
 	m := newBareMinter(0, 0)
 	m.launch = func(context.Context) (minterSession, error) {
-		n := atomic.AddInt64(&launches, 1)
+		n := launches.Add(1)
 		fs := &fakeSession{mint: okMint, establishErr: errors.New("full-length proof failed")}
 		if n == 3 {
 			gen3Session = fs
@@ -3881,7 +3874,7 @@ func TestPlayerContextProofRelaunchSpentOncePerStreak(t *testing.T) {
 	if gen2 == gen1 {
 		t.Fatal("generation did not advance after the second failure")
 	}
-	if got := atomic.LoadInt64(&launches); got != 2 {
+	if got := launches.Load(); got != 2 {
 		t.Fatalf("launches = %d, want 2 (exactly one relaunch)", got)
 	}
 	if got := m.metrics.Escalations.Load(); got != 1 {
@@ -3894,7 +3887,7 @@ func TestPlayerContextProofRelaunchSpentOncePerStreak(t *testing.T) {
 	if _, _, err := m.PlayerContext(ctx, "vid"); !errors.Is(err, ErrUnproven) {
 		t.Fatalf("gen2 second request err = %v, want ErrUnproven", err)
 	}
-	if got := atomic.LoadInt64(&launches); got != 2 {
+	if got := launches.Load(); got != 2 {
 		t.Errorf("launches = %d, want 2 (the streak's relaunch is already spent)", got)
 	}
 
@@ -3911,7 +3904,7 @@ func TestPlayerContextProofRelaunchSpentOncePerStreak(t *testing.T) {
 	if gen3 == gen2 {
 		t.Fatal("generation did not advance after the simulated relaunch")
 	}
-	if got := atomic.LoadInt64(&launches); got != 3 {
+	if got := launches.Load(); got != 3 {
 		t.Fatalf("launches = %d, want 3 (the simulated out-of-band relaunch)", got)
 	}
 
@@ -3920,7 +3913,7 @@ func TestPlayerContextProofRelaunchSpentOncePerStreak(t *testing.T) {
 	if _, _, err := m.PlayerContext(ctx, "vid"); !errors.Is(err, ErrUnproven) {
 		t.Fatalf("gen3 first request err = %v, want ErrUnproven", err)
 	}
-	if got := atomic.LoadInt64(&launches); got != 3 {
+	if got := launches.Load(); got != 3 {
 		t.Errorf("launches = %d, want 3 (a first failure never relaunches)", got)
 	}
 
@@ -3931,7 +3924,7 @@ func TestPlayerContextProofRelaunchSpentOncePerStreak(t *testing.T) {
 	if _, _, err := m.PlayerContext(ctx, "vid"); !errors.Is(err, ErrUnproven) {
 		t.Fatalf("gen3 second request err = %v, want ErrUnproven", err)
 	}
-	if got := atomic.LoadInt64(&launches); got != 3 {
+	if got := launches.Load(); got != 3 {
 		t.Errorf("launches = %d, want 3 (the streak's relaunch stays spent across generations)", got)
 	}
 	if got := m.metrics.Escalations.Load(); got != 1 {
@@ -3955,7 +3948,7 @@ func TestPlayerContextProofRelaunchSpentOncePerStreak(t *testing.T) {
 	// A later double failure relaunches again: clearing the flag freed a fresh
 	// streak's one relaunch.
 	m.launch = func(context.Context) (minterSession, error) {
-		atomic.AddInt64(&launches, 1)
+		launches.Add(1)
 		return &fakeSession{mint: okMint, establishErr: errors.New("full-length proof failed")}, nil
 	}
 	if !m.retire(gen3, "test: force a fresh failing generation", false) {
@@ -3964,7 +3957,7 @@ func TestPlayerContextProofRelaunchSpentOncePerStreak(t *testing.T) {
 	if _, _, err := m.ensure(ctx); err != nil {
 		t.Fatalf("ensure (fresh failing generation): %v", err)
 	}
-	launchesBeforeRelaunch := atomic.LoadInt64(&launches)
+	launchesBeforeRelaunch := launches.Load()
 	gen4 := m.Generation()
 
 	if _, _, err := m.PlayerContext(ctx, "vid"); !errors.Is(err, ErrUnproven) {
@@ -3974,7 +3967,7 @@ func TestPlayerContextProofRelaunchSpentOncePerStreak(t *testing.T) {
 	if _, _, err := m.PlayerContext(ctx, "vid"); !errors.Is(err, ErrUnproven) {
 		t.Fatalf("gen4 second request err = %v, want ErrUnproven", err)
 	}
-	if got := atomic.LoadInt64(&launches); got != launchesBeforeRelaunch+1 {
+	if got := launches.Load(); got != launchesBeforeRelaunch+1 {
 		t.Errorf("launches = %d, want %d (a fresh streak relaunches once more)", got, launchesBeforeRelaunch+1)
 	}
 	if got := m.metrics.Escalations.Load(); got != 2 {
@@ -4023,14 +4016,14 @@ func requireCrashOnlyMetrics(t *testing.T, m *Minter) {
 // while its proof is in flight. The request proves the replacement and is served.
 func TestPlayerContextSurvivesCrashDuringProof(t *testing.T) {
 	m := newBareMinter(0, 0)
-	var launches int64
+	var launches atomic.Int64
 	first := &fakeSession{mint: okMint}
 	first.onEstablish = func() error {
 		crashUnder(m)
 		return errDeadPage
 	}
 	m.launch = func(context.Context) (minterSession, error) {
-		if atomic.AddInt64(&launches, 1) == 1 {
+		if launches.Add(1) == 1 {
 			return first, nil
 		}
 		return &fakeSession{mint: okMint}, nil
@@ -4046,7 +4039,7 @@ func TestPlayerContextSurvivesCrashDuringProof(t *testing.T) {
 	if pc.ServerAbrStreamingURL == "" {
 		t.Error("served an empty context")
 	}
-	if got := atomic.LoadInt64(&launches); got != 2 {
+	if got := launches.Load(); got != 2 {
 		t.Errorf("launches = %d, want 2 (one replacement)", got)
 	}
 	if !first.closed.Load() {
@@ -4066,7 +4059,7 @@ func TestPlayerContextSurvivesCrashDuringProof(t *testing.T) {
 // looping, and the following request relaunches and is served.
 func TestPlayerContextCrashDuringReplacementProofRefusesOnce(t *testing.T) {
 	m := newBareMinter(0, 0)
-	var launches int64
+	var launches atomic.Int64
 	dying := func() *fakeSession {
 		fs := &fakeSession{mint: okMint}
 		fs.onEstablish = func() error {
@@ -4076,7 +4069,7 @@ func TestPlayerContextCrashDuringReplacementProofRefusesOnce(t *testing.T) {
 		return fs
 	}
 	m.launch = func(context.Context) (minterSession, error) {
-		if atomic.AddInt64(&launches, 1) <= 2 {
+		if launches.Add(1) <= 2 {
 			return dying(), nil
 		}
 		return &fakeSession{mint: okMint}, nil
@@ -4087,7 +4080,7 @@ func TestPlayerContextCrashDuringReplacementProofRefusesOnce(t *testing.T) {
 	if !errors.Is(err, ErrUnproven) {
 		t.Fatalf("err = %v, want ErrUnproven when the replacement dies too", err)
 	}
-	if got := atomic.LoadInt64(&launches); got != 2 {
+	if got := launches.Load(); got != 2 {
 		t.Fatalf("launches = %d, want 2 (the request takes one replacement, not a loop)", got)
 	}
 	if got := m.metrics.UnprovenRejections.Load(); got != 1 {
@@ -4119,7 +4112,7 @@ func TestPlayerContextCrashDuringReplacementProofRefusesOnce(t *testing.T) {
 // its proof returns the context error and launches nothing.
 func TestPlayerContextCrashDuringProofOfCanceledCaller(t *testing.T) {
 	m := newBareMinter(0, 0)
-	var launches int64
+	var launches atomic.Int64
 	ctx, cancel := context.WithCancel(context.Background())
 	first := &fakeSession{mint: okMint}
 	first.onEstablish = func() error {
@@ -4128,13 +4121,13 @@ func TestPlayerContextCrashDuringProofOfCanceledCaller(t *testing.T) {
 		return errDeadPage
 	}
 	m.launch = func(context.Context) (minterSession, error) {
-		atomic.AddInt64(&launches, 1)
+		launches.Add(1)
 		return first, nil
 	}
 	if _, _, err := m.PlayerContext(ctx, "vid"); !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v, want context.Canceled", err)
 	}
-	if got := atomic.LoadInt64(&launches); got != 1 {
+	if got := launches.Load(); got != 1 {
 		t.Errorf("launches = %d, want 1 (no replacement for a departed caller)", got)
 	}
 	if got := m.metrics.UnprovenRejections.Load(); got != 0 {
@@ -4157,7 +4150,7 @@ func TestPlayerContextSurvivesCrashDuringContext(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			m := newBareMinter(0, 0)
-			var launches int64
+			var launches atomic.Int64
 			var attempts int
 			first := &fakeSession{mint: okMint}
 			first.playerCtx = func(string) (browser.PlayerContext, error) {
@@ -4169,7 +4162,7 @@ func TestPlayerContextSurvivesCrashDuringContext(t *testing.T) {
 				return browser.PlayerContext{}, errDeadPage
 			}
 			m.launch = func(context.Context) (minterSession, error) {
-				if atomic.AddInt64(&launches, 1) == 1 {
+				if launches.Add(1) == 1 {
 					return first, nil
 				}
 				return &fakeSession{mint: okMint}, nil
@@ -4182,7 +4175,7 @@ func TestPlayerContextSurvivesCrashDuringContext(t *testing.T) {
 			if gen != 2 || pc.ServerAbrStreamingURL == "" {
 				t.Errorf("served generation %d (url set: %v), want 2", gen, pc.ServerAbrStreamingURL != "")
 			}
-			if got := atomic.LoadInt64(&launches); got != 2 {
+			if got := launches.Load(); got != 2 {
 				t.Errorf("launches = %d, want 2", got)
 			}
 			if attempts != tc.dieOnAttempt {
@@ -4208,7 +4201,7 @@ func TestMintSurvivesCrashDuringMint(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			m := newBareMinter(0, 0)
-			var launches int64
+			var launches atomic.Int64
 			var attempts int
 			first := &fakeSession{}
 			first.mint = func(id string) (browser.MintResult, error) {
@@ -4223,7 +4216,7 @@ func TestMintSurvivesCrashDuringMint(t *testing.T) {
 				return browser.MintResult{}, errDeadPage
 			}
 			m.launch = func(context.Context) (minterSession, error) {
-				if atomic.AddInt64(&launches, 1) == 1 {
+				if launches.Add(1) == 1 {
 					return first, nil
 				}
 				return &fakeSession{mint: okMint}, nil
@@ -4237,7 +4230,7 @@ func TestMintSurvivesCrashDuringMint(t *testing.T) {
 			if cached || res.Token == "" {
 				t.Errorf("mint = (cached=%v, token set=%v), want a fresh token", cached, res.Token != "")
 			}
-			if got := atomic.LoadInt64(&launches); got != 2 {
+			if got := launches.Load(); got != 2 {
 				t.Errorf("launches = %d, want 2", got)
 			}
 			if attempts != tc.dieOnAttempt {
@@ -4260,14 +4253,14 @@ func TestMintSurvivesCrashDuringMint(t *testing.T) {
 // handled the same way.
 func TestSessionSnapshotSurvivesCrashDuringCookies(t *testing.T) {
 	m := newBareMinter(0, 0)
-	var launches int64
+	var launches atomic.Int64
 	first := &fakeSession{mint: okMint, id: browser.Identity{VisitorData: "vd1"}}
 	first.cookiesFn = func() ([]*http.Cookie, error) {
 		crashUnder(m)
 		return nil, errDeadPage
 	}
 	m.launch = func(context.Context) (minterSession, error) {
-		if atomic.AddInt64(&launches, 1) == 1 {
+		if launches.Add(1) == 1 {
 			return first, nil
 		}
 		return &fakeSession{mint: okMint, id: browser.Identity{VisitorData: "vd2"}, cookies: []*http.Cookie{{Name: "c", Value: "v"}}}, nil
@@ -4280,7 +4273,7 @@ func TestSessionSnapshotSurvivesCrashDuringCookies(t *testing.T) {
 	if id.VisitorData != "vd2" || gen != 2 || len(cookies) != 1 {
 		t.Errorf("snapshot = (vd=%q, gen=%d, cookies=%d), want the replacement's (vd2, 2, 1)", id.VisitorData, gen, len(cookies))
 	}
-	if got := atomic.LoadInt64(&launches); got != 2 {
+	if got := launches.Load(); got != 2 {
 		t.Errorf("launches = %d, want 2", got)
 	}
 	requireCrashOnlyMetrics(t, m)
@@ -4321,7 +4314,7 @@ func TestWarmSerializesWithRequests(t *testing.T) {
 // operation fails, its ladder calls ensure again, and ensure must refuse rather
 // than launch a browser nothing will tear down.
 func TestCloseStopsAnInFlightRequestFromRelaunching(t *testing.T) {
-	var launches int64
+	var launches atomic.Int64
 	var sessions []*fakeSession
 	var smu sync.Mutex
 	entered := make(chan struct{})
@@ -4329,7 +4322,7 @@ func TestCloseStopsAnInFlightRequestFromRelaunching(t *testing.T) {
 	var once sync.Once
 	m := newBareMinter(0, 0)
 	m.launch = func(context.Context) (minterSession, error) {
-		atomic.AddInt64(&launches, 1)
+		launches.Add(1)
 		fs := &fakeSession{mint: func(binding string) (browser.MintResult, error) {
 			if binding == "vd" { // the attestation pre-mint, so the session publishes
 				return okMint(binding)
@@ -4368,7 +4361,7 @@ func TestCloseStopsAnInFlightRequestFromRelaunching(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("the in-flight Mint never returned")
 	}
-	if got := atomic.LoadInt64(&launches); got != 1 {
+	if got := launches.Load(); got != 1 {
 		t.Errorf("launches = %d, want 1 (Close must not let the ladder relaunch)", got)
 	}
 	if got := m.Generation(); got != genBefore {
@@ -4392,17 +4385,17 @@ func TestCloseStopsAnInFlightRequestFromRelaunching(t *testing.T) {
 
 // Warm on a closed Minter reports ErrClosed without launching anything.
 func TestWarmAfterCloseDoesNotLaunch(t *testing.T) {
-	var launches int64
+	var launches atomic.Int64
 	m := newBareMinter(0, 0)
 	m.launch = func(context.Context) (minterSession, error) {
-		atomic.AddInt64(&launches, 1)
+		launches.Add(1)
 		return &fakeSession{mint: okMint}, nil
 	}
 	m.Close()
 	if err := m.Warm(context.Background()); !errors.Is(err, ErrClosed) {
 		t.Fatalf("Warm after Close = %v, want ErrClosed", err)
 	}
-	if got := atomic.LoadInt64(&launches); got != 0 {
+	if got := launches.Load(); got != 0 {
 		t.Errorf("launches = %d, want 0", got)
 	}
 	if got := m.Generation(); got != 0 {
@@ -4418,9 +4411,9 @@ func TestCloseDuringLaunchClosesTheLaunchedSession(t *testing.T) {
 	launchStarted := make(chan struct{})
 	release := make(chan struct{})
 	launched := &fakeSession{mint: okMint}
-	var launches int64
+	var launches atomic.Int64
 	m.launch = func(context.Context) (minterSession, error) {
-		atomic.AddInt64(&launches, 1)
+		launches.Add(1)
 		close(launchStarted)
 		<-release
 		return launched, nil
@@ -4446,7 +4439,7 @@ func TestCloseDuringLaunchClosesTheLaunchedSession(t *testing.T) {
 	if got := m.Generation(); got != 0 {
 		t.Errorf("generation = %d, want 0 (a closed Minter publishes nothing)", got)
 	}
-	if got := atomic.LoadInt64(&launches); got != 1 {
+	if got := launches.Load(); got != 1 {
 		t.Errorf("launches = %d, want 1", got)
 	}
 }
@@ -4462,10 +4455,10 @@ func TestCloseDuringLaunchClosesTheLaunchedSession(t *testing.T) {
 func retireUnder(m *Minter) { m.retire(m.Generation(), "retired out from under the request", false) }
 
 func TestMintDoesNotEscalateOnAForeignRetirement(t *testing.T) {
-	var launches int64
+	var launches atomic.Int64
 	m := newBareMinter(0, 0)
 	m.launch = func(context.Context) (minterSession, error) {
-		if atomic.AddInt64(&launches, 1) > 1 {
+		if launches.Add(1) > 1 {
 			return &fakeSession{mint: okMint}, nil
 		}
 		return &fakeSession{mint: func(binding string) (browser.MintResult, error) {
@@ -4486,7 +4479,7 @@ func TestMintDoesNotEscalateOnAForeignRetirement(t *testing.T) {
 	if res.Token != "t" {
 		t.Errorf("token = %q, want the replacement's", res.Token)
 	}
-	if got := atomic.LoadInt64(&launches); got != 2 {
+	if got := launches.Load(); got != 2 {
 		t.Errorf("launches = %d, want 2 (the original plus its replacement)", got)
 	}
 	if got := m.metrics.MintFailures.Load(); got != 1 {
@@ -4498,10 +4491,10 @@ func TestMintDoesNotEscalateOnAForeignRetirement(t *testing.T) {
 }
 
 func TestPlayerContextDoesNotEscalateOnAForeignRetirement(t *testing.T) {
-	var launches int64
+	var launches atomic.Int64
 	m := newBareMinter(0, 0)
 	m.launch = func(context.Context) (minterSession, error) {
-		if atomic.AddInt64(&launches, 1) > 1 {
+		if launches.Add(1) > 1 {
 			return &fakeSession{mint: okMint}, nil
 		}
 		return &fakeSession{mint: okMint, playerCtx: func(string) (browser.PlayerContext, error) {
@@ -4516,7 +4509,7 @@ func TestPlayerContextDoesNotEscalateOnAForeignRetirement(t *testing.T) {
 	if pc.ServerAbrStreamingURL == "" {
 		t.Error("empty context; want the replacement's")
 	}
-	if got := atomic.LoadInt64(&launches); got != 2 {
+	if got := launches.Load(); got != 2 {
 		t.Errorf("launches = %d, want 2 (the original plus its replacement)", got)
 	}
 	if got := m.metrics.PlayerContextFailures.Load(); got != 1 {
@@ -4577,11 +4570,11 @@ func TestReportDropsTheReportedGenerationsCachedTokens(t *testing.T) {
 	// Attempts, not successes: counting only the successful launches would make
 	// the assertion below unfalsifiable, since nothing increments it once
 	// failLaunch is set.
-	var attempts int64
+	var attempts atomic.Int64
 	failLaunch := false
 	m := newBareMinter(0, 0)
 	m.launch = func(context.Context) (minterSession, error) {
-		atomic.AddInt64(&attempts, 1)
+		attempts.Add(1)
 		if failLaunch {
 			return nil, errors.New("no browser")
 		}
@@ -4617,7 +4610,7 @@ func TestReportDropsTheReportedGenerationsCachedTokens(t *testing.T) {
 	// Two attempts: the warm, and the relaunch this request reached because the
 	// cache lookup missed. Had the report kept the tokens, the lookup would hit
 	// and ensure would never run.
-	if got := atomic.LoadInt64(&attempts); got != 2 {
+	if got := attempts.Load(); got != 2 {
 		t.Errorf("launch attempts = %d, want 2 (the warm, plus the relaunch the miss forced)", got)
 	}
 }
@@ -4771,10 +4764,10 @@ func TestPendingReportThenCrashIsNotChargedTwice(t *testing.T) {
 // relaunch, but once the session is gone, refusing would fail a recoverable
 // request and file a crash under status2_rejections.
 func TestPlayerContextCrashDuringConfirmTakesTheReplacement(t *testing.T) {
-	var launches int64
+	var launches atomic.Int64
 	m := newBareMinter(0, 0)
 	m.launch = func(context.Context) (minterSession, error) {
-		if atomic.AddInt64(&launches, 1) > 1 {
+		if launches.Add(1) > 1 {
 			return &fakeSession{mint: okMint}, nil
 		}
 		return &fakeSession{mint: okMint, playerCtx: func(string) (browser.PlayerContext, error) {
@@ -4789,7 +4782,7 @@ func TestPlayerContextCrashDuringConfirmTakesTheReplacement(t *testing.T) {
 	if pc.ServerAbrStreamingURL == "" {
 		t.Error("empty context; want the replacement's")
 	}
-	if got := atomic.LoadInt64(&launches); got != 2 {
+	if got := launches.Load(); got != 2 {
 		t.Errorf("launches = %d, want 2 (the dead session plus its replacement)", got)
 	}
 	if got := m.metrics.Status2Rejections.Load(); got != 0 {
@@ -5022,10 +5015,10 @@ func botCheck() error {
 // request from it: waiting cannot lift a wall that keys on the visitor, and the
 // video itself is fine, so it must not be negative-cached.
 func TestPlayerContextBotCheckRelaunchesAndServesFromReplacement(t *testing.T) {
-	var launches int64
+	var launches atomic.Int64
 	m := newBareMinter(0, 0)
 	m.launch = func(context.Context) (minterSession, error) {
-		if atomic.AddInt64(&launches, 1) == 1 {
+		if launches.Add(1) == 1 {
 			return &fakeSession{mint: okMint, playerCtx: func(string) (browser.PlayerContext, error) {
 				return browser.PlayerContext{}, botCheck()
 			}}, nil
@@ -5041,7 +5034,7 @@ func TestPlayerContextBotCheckRelaunchesAndServesFromReplacement(t *testing.T) {
 	if pc.ServerAbrStreamingURL == "" {
 		t.Error("the replacement served an empty context")
 	}
-	if got := atomic.LoadInt64(&launches); got != 2 {
+	if got := launches.Load(); got != 2 {
 		t.Errorf("launches = %d, want 2 (the bot check relaunches once)", got)
 	}
 	if got := m.metrics.BotChecks.Load(); got != 1 {
@@ -5062,7 +5055,7 @@ func TestPlayerContextBotCheckRelaunchesAndServesFromReplacement(t *testing.T) {
 // replacement's own passing proof must not hand the window a second relaunch.
 func TestPlayerContextBotCheckOnReplacementRefusesWithWait(t *testing.T) {
 	var logs bytes.Buffer
-	var launches int64
+	var launches atomic.Int64
 	var pcCalls atomic.Int64
 	walled := func(string) (browser.PlayerContext, error) {
 		pcCalls.Add(1)
@@ -5071,7 +5064,7 @@ func TestPlayerContextBotCheckOnReplacementRefusesWithWait(t *testing.T) {
 	m := NewMinter("v", browser.Options{Logger: slog.New(slog.NewTextHandler(&logs, nil))}, 0, 0, 0)
 	m.mintSeparation = 0
 	m.launch = func(context.Context) (minterSession, error) {
-		atomic.AddInt64(&launches, 1)
+		launches.Add(1)
 		return &fakeSession{mint: okMint, playerCtx: walled}, nil
 	}
 	ctx := context.Background()
@@ -5090,7 +5083,7 @@ func TestPlayerContextBotCheckOnReplacementRefusesWithWait(t *testing.T) {
 	if got := m.metrics.BotChecks.Load(); got != 2 {
 		t.Errorf("bot_checks = %d, want 2 (the context, then the replacement's)", got)
 	}
-	if got := atomic.LoadInt64(&launches); got != 2 {
+	if got := launches.Load(); got != 2 {
 		t.Errorf("launches = %d, want 2 (the window grants one relaunch)", got)
 	}
 
@@ -5111,7 +5104,7 @@ func TestPlayerContextBotCheckOnReplacementRefusesWithWait(t *testing.T) {
 	if got := pcCalls.Load(); got != before {
 		t.Errorf("PlayerContext calls = %d, want %d (the cool-down must refuse without touching the browser)", got, before)
 	}
-	if got := atomic.LoadInt64(&launches); got != 2 {
+	if got := launches.Load(); got != 2 {
 		t.Errorf("launches = %d, want 2 (a cool-down refusal never relaunches)", got)
 	}
 	if m.metrics.UnprovenRejections.Load() <= preRejections {
@@ -5126,10 +5119,10 @@ func TestPlayerContextBotCheckOnReplacementRefusesWithWait(t *testing.T) {
 // waiting cannot lift it, so the relaunch is immediate and the same request is
 // served from the fresh identity.
 func TestProofBotCheckRelaunchesAtOnce(t *testing.T) {
-	var launches int64
+	var launches atomic.Int64
 	m := newBareMinter(0, 0)
 	m.launch = func(context.Context) (minterSession, error) {
-		if atomic.AddInt64(&launches, 1) == 1 {
+		if launches.Add(1) == 1 {
 			return &fakeSession{mint: okMint, establishErr: botCheck()}, nil
 		}
 		return &fakeSession{mint: okMint}, nil
@@ -5143,7 +5136,7 @@ func TestProofBotCheckRelaunchesAtOnce(t *testing.T) {
 	if pc.ServerAbrStreamingURL == "" {
 		t.Error("the replacement served an empty context")
 	}
-	if got := atomic.LoadInt64(&launches); got != 2 {
+	if got := launches.Load(); got != 2 {
 		t.Errorf("launches = %d, want 2 on the first request (no first-failure cool-down)", got)
 	}
 	if got := m.metrics.BotChecks.Load(); got != 1 {
@@ -5191,10 +5184,10 @@ func TestProofBotCheckOnReplacementIsCountedAndNamed(t *testing.T) {
 // three Chromiums under one mintMu hold. B's bot check is refused with the
 // cool-down, as a walled replacement is elsewhere.
 func TestOneRequestTakesAtMostOneReplacement(t *testing.T) {
-	var launches int64
+	var launches atomic.Int64
 	m := newBareMinter(0, 0)
 	m.launch = func(context.Context) (minterSession, error) {
-		if atomic.AddInt64(&launches, 1) == 1 {
+		if launches.Add(1) == 1 {
 			return &fakeSession{mint: okMint, playerCtx: func(string) (browser.PlayerContext, error) {
 				return browser.PlayerContext{}, errors.New("extraction failed")
 			}}, nil
@@ -5210,7 +5203,7 @@ func TestOneRequestTakesAtMostOneReplacement(t *testing.T) {
 	if ra.After != botCheckCooldown {
 		t.Errorf("After = %v, want %v", ra.After, botCheckCooldown)
 	}
-	if got := atomic.LoadInt64(&launches); got != 2 {
+	if got := launches.Load(); got != 2 {
 		t.Errorf("launches = %d, want 2 (A, then its one replacement B; no C)", got)
 	}
 	if got := m.metrics.BotChecks.Load(); got != 1 {
@@ -5224,10 +5217,10 @@ func TestOneRequestTakesAtMostOneReplacement(t *testing.T) {
 // One fresh identity per window, however many proofs pass in between, and a
 // window that has rolled over grants the next one.
 func TestBotCheckRelaunchOncePerWindow(t *testing.T) {
-	var launches int64
+	var launches atomic.Int64
 	m := newBareMinter(0, 0)
 	m.launch = func(context.Context) (minterSession, error) {
-		atomic.AddInt64(&launches, 1)
+		launches.Add(1)
 		return &fakeSession{mint: okMint, playerCtx: func(string) (browser.PlayerContext, error) {
 			return browser.PlayerContext{}, botCheck()
 		}}, nil
@@ -5243,7 +5236,7 @@ func TestBotCheckRelaunchOncePerWindow(t *testing.T) {
 	if _, _, err := m.PlayerContext(ctx, "vid"); !errors.Is(err, browser.ErrBotCheck) {
 		t.Fatalf("first request err = %v, want ErrBotCheck", err)
 	}
-	if got := atomic.LoadInt64(&launches); got != 2 {
+	if got := launches.Load(); got != 2 {
 		t.Fatalf("launches = %d, want 2", got)
 	}
 
@@ -5252,7 +5245,7 @@ func TestBotCheckRelaunchOncePerWindow(t *testing.T) {
 	if _, _, err := m.PlayerContext(ctx, "vid"); !errors.Is(err, browser.ErrBotCheck) {
 		t.Fatalf("second request err = %v, want ErrBotCheck", err)
 	}
-	if got := atomic.LoadInt64(&launches); got != 2 {
+	if got := launches.Load(); got != 2 {
 		t.Errorf("launches = %d, want 2 (the window's relaunch is spent)", got)
 	}
 
@@ -5264,7 +5257,7 @@ func TestBotCheckRelaunchOncePerWindow(t *testing.T) {
 	if _, _, err := m.PlayerContext(ctx, "vid"); !errors.Is(err, browser.ErrBotCheck) {
 		t.Fatalf("third request err = %v, want ErrBotCheck", err)
 	}
-	if got := atomic.LoadInt64(&launches); got != 3 {
+	if got := launches.Load(); got != 3 {
 		t.Errorf("launches = %d, want 3 (a fresh window grants another relaunch)", got)
 	}
 }
@@ -5274,11 +5267,11 @@ func TestBotCheckRelaunchOncePerWindow(t *testing.T) {
 // a fresh identity. The self-test never relaunches on its own.
 func TestSelfTestBotCheckCountsWithoutCooldown(t *testing.T) {
 	var logs bytes.Buffer
-	var launches int64
+	var launches atomic.Int64
 	m := NewMinter("v", browser.Options{Logger: slog.New(slog.NewTextHandler(&logs, nil))}, 0, 0, 0)
 	m.mintSeparation = 0
 	m.launch = func(context.Context) (minterSession, error) {
-		if atomic.AddInt64(&launches, 1) == 1 {
+		if launches.Add(1) == 1 {
 			return &fakeSession{mint: okMint, establishErr: botCheck()}, nil
 		}
 		return &fakeSession{mint: okMint}, nil
@@ -5291,7 +5284,7 @@ func TestSelfTestBotCheckCountsWithoutCooldown(t *testing.T) {
 	if got := m.metrics.BotChecks.Load(); got != 1 {
 		t.Errorf("bot_checks = %d, want 1", got)
 	}
-	if got := atomic.LoadInt64(&launches); got != 1 {
+	if got := launches.Load(); got != 1 {
 		t.Errorf("launches = %d, want 1 (the self-test never relaunches)", got)
 	}
 	if !strings.Contains(logs.String(), "bot check") {
@@ -5308,7 +5301,7 @@ func TestSelfTestBotCheckCountsWithoutCooldown(t *testing.T) {
 	if _, _, err := m.PlayerContext(ctx, "vid"); err != nil {
 		t.Fatalf("PlayerContext after the self-test: %v", err)
 	}
-	if got := atomic.LoadInt64(&launches); got != 2 {
+	if got := launches.Load(); got != 2 {
 		t.Errorf("launches = %d, want 2 (the first request relaunches)", got)
 	}
 }
@@ -5316,10 +5309,10 @@ func TestSelfTestBotCheckCountsWithoutCooldown(t *testing.T) {
 // /session proves through the same ladder, so a bot check there relaunches too
 // and the caller gets the replacement's identity.
 func TestSessionSnapshotBotCheckRelaunches(t *testing.T) {
-	var launches int64
+	var launches atomic.Int64
 	m := newBareMinter(0, 0)
 	m.launch = func(context.Context) (minterSession, error) {
-		if atomic.AddInt64(&launches, 1) == 1 {
+		if launches.Add(1) == 1 {
 			return &fakeSession{mint: okMint, establishErr: botCheck(), id: browser.Identity{VisitorData: "walled"}}, nil
 		}
 		return &fakeSession{mint: okMint, id: browser.Identity{VisitorData: "fresh"}}, nil
@@ -5332,7 +5325,7 @@ func TestSessionSnapshotBotCheckRelaunches(t *testing.T) {
 	if id.VisitorData != "fresh" {
 		t.Errorf("visitor_data = %q, want the replacement's identity", id.VisitorData)
 	}
-	if got := atomic.LoadInt64(&launches); got != 2 {
+	if got := launches.Load(); got != 2 {
 		t.Errorf("launches = %d, want 2", got)
 	}
 	if got := m.metrics.BotChecks.Load(); got != 1 {
@@ -5345,11 +5338,11 @@ func TestSessionSnapshotBotCheckRelaunches(t *testing.T) {
 // so claiming the grant there would spend it with no fresh identity to show for
 // it and refuse the next real bot check.
 func TestBotCheckOnAnUnrelatedReplacementKeepsTheGrant(t *testing.T) {
-	var launches int64
+	var launches atomic.Int64
 	var pcCalls atomic.Int64
 	m := newBareMinter(0, 0)
 	m.launch = func(context.Context) (minterSession, error) {
-		atomic.AddInt64(&launches, 1)
+		launches.Add(1)
 		return &fakeSession{mint: okMint, playerCtx: func(string) (browser.PlayerContext, error) {
 			// The first request walks the ladder on a plain failure (attempt, retry,
 			// then the replacement); the wall appears only once it is already on that
@@ -5374,14 +5367,14 @@ func TestBotCheckOnAnUnrelatedReplacementKeepsTheGrant(t *testing.T) {
 
 	// The next bot check is the first one that can act on a grant, so it must
 	// still get its fresh identity.
-	before := atomic.LoadInt64(&launches)
+	before := launches.Load()
 	m.mu.Lock()
 	m.proofFailGen, m.proofFailedAt, m.proofFailCause, m.proofFailCooldown = 0, time.Time{}, nil, 0
 	m.mu.Unlock()
 	if _, _, err := m.PlayerContext(ctx, "vid"); !errors.Is(err, browser.ErrBotCheck) {
 		t.Fatalf("second request err = %v, want ErrBotCheck", err)
 	}
-	if got := atomic.LoadInt64(&launches) - before; got != 1 {
+	if got := launches.Load() - before; got != 1 {
 		t.Errorf("launches on the bot check = %d, want 1 (the window's grant was still unspent)", got)
 	}
 }
