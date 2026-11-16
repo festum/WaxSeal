@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/colespringer/waxseal/internal/browser"
+	"github.com/festum/waxseal/internal/browser"
 )
 
 // idleTenants builds a browserless registry that has been up for a day, with

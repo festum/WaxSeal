@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/colespringer/waxseal/server"
+	"github.com/festum/waxseal/server"
 )
 
 // The in-process daemon the e2e and live tests start.

@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/colespringer/waxseal/internal/browser"
+	"github.com/festum/waxseal/internal/browser"
 )
 
 // A daemon whose Chromium was closed for idleness is healthy and says why on

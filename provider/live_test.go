@@ -15,10 +15,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/colespringer/waxseal/client"
-	"github.com/colespringer/waxseal/internal/chromepath"
-	"github.com/colespringer/waxseal/server"
-	waxtap "github.com/colespringer/waxtap/v3"
+	"github.com/festum/waxseal/client"
+	"github.com/festum/waxseal/internal/chromepath"
+	"github.com/festum/waxseal/server"
+	waxtap "github.com/festum/waxtap/v3"
 )
 
 // TestFailedLaunchPingHTTP asks WaxTap's own probe about a daemon whose session

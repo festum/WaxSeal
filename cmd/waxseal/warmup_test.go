@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/colespringer/waxseal/internal/browser"
-	"github.com/colespringer/waxseal/internal/minter"
+	"github.com/festum/waxseal/internal/browser"
+	"github.com/festum/waxseal/internal/minter"
 )
 
 // fakeWarmer scripts the two startup checks and records how often each ran.
