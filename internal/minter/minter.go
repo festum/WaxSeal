@@ -39,6 +39,11 @@ type Minter struct {
 	// logic can run without a browser.
 	launch func(ctx context.Context) (minterSession, error)
 
+	// life ends when Close runs. Launches derive their context from it (see
+	// runLaunch), so one in flight stops at shutdown.
+	life       context.Context
+	lifeCancel context.CancelFunc
+
 	mu   sync.Mutex
 	sess minterSession
 	// closed marks the Minter terminal: ensure refuses to launch once Close sets
@@ -51,9 +56,17 @@ type Minter struct {
 	// means no mint has reported one yet, and maxAge alone bounds the session.
 	grantExpiresAt time.Time
 	watchCancel    context.CancelFunc // cancels the live session's crash watcher on teardown
-	launching      chan struct{}      // non-nil while an attestation is in flight (single-flight)
+	launching      *launchAttempt     // non-nil while an attestation is in flight (single-flight)
 	cache          map[string]cachedToken
 	negCache       map[string]negEntry // terminal player-context errors by video_id, guarded by mu
+
+	// launchFailStreak counts launches that failed in a row since the last
+	// attested session; launchFailedAt and launchFailCause describe the newest.
+	// Together they are the launch cool-down (see launchCooldown), which only a
+	// published session clears. Guarded by mu.
+	launchFailStreak int
+	launchFailedAt   time.Time
+	launchFailCause  error
 
 	// mu guards the streaming deadline, outstanding degradation report, and report
 	// budget state. A suspect mark must not outlive its generation.
@@ -103,6 +116,15 @@ type Minter struct {
 	// so a replacement that proves and then walls on a context cannot claim a
 	// second one.
 	botCheckRelaunchedAt time.Time
+
+	// What the idle timeout measures (see holdPage, closeIdle), guarded by mu.
+	// lastUsedAt is when a request that took the browser last released the
+	// page, or the session was published. pageUsers counts the requests holding
+	// the page or queued for it, and browserUsed says the one holding it was
+	// handed a session or ran a launch for one.
+	lastUsedAt  time.Time
+	pageUsers   int
+	browserUsed bool
 
 	// retiredGen and retiredCrash record the last generation torn down and
 	// whether the browser died under it, so sessionDied cannot mistake an
@@ -159,6 +181,11 @@ type minterMetrics struct {
 	LaunchFailures atomic.Int64
 	Mints          atomic.Int64
 	MintFailures   atomic.Int64 // per attempt (see minterMetrics doc)
+	// LaunchCooldownRefusals counts callers that needed a session while the
+	// launch cool-down was open, so no launch ran. Nearly all are requests, once
+	// each. The startup warm-up's background retry waits the window out, and is
+	// counted only when a request's failed launch reopened it meanwhile.
+	LaunchCooldownRefusals atomic.Int64
 	// Escalations counts generations a request abandoned for a fresh one: a
 	// ladder's second failure (mint, player-context, or proof) or a bot check,
 	// whether the relaunch runs at once or falls to the next request. It counts
@@ -215,14 +242,17 @@ type minterMetrics struct {
 	// Session recycles are separated by cause.
 	StreamingRecycles    atomic.Int64 // time-based recycle on a streaming handoff
 	ReportDrivenRecycles atomic.Int64 // recycle triggered by a consumer degradation report
+	// IdleCloses counts sessions closed for going unused past the idle timeout.
+	// Nothing replaces one until a request needs it, so it is not a recycle.
+	IdleCloses atomic.Int64
 
 	// Consumer degradation reports, classified by disposition.
 	DegradationReportsAccepted      atomic.Int64
 	DegradationReportsRejectedStale atomic.Int64 // named an old or replaced generation
 	DegradationReportsRateLimited   atomic.Int64 // rejected by the debounce
 	// DegradationReportsAlreadyRetired counts reports naming the current
-	// generation whose session was already retired by a crash or a prior report.
-	// This is a benign no-op, not a stale report.
+	// generation whose session was already retired, with no replacement
+	// attested yet. This is a benign no-op, not a stale report.
 	DegradationReportsAlreadyRetired atomic.Int64
 	// DegradationReportsDuplicatePending counts a repeat report for a generation
 	// whose retirement is already pending. DegradationReportsAccepted counts only
@@ -291,6 +321,14 @@ const (
 	// passing proof does not reset it (see botCheckRelaunchedAt).
 	botCheckRelaunchWindow = 10 * time.Minute
 
+	// launchRetryBase is how long the first failed launch refuses requests before
+	// another is tried, and launchRetryMax caps the doubling. Without the window
+	// every request on an address YouTube refuses loads a page of its own, one
+	// after another under mintMu. The cap allows 12 launches an hour, the rate
+	// the default report budget sustains; --report-debounce does not move it.
+	launchRetryBase = 15 * time.Second
+	launchRetryMax  = 5 * time.Minute
+
 	// pingProbeTimeout allows for a busy host without leaving /ping unbounded.
 	pingProbeTimeout = 5 * time.Second
 
@@ -301,6 +339,15 @@ const (
 
 // selfTestMintRetryDelay is variable so tests can shorten the retry interval.
 var selfTestMintRetryDelay = 1 * time.Second
+
+// launchBudget bounds one session launch. A launch runs on the Minter's clock
+// (see runLaunch), so this, not a request's deadline, is what ends one that
+// hangs. It has to cover what a healthy launch can contain on a slow host: a
+// relaunch of the shared Chromium (a handshake of up to 60 s), the 45 s
+// navigation budget, and the attestation behind them. A shorter one grades a
+// launch that was only slow and opens a cool-down nothing earned. Tests
+// shorten it, so it is a var.
+var launchBudget = 3 * time.Minute
 
 // ErrNoSession reports that the tenant has no attested session, which callers
 // such as server /ping treat as benign rather than as a probe failure.
@@ -321,6 +368,14 @@ var ErrClosed = errors.New("waxseal: minter closed")
 // streaming, so nothing was handed out (see ensureProven). Callers use it to
 // tell a refusal from an extraction failure.
 var ErrUnproven = errors.New("waxseal: session has not proved full-length streaming")
+
+// ErrLaunchCooldown reports a request refused without a launch because the last
+// one failed too recently (see launchCooldown). It wraps that failure.
+var ErrLaunchCooldown = errors.New("waxseal: session launch is cooling down")
+
+// ErrSelfTestMint reports that SelfTest attested a session and then could not
+// mint with it, which no answer from YouTube explains.
+var ErrSelfTestMint = errors.New("minter: self-test mint failed")
 
 // RetryAfterError wraps a refusal the daemon expects to lift on its own and says
 // how long the caller should wait before asking again: the rest of a cool-down,
@@ -343,6 +398,39 @@ func (e *RetryAfterError) Seconds() int { return max(1, ceilSeconds(e.After)) }
 // the whole window.
 func unprovenRefusal(cause error) error {
 	return &RetryAfterError{Err: fmt.Errorf("%w: %w", ErrUnproven, cause), After: proofRetryCooldown}
+}
+
+// launchCooldown is the window the streak'th consecutive failed launch opens:
+// launchRetryBase doubled per failure, capped at launchRetryMax.
+func launchCooldown(streak int) time.Duration {
+	d := launchRetryBase
+	for i := 1; i < streak; i++ {
+		if d *= 2; d >= launchRetryMax {
+			return launchRetryMax
+		}
+	}
+	return d
+}
+
+// launchWaitLocked is what remains of the launch cool-down at now, or zero when
+// none is open. The caller must hold m.mu.
+func (m *Minter) launchWaitLocked(now time.Time) time.Duration {
+	if m.launchFailStreak == 0 {
+		return 0
+	}
+	return max(0, m.launchFailedAt.Add(launchCooldown(m.launchFailStreak)).Sub(now))
+}
+
+// gradeLaunch sorts a failed launch. graded says the next one would fail too,
+// so it opens the cool-down. A pool that is closed or backing off, and a
+// browser that died under the launch, are not graded: the pool relaunches a
+// dead browser and rate-limits that itself, and poolWait is what remains of its
+// backoff when that is what refused.
+func gradeLaunch(err error) (graded bool, poolWait time.Duration) {
+	if be, ok := errors.AsType[*browser.RelaunchBackoffError](err); ok {
+		return false, be.Wait
+	}
+	return !errors.Is(err, browser.ErrPoolClosed) && !errors.Is(err, browser.ErrConnClosed), 0
 }
 
 // botCheckRefusal is the refusal that starts a bot-check cool-down. The cause
@@ -381,6 +469,7 @@ func NewMinter(video string, opts browser.Options, streamingMaxAge, reportDeboun
 		negCache:        make(map[string]negEntry),
 	}
 	m.launch = m.launchReal
+	m.life, m.lifeCancel = context.WithCancel(context.Background())
 	return m
 }
 
@@ -660,8 +749,8 @@ func (m *Minter) relaunchAndProve(ctx context.Context, sess minterSession, gen u
 	}
 	newSess, newGen, err := m.ensure(ctx)
 	if err != nil {
-		// ensure counted the failed launch under launch_failures, so it is not
-		// also an unproven rejection.
+		// A launch that failed counts itself under launch_failures, so this is
+		// not also an unproven rejection.
 		return nil, 0, err
 	}
 	proofErr := newSess.EnsureEstablished(ctx)
@@ -819,8 +908,7 @@ func (m *Minter) launchReal(ctx context.Context) (minterSession, error) {
 // close an aged session under a request that holds it; running Warm before
 // Serve is then a convenience, not a correctness condition.
 func (m *Minter) Warm(ctx context.Context) error {
-	m.mintMu.Lock()
-	defer m.mintMu.Unlock()
+	defer m.holdPage()()
 	_, _, err := m.ensure(ctx)
 	return err
 }
@@ -922,9 +1010,20 @@ func (m *Minter) recycleCauseLocked() string {
 	}
 }
 
-// ensure returns the live session and its generation. Concurrent launches
-// coalesce into one attestation, and a session older than maxAge or past its
-// grant is recycled.
+// launchAttempt is one single-flighted launch. Its outcome, err or the session
+// and generation it published, is written before done is closed and never
+// after, so a waiter reads it once done is closed.
+type launchAttempt struct {
+	done chan struct{}
+	err  error
+	sess minterSession
+	gen  uint64
+}
+
+// ensure returns the live session and its generation, launching one if there
+// is none. Concurrent callers share one launch and its outcome, and a session
+// older than maxAge or past its grant is recycled. ctx bounds only the wait:
+// the launch itself runs in runLaunch and outlives a caller that leaves.
 func (m *Minter) ensure(ctx context.Context) (minterSession, uint64, error) {
 	for {
 		m.mu.Lock()
@@ -954,124 +1053,183 @@ func (m *Minter) ensure(ctx context.Context) (minterSession, uint64, error) {
 		}
 		if m.sess != nil {
 			s, g := m.sess, m.gen
+			m.browserUsed = true
 			m.mu.Unlock()
 			return s, g, nil
 		}
-		if m.launching != nil { // another goroutine is attesting; wait for it.
-			ch := m.launching
-			m.mu.Unlock()
-			select {
-			case <-ch:
-			case <-ctx.Done():
-				return nil, 0, ctx.Err()
+		la := m.launching
+		if la == nil {
+			if wait := m.launchWaitLocked(time.Now()); wait > 0 {
+				streak, cause := m.launchFailStreak, m.launchFailCause
+				m.mu.Unlock()
+				m.metrics.LaunchCooldownRefusals.Add(1)
+				m.log.Debug("minter: refusing to launch; the last launch failed too recently",
+					"consecutive_failures", streak, "remaining", wait.Round(time.Millisecond))
+				return nil, 0, &RetryAfterError{
+					Err:   fmt.Errorf("%w (failed launches in a row: %d): %w", ErrLaunchCooldown, streak, cause),
+					After: wait,
+				}
 			}
-			continue
+			la = &launchAttempt{done: make(chan struct{})}
+			m.launching = la
+			go m.runLaunch(la)
 		}
-		// We own the (single-flighted) launch.
-		ch := make(chan struct{})
-		m.launching = ch
+		// A launch runs the browser whatever comes of it, so waiting on one is
+		// use; the cool-down refusal above never got this far.
+		m.browserUsed = true
 		m.mu.Unlock()
-
-		sess, err := m.launch(ctx)
-
-		// Mint the visitor's GVS token before publishing the session, while no
-		// other call can reach the page. It puts the token a consumer streams with
-		// well ahead of the first context establishment, the spacing
-		// waitSeparation then keeps. A failure is not fatal: the session is
-		// published anyway and the next token request mints on demand.
-		var premint browser.MintResult
-		var premintBinding string
-		preminted := false
-		if err == nil && !m.skipPremint {
-			premintBinding = sess.Identity().VisitorData
-			res, mintErr := sess.Mint(ctx, premintBinding)
-			switch {
-			case mintErr == nil:
-				m.metrics.Mints.Add(1)
-				premint, preminted = res, true
-			case ctx.Err() != nil:
-				// A canceled or timed-out launch is not a mint failure, matching Mint.
-				m.log.Warn("minter: startup mint abandoned", "err", mintErr)
-			default:
-				m.metrics.MintFailures.Add(1)
-				m.log.Warn("minter: startup mint failed; the next token request mints on demand", "err", mintErr)
-			}
+		select {
+		case <-la.done:
+		case <-ctx.Done():
+			return nil, 0, ctx.Err()
 		}
+		// Hand back what the launch published rather than reading m.sess again
+		// through the recycle check above, which would retire a session the
+		// moment it was born once a bound had passed. A crash since then is the
+		// caller's to meet, as it is for any session (see sessionDied).
+		return la.sess, la.gen, la.err
+	}
+}
 
-		var shortGrant bool
-		m.mu.Lock()
-		m.launching = nil
-		close(ch)
-		if err != nil {
-			m.mu.Unlock()
-			m.metrics.LaunchFailures.Add(1)
-			// Pass the pool's remaining backoff on as the caller's wait.
-			if be, ok := errors.AsType[*browser.RelaunchBackoffError](err); ok {
-				err = &RetryAfterError{Err: err, After: be.Wait}
-			}
-			return nil, 0, err
+// runLaunch launches, attests, and pre-mints one session, then publishes it or
+// records why it could not, and releases everyone waiting on la.
+//
+// It runs on the Minter's clock, bounded by launchBudget and ended early only
+// by Close. Tying it to the request that asked would let a consumer whose
+// timeout is shorter than a failing launch abandon every one before its
+// verdict: no cool-down would open and each retry would launch again. It also
+// leaves a caller that gave up on a slow launch a session for its next try.
+func (m *Minter) runLaunch(la *launchAttempt) {
+	ctx, cancel := context.WithTimeout(m.life, launchBudget)
+	defer cancel()
+	sess, err := m.launch(ctx)
+	if err != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		err = fmt.Errorf("waxseal: session launch ran out its %s budget: %w", launchBudget, err)
+	}
+
+	// Mint the visitor's GVS token before publishing the session, while no
+	// other call can reach the page. It puts the token a consumer streams with
+	// well ahead of the first context establishment, the spacing
+	// waitSeparation then keeps. A failure is not fatal: the session is
+	// published anyway and the next token request mints on demand.
+	var premint browser.MintResult
+	var premintBinding string
+	preminted := false
+	if err == nil && !m.skipPremint {
+		premintBinding = sess.Identity().VisitorData
+		res, mintErr := sess.Mint(ctx, premintBinding)
+		switch {
+		case mintErr == nil:
+			m.metrics.Mints.Add(1)
+			premint, preminted = res, true
+		case ctx.Err() != nil:
+			// A launch out of budget or shut down is not a mint failure, matching Mint.
+			m.log.Warn("minter: startup mint abandoned", "err", mintErr)
+		default:
+			m.metrics.MintFailures.Add(1)
+			m.log.Warn("minter: startup mint failed; the next token request mints on demand", "err", mintErr)
 		}
-		if m.closed {
-			// Close landed during the launch, the one way a session can still
-			// reach publication after Close. Discard it rather than leave the pool
-			// a browser context nothing will close; waiters released by close(ch)
-			// hit the closed check at the top.
-			m.mu.Unlock()
+	}
+
+	var shortGrant bool
+	m.mu.Lock()
+	m.launching = nil
+	if m.closed {
+		// Close landed during the launch, the one way a session can still reach
+		// publication after Close. Discard it rather than leave the pool a
+		// browser context nothing will close.
+		m.mu.Unlock()
+		if sess != nil {
 			// Log it, or a launch that attested, maybe pre-minted, and produced
 			// nothing leaves a gap between the counters and the session log.
 			m.log.Info("minter: discarding a session that finished launching after Close", "preminted", preminted)
 			sess.Close()
-			return nil, 0, ErrClosed
 		}
-		m.sess = sess
-		m.gen++
-		// Fixed before the pre-mint's grant is recorded, which is measured against it.
-		m.attestedAt = time.Now()
-		// A new page starts with no marks and no proof-failure record. A
-		// successful pre-mint sets its first mark below.
-		m.lastMintAt = time.Time{}
-		m.lastProofAt = time.Time{}
-		m.lastEstablishAt = time.Time{}
-		m.grantExpiresAt = time.Time{}
-		m.proofFailGen = 0
-		m.proofFailedAt = time.Time{}
-		m.proofCooldownWarnedAt = time.Time{}
-		m.proofFailCause, m.proofFailCooldown = nil, 0
-		// A generation bump invalidates every cached token; under m.mu no
-		// new-generation cachePut can precede the clear. The negative cache stays:
-		// an unplayable video remains unplayable across a relaunch.
-		clear(m.cache)
-		if preminted {
-			m.lastMintAt = time.Now()
-			// The pre-mint's expiry bounds the session alongside maxAge. A result
-			// without one leaves that to a later mint, and one already inside the
-			// cache margin is dropped (see grantWorthRecording).
-			shortGrant = m.recordGrantLocked(m.gen, m.attestedAt, premint.ExpiresAt)
-			// Cache the pre-mint under both gvs and the default pot scope: scope
-			// only namespaces the cache, and the token is the same either way.
-			// Writing it in the critical section that publishes m.sess means no
-			// caller sees the session without its token.
-			m.cachePutLocked(cacheKey("gvs", premintBinding), premint, m.gen)
-			m.cachePutLocked(cacheKey("pot", premintBinding), premint, m.gen)
-		}
-		// Arm the streaming deadline for this generation.
-		if m.streamingMaxAge > 0 {
-			m.streamingDeadline = time.Now().Add(jitter(m.streamingMaxAge))
-		}
-		g := m.gen
-		// The crash watcher must outlive the (transient) launch ctx, so give it a
-		// session-scoped context canceled only when this session is torn down.
-		watchCtx, cancel := context.WithCancel(context.Background())
-		m.watchCancel = cancel
-		m.mu.Unlock()
-		m.metrics.Attestations.Add(1)
-		if shortGrant {
-			m.warnShortGrant(g, premint.ExpiresAt)
-		}
-		m.log.Info("minter: session ready", "gen", g, "attest", sess.AttestKind())
-		go m.watchCrash(sess, watchCtx, g)
-		return sess, g, nil
+		la.err = ErrClosed
+		close(la.done)
+		return
 	}
+	if err != nil {
+		graded, poolWait := gradeLaunch(err)
+		var streak int
+		var window time.Duration
+		if graded {
+			m.launchFailStreak++
+			m.launchFailedAt, m.launchFailCause = time.Now(), err
+			streak, window = m.launchFailStreak, launchCooldown(m.launchFailStreak)
+		}
+		m.mu.Unlock()
+		m.metrics.LaunchFailures.Add(1)
+		switch {
+		case graded:
+			// The one line a failed launch gets while serving: no handler logs
+			// a refusal.
+			m.log.Warn("minter: session launch failed; refusing requests that need one until the cool-down passes",
+				"err", err, "consecutive_failures", streak, "retry_in", window)
+			err = &RetryAfterError{Err: err, After: window}
+		case poolWait > 0:
+			// Pass the pool's remaining backoff on as the caller's wait.
+			err = &RetryAfterError{Err: err, After: poolWait}
+		default:
+			m.log.Debug("minter: session launch did not reach a verdict; no cool-down", "err", err)
+		}
+		la.err = err
+		close(la.done)
+		return
+	}
+	m.sess = sess
+	m.gen++
+	// Fixed before the pre-mint's grant is recorded, which is measured against it.
+	m.attestedAt = time.Now()
+	// A session whose launch outlived its caller still gets the whole idle
+	// timeout before closeIdle takes it.
+	m.lastUsedAt = m.attestedAt
+	// A new page starts with no marks and no proof-failure record. A
+	// successful pre-mint sets its first mark below.
+	m.lastMintAt = time.Time{}
+	m.lastProofAt = time.Time{}
+	m.lastEstablishAt = time.Time{}
+	m.grantExpiresAt = time.Time{}
+	m.proofFailGen = 0
+	m.proofFailedAt = time.Time{}
+	m.proofCooldownWarnedAt = time.Time{}
+	m.proofFailCause, m.proofFailCooldown = nil, 0
+	m.launchFailStreak, m.launchFailedAt, m.launchFailCause = 0, time.Time{}, nil
+	// A generation bump invalidates every cached token; under m.mu no
+	// new-generation cachePut can precede the clear. The negative cache stays:
+	// an unplayable video remains unplayable across a relaunch.
+	clear(m.cache)
+	if preminted {
+		m.lastMintAt = time.Now()
+		// The pre-mint's expiry bounds the session alongside maxAge. A result
+		// without one leaves that to a later mint, and one already inside the
+		// cache margin is dropped (see grantWorthRecording).
+		shortGrant = m.recordGrantLocked(m.gen, m.attestedAt, premint.ExpiresAt)
+		// Cache the pre-mint under both gvs and the default pot scope: scope
+		// only namespaces the cache, and the token is the same either way.
+		// Writing it in the critical section that publishes m.sess means no
+		// caller sees the session without its token.
+		m.cachePutLocked(cacheKey("gvs", premintBinding), premint, m.gen)
+		m.cachePutLocked(cacheKey("pot", premintBinding), premint, m.gen)
+	}
+	// Arm the streaming deadline for this generation.
+	if m.streamingMaxAge > 0 {
+		m.streamingDeadline = time.Now().Add(jitter(m.streamingMaxAge))
+	}
+	g := m.gen
+	// The crash watcher lives as long as the session, not the launch, so it
+	// gets a context canceled only when this session is torn down.
+	watchCtx, watchCancel := context.WithCancel(context.Background())
+	m.watchCancel = watchCancel
+	m.mu.Unlock()
+	m.metrics.Attestations.Add(1)
+	if shortGrant {
+		m.warnShortGrant(g, premint.ExpiresAt)
+	}
+	m.log.Info("minter: session ready", "gen", g, "attest", sess.AttestKind())
+	go m.watchCrash(sess, watchCtx, g)
+	la.sess, la.gen = sess, g
+	close(la.done)
 }
 
 // retire closes generation gen if it is current and reports whether it closed a
@@ -1080,13 +1238,33 @@ func (m *Minter) ensure(ctx context.Context) (minterSession, uint64, error) {
 // retirement attempts idempotent.
 func (m *Minter) retire(gen uint64, reason string, isCrash bool) bool {
 	m.mu.Lock()
-	if m.sess == nil || m.gen != gen {
-		m.mu.Unlock()
+	d, _, ok := m.detachLocked(gen, isCrash)
+	m.mu.Unlock()
+	if !ok {
 		return false
 	}
-	old := m.sess
+	m.closeDetached(d, slog.LevelWarn, reason)
+	return true
+}
+
+// detached is a session detachLocked took off the minter, for closeDetached to
+// finish once mu is released.
+type detached struct {
+	gen    uint64
+	sess   minterSession
+	cancel context.CancelFunc
+}
+
+// detachLocked takes generation gen's session off the minter if gen is current
+// and has one, and clears any report pending on it; reported says one was. The
+// caller holds mu, and passes what it gets to closeDetached after releasing it.
+func (m *Minter) detachLocked(gen uint64, isCrash bool) (d detached, reported, ok bool) {
+	if m.sess == nil || m.gen != gen {
+		return detached{}, false, false
+	}
+	d = detached{gen: gen, sess: m.sess, cancel: m.watchCancel}
+	reported = gen != 0 && m.reportSuspectGen == gen
 	m.sess = nil
-	cancel := m.watchCancel
 	m.watchCancel = nil
 	m.dropReportedGenerationLocked(gen)
 	m.reportSuspectGen = 0
@@ -1095,12 +1273,91 @@ func (m *Minter) retire(gen uint64, reason string, isCrash bool) bool {
 	if isCrash {
 		m.metrics.Crashes.Add(1)
 	}
-	m.mu.Unlock()
-	if cancel != nil {
-		cancel()
+	return d, reported, true
+}
+
+// closeDetached logs a detached session's retirement at level and closes it.
+func (m *Minter) closeDetached(d detached, level slog.Level, reason string) {
+	if d.cancel != nil {
+		d.cancel()
 	}
-	m.log.Warn("minter: retiring session", "gen", gen, "reason", reason)
-	old.Close()
+	m.log.Log(context.Background(), level, "minter: retiring session", "gen", d.gen, "reason", reason)
+	d.sess.Close()
+}
+
+// holdPage takes the page for a request, as defer m.holdPage()(). It is
+// mintMu's Lock and Unlock with the use the idle timeout measures tied to
+// them, so a request cannot take the page without being counted. A request is
+// use from the moment it queues for the page until it lets go. What it leaves
+// behind as the last use is the moment it let go, and only if it took the
+// browser (see ensure): a token found cached after the wait and a cool-down
+// refusal never touch it, so a retry storm against a failing tenant does not
+// keep the browser awake. The paths that only try the lock (closeIdle, Health,
+// ReportDegraded) are not use.
+func (m *Minter) holdPage() (release func()) {
+	m.mu.Lock()
+	m.pageUsers++
+	m.mu.Unlock()
+	m.mintMu.Lock()
+	return func() {
+		m.mu.Lock()
+		m.pageUsers--
+		if m.browserUsed {
+			m.browserUsed = false
+			m.lastUsedAt = time.Now()
+		}
+		m.mu.Unlock()
+		m.mintMu.Unlock()
+	}
+}
+
+// lastUsed is when the tenant last used the browser: now while a request holds
+// the page or waits for it, and zero if none ever took it.
+func (m *Minter) lastUsed() time.Time {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.pageUsers > 0 {
+		return time.Now()
+	}
+	return m.lastUsedAt
+}
+
+// closeIdle closes the session if no request has used it for idle, and reports
+// whether it did. A request holding the page is a use in progress. The next
+// request that needs a session launches one, as after any retirement, and the
+// cached tokens stay servable meanwhile: a token outlives the page that minted
+// it (see dropReportedGenerationLocked).
+func (m *Minter) closeIdle(idle time.Duration) bool {
+	if !m.mintMu.TryLock() {
+		return false
+	}
+	defer m.mintMu.Unlock()
+	return m.closeIdleLocked(idle)
+}
+
+// closeIdleLocked is closeIdle once it has the page. A request that queued for
+// the page in the meantime keeps the session it came for.
+func (m *Minter) closeIdleLocked(idle time.Duration) bool {
+	m.mu.Lock()
+	unused := time.Since(m.lastUsedAt)
+	if m.sess == nil || m.pageUsers > 0 || unused < idle {
+		m.mu.Unlock()
+		return false
+	}
+	// A report still pending on the session is why it closes. The timeout only
+	// supplies the moment, so the close is the report's recycle, not an idle one.
+	// Reading the report in the hold of mu that detaches the session books one
+	// that lands during the pass the same way.
+	d, reported, _ := m.detachLocked(m.gen, false)
+	m.mu.Unlock()
+	if reported {
+		m.closeDetached(d, slog.LevelWarn, "consumer reported degradation; closing the idle session")
+		m.bookReportRecycle()
+		return false
+	}
+	// Info, not Warn: an idle close answers nothing that went wrong.
+	m.closeDetached(d, slog.LevelInfo, "unused for "+unused.Round(time.Second).String())
+	m.metrics.IdleCloses.Add(1)
 	return true
 }
 
@@ -1125,24 +1382,35 @@ func (m *Minter) watchCrash(s minterSession, ctx context.Context, gen uint64) {
 	m.retire(gen, reason, true)
 }
 
+// reportRelaunchReason is the retirement reason when a request consumes a
+// pending report: its own launch follows.
+const reportRelaunchReason = "consumer reported degradation; relaunching"
+
 // retireReported retires the current generation when a consumer report is
 // pending on it, charging the report budget the way an immediate retirement
 // does. Every request that takes the page calls it first, so a deferred report
-// is consumed by the next request of any kind. The caller holds mintMu.
-func (m *Minter) retireReported() bool {
+// is consumed by the next request of any kind, and the idle close books one
+// the same way for a session no request came back to. reason is the log
+// line's. The caller holds mintMu.
+func (m *Minter) retireReported(reason string) bool {
 	m.mu.Lock()
 	cur := m.gen
 	suspect := m.sess != nil && m.reportSuspectGen == cur && cur != 0
 	m.mu.Unlock()
-	if !suspect || !m.retire(cur, "consumer reported degradation; relaunching", false) {
+	if !suspect || !m.retire(cur, reason, false) {
 		return false
 	}
+	m.bookReportRecycle()
+	return true
+}
+
+// bookReportRecycle counts a session a consumer report closed and charges it to
+// the report budget, which deferred and immediate report-driven recycles share.
+func (m *Minter) bookReportRecycle() {
 	m.metrics.ReportDrivenRecycles.Add(1)
-	// Deferred and immediate report-driven recycles share one budget.
 	m.mu.Lock()
 	m.spendReportTokenLocked()
 	m.mu.Unlock()
-	return true
 }
 
 // refreshStreamingSession replaces a stale or reported-degraded session before a
@@ -1150,7 +1418,7 @@ func (m *Minter) retireReported() bool {
 // recycle an otherwise usable session for age, though they do consume a pending
 // report the same way this does.
 func (m *Minter) refreshStreamingSession(ctx context.Context) (minterSession, uint64, error) {
-	if !m.retireReported() {
+	if !m.retireReported(reportRelaunchReason) {
 		m.mu.Lock()
 		cur := m.gen
 		stale := m.sess != nil && !m.streamingDeadline.IsZero() && time.Now().After(m.streamingDeadline)
@@ -1175,8 +1443,9 @@ func (m *Minter) Generation() uint64 {
 // ReportResult describes how the minter handled a degradation report. Accepted
 // means the report applies to the current session; Retired, that the session
 // was closed at once; RetirementPending, that the next request to take the page
-// will close it. Accepted with neither means a crash or recycle closed the
-// session first. RetryAfterSeconds is set when the report was rate-limited.
+// will close it. Accepted with neither means the session closed before the
+// report could retire it. RetryAfterSeconds is set when the report was
+// rate-limited.
 type ReportResult struct {
 	Accepted          bool
 	Retired           bool
@@ -1202,8 +1471,8 @@ func (m *Minter) ReportDegraded(gen uint64, videoID, reason string) ReportResult
 		m.metrics.DegradationReportsRejectedStale.Add(1)
 		return ReportResult{Accepted: false, Generation: cur}
 	case m.sess == nil:
-		// The current generation, already retired (by a crash or a prior report)
-		// before the next request relaunches: a benign no-op, not a stale report.
+		// The current generation, already retired with no replacement attested
+		// yet: a benign no-op, not a stale report.
 		// It must precede the rate-limit case: a report-driven retire leaves gen
 		// unchanged and spends budget, so a re-report can match both.
 		// TestMinterReportDegradedAlreadyRetired pins the order.
@@ -1238,12 +1507,9 @@ func (m *Minter) ReportDegraded(gen uint64, videoID, reason string) ReportResult
 	if m.mintMu.TryLock() {
 		acted := m.retire(gen, retireReason, false)
 		if acted {
-			m.mu.Lock()
-			m.spendReportTokenLocked()
-			m.mu.Unlock()
-			m.metrics.ReportDrivenRecycles.Add(1)
+			m.bookReportRecycle()
 		} else {
-			m.log.Debug("minter: report accepted but nothing was left to retire; a crash or recycle landed first", "gen", gen)
+			m.log.Debug("minter: report accepted but its session had already closed", "gen", gen)
 		}
 		m.mintMu.Unlock()
 		return ReportResult{Accepted: true, Retired: acted, Generation: gen}
@@ -1273,8 +1539,8 @@ func (m *Minter) refillReportTokensLocked(now time.Time) {
 }
 
 // spendReportTokenLocked consumes one token of report budget. It is called only
-// after a report-driven retire recycled the session, so a no-op retire (a crash
-// or recycle got there first) never spends budget. The caller must hold m.mu.
+// after a report-driven retire recycled the session, so a no-op retire (the
+// session had already closed) never spends budget. The caller must hold m.mu.
 func (m *Minter) spendReportTokenLocked() {
 	m.refillReportTokensLocked(time.Now())
 	m.reportTokens = max(m.reportTokens-1, 0)
@@ -1294,11 +1560,10 @@ func (m *Minter) Mint(ctx context.Context, scope, binding string) (res browser.M
 		}
 	}
 
-	m.mintMu.Lock() // one page, so mints serialize
-	defer m.mintMu.Unlock()
+	defer m.holdPage()() // one page, so mints serialize
 	// Taking the page consumes a pending report, so no fresh token comes from a
 	// session the consumer called degraded.
-	m.retireReported()
+	m.retireReported(reportRelaunchReason)
 	// Recheck after waiting for mintMu, which can take as long as a full-length
 	// proof: another goroutine may have filled the cache, or the session may have
 	// aged past its bound.
@@ -1320,7 +1585,13 @@ func (m *Minter) Mint(ctx context.Context, scope, binding string) (res browser.M
 		if ctx.Err() == nil {
 			if r, ok := m.cacheGet(key); ok {
 				m.metrics.CacheHits.Add(1)
-				m.log.Warn("minter: serving a cached token from the aged generation; its replacement could not be launched", "err", err)
+				// Warn for the launch that failed, not for each request its
+				// cool-down then refuses at once: that is the request rate.
+				level := slog.LevelWarn
+				if errors.Is(err, ErrLaunchCooldown) {
+					level = slog.LevelDebug
+				}
+				m.log.Log(ctx, level, "minter: serving a cached token from the aged generation; its replacement could not be launched", "err", err)
 				return r, true, nil
 			}
 		}
@@ -1415,8 +1686,7 @@ func (m *Minter) PlayerContext(ctx context.Context, videoID string) (browser.Pla
 		return browser.PlayerContext{}, 0, err
 	}
 
-	m.mintMu.Lock() // one page, so player-context calls serialize with mints
-	defer m.mintMu.Unlock()
+	defer m.holdPage()() // one page, so player-context calls serialize with mints
 
 	sess, gen, err := m.refreshStreamingSession(ctx)
 	if err != nil {
@@ -1823,8 +2093,7 @@ func (m *Minter) cachePutLocked(key string, res browser.MintResult, gen uint64) 
 // is harmless (see ensureProven). The startup self-test normally proves the
 // session first, so this costs nothing.
 func (m *Minter) SessionSnapshot(ctx context.Context) (browser.Identity, []*http.Cookie, uint64, error) {
-	m.mintMu.Lock()
-	defer m.mintMu.Unlock()
+	defer m.holdPage()()
 	// A session lost after its proof, while its cookies are read, is replaced
 	// once, like one that dies during the proof; the replacement is not itself
 	// replaced.
@@ -1863,6 +2132,12 @@ type HealthSnapshot struct {
 	BrowserProofEstablished bool
 	LastBrowserProofOutcome string
 	StreamingSuspect        bool // a consumer reported this generation degraded
+	// ConsecutiveLaunchFailures and LaunchRetryAfterSecs are set only when no
+	// session is live: the graded launches that have failed in a row since the
+	// last attested session, and what is left of the cool-down holding the next
+	// back, rounded as /metrics rounds it (0 when none is open).
+	ConsecutiveLaunchFailures int
+	LaunchRetryAfterSecs      int
 }
 
 // failHealth is the return value for a non-live Health outcome. It carries the
@@ -1870,6 +2145,29 @@ type HealthSnapshot struct {
 // routing every failure path through it keeps a new one from reporting 0.
 func failHealth(gen uint64, err error) (HealthSnapshot, bool, error) {
 	return HealthSnapshot{Generation: gen}, false, err
+}
+
+// noSession is Health's answer when no session is live. A tenant whose last
+// launch failed says so, with the failure in the error, so a daemon YouTube
+// refuses does not read like one that is only idle.
+//
+// It is benign whatever failed, a fault in the browser included. A launch that
+// failed is history, not something this probe observed, and on an idle daemon
+// nothing launches again to clear a verdict built on it.
+func (m *Minter) noSession() (HealthSnapshot, bool, error) {
+	m.mu.Lock()
+	snap := HealthSnapshot{
+		Generation:                m.gen,
+		ConsecutiveLaunchFailures: m.launchFailStreak,
+		LaunchRetryAfterSecs:      ceilSeconds(m.launchWaitLocked(time.Now())),
+	}
+	cause := m.launchFailCause
+	m.mu.Unlock()
+	if cause == nil {
+		return snap, false, ErrNoSession
+	}
+	// %v: a health report must not route on the failure it quotes.
+	return snap, false, fmt.Errorf("%w: the last session launch failed: %v", ErrNoSession, cause)
 }
 
 // isSuperseded reports whether the live session or generation changed since
@@ -1918,7 +2216,7 @@ func (m *Minter) Health(ctx context.Context) (HealthSnapshot, bool, error) {
 		sess, gen := m.sess, m.gen
 		m.mu.Unlock()
 		if sess == nil {
-			return failHealth(gen, ErrNoSession)
+			return m.noSession()
 		}
 
 		err := m.probe(ctx, sess)
@@ -1978,10 +2276,7 @@ func (m *Minter) Health(ctx context.Context) (HealthSnapshot, bool, error) {
 	}
 	// Superseded on every attempt: report a soft no-session with the current
 	// generation, so /ping still shows the last-known N rather than 0.
-	m.mu.Lock()
-	gen := m.gen
-	m.mu.Unlock()
-	return failHealth(gen, ErrNoSession)
+	return m.noSession()
 }
 
 // probe runs one bounded CDP round trip against sess. Health calls it twice
@@ -2017,8 +2312,7 @@ func (m *Minter) healthSnapshot(sess minterSession, gen uint64) HealthSnapshot {
 // in place without the relaunch ladder and returns a persistent failure; a
 // failed proof is logged and retried by the first endpoint that needs it.
 func (m *Minter) SelfTest(ctx context.Context) error {
-	m.mintMu.Lock()
-	defer m.mintMu.Unlock()
+	defer m.holdPage()()
 	sess, gen, err := m.ensure(ctx)
 	if err != nil {
 		return err
@@ -2048,7 +2342,7 @@ func (m *Minter) SelfTest(ctx context.Context) error {
 			}
 		}
 		if mintErr != nil {
-			return fmt.Errorf("minter: self-test mint failed after %d attempts: %w", selfTestMintAttempts, mintErr)
+			return fmt.Errorf("%w after %d attempts: %w", ErrSelfTestMint, selfTestMintAttempts, mintErr)
 		}
 		m.metrics.Mints.Add(1)
 		m.markMinted()
@@ -2110,8 +2404,10 @@ var lifetimeCounterKeys = []string{
 	"cache_misses",
 	"cache_evictions",
 	"launch_failures",
+	"launch_cooldown_refusals",
 	"streaming_recycles",
 	"report_driven_recycles",
+	"idle_closes",
 	"degradation_reports_accepted",
 	"degradation_reports_rejected_stale",
 	"degradation_reports_already_retired",
@@ -2142,8 +2438,10 @@ func (m *Minter) counterValues() map[string]int64 {
 		"cache_misses":                          m.metrics.CacheMisses.Load(),
 		"cache_evictions":                       m.metrics.CacheEvictions.Load(),
 		"launch_failures":                       m.metrics.LaunchFailures.Load(),
+		"launch_cooldown_refusals":              m.metrics.LaunchCooldownRefusals.Load(),
 		"streaming_recycles":                    m.metrics.StreamingRecycles.Load(),
 		"report_driven_recycles":                m.metrics.ReportDrivenRecycles.Load(),
+		"idle_closes":                           m.metrics.IdleCloses.Load(),
 		"degradation_reports_accepted":          m.metrics.DegradationReportsAccepted.Load(),
 		"degradation_reports_rejected_stale":    m.metrics.DegradationReportsRejectedStale.Load(),
 		"degradation_reports_already_retired":   m.metrics.DegradationReportsAlreadyRetired.Load(),
@@ -2190,6 +2488,11 @@ func (m *Minter) MetricsSnapshot() map[string]any {
 		}
 	}
 	cacheN := m.servableCacheEntriesLocked(time.Now())
+	launchFailures := m.launchFailStreak
+	var launchRetrySecs any // nil encodes as JSON null: no cool-down is open
+	if secs := ceilSeconds(m.launchWaitLocked(time.Now())); secs > 0 {
+		launchRetrySecs = secs
+	}
 	m.mu.Unlock()
 
 	// Read the session's proof state outside m.mu, as healthSnapshot does. The
@@ -2216,6 +2519,8 @@ func (m *Minter) MetricsSnapshot() map[string]any {
 		"streaming_suspect_video":     suspectVideo,
 		"last_browser_proof_outcome":  proofOutcome,
 		"last_browser_proof_age_secs": proofAge,
+		"consecutive_launch_failures": launchFailures,
+		"launch_retry_after_secs":     launchRetrySecs,
 	}
 	for name, v := range m.counterValues() {
 		out[name] = v
@@ -2247,6 +2552,7 @@ func (m *Minter) Close() {
 	m.cache = make(map[string]cachedToken)
 	m.negCache = make(map[string]negEntry)
 	m.mu.Unlock()
+	m.lifeCancel() // ends a launch in flight; runLaunch discards what it made
 	if cancel != nil {
 		cancel()
 	}

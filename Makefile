@@ -42,7 +42,7 @@ GOVULNCHECK_VERSION ?= v1.9.0
 # verified against the checksum database, if PATH has another patch.
 GO_TOOLCHAIN = $(or $(shell awk '$$1 == "toolchain" { print $$2 }' go.mod),$(error go.mod has no toolchain line))
 
-.PHONY: all help fmt-check tidy-check vulncheck vet test consumer-check live jsbundle-browser \
+.PHONY: all help fmt-check tidy-check vulncheck vet test consumer-check waxtap-pin-check live jsbundle-browser \
         verify-assets release deps clean docker-build docker-smoke compose-check docker-login \
         docker-push docker-push-authed docker-manifest docker-manifest-authed release-guard \
         image-name docker-digest docker-manifest-digest
@@ -63,7 +63,8 @@ help:
 	@echo "  vet               go vet the root and provider/ modules, plus a windows cross-vet"
 	@echo "  test              offline Go test suite, race-enabled (root + provider/)"
 	@echo "  consumer-check    build provider/ as an external go get sees it (needs network)"
-	@echo "  live              real-Chromium CDP transport tests (needs a browser)"
+	@echo "  waxtap-pin-check  fail unless provider/ requires a tagged WaxTap release"
+	@echo "  live              real-Chromium tests that need no network (root CDP transport + provider/)"
 	@echo "  jsbundle-browser  rebuild the embedded browser bundle (needs Node)"
 	@echo "  verify-assets     rebuild the bundle in a temp dir, fail if the checked-in one differs"
 	@echo "  release           build Linux/macOS/Windows amd64+arm64 binaries into $(DIST)/"
@@ -118,19 +119,31 @@ consumer-check:
 	    || exit 1; \
 	  echo "OK: provider/ compiles against its pinned root with no replace"
 
+# waxtap-pin-check fails unless provider/ requires a tagged WaxTap release.
+# Between releases the pin can sit on pushed main; the release gate runs this so
+# a release never makes consumers resolve an untagged commit.
+waxtap-pin-check:
+	@v=$$(cd provider && GOWORK=off go list -m -f '{{.Version}}' github.com/colespringer/waxtap/v3) || exit 1; \
+	  if ! printf '%s\n' "$$v" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$$'; then \
+	    echo "provider/ requires waxtap $$v, not a tagged release; move the pin to a tag first"; exit 1; \
+	  fi; \
+	  echo "OK: provider/ requires the tagged waxtap $$v"
+
 # test runs the offline suite with the race detector, as CI does: the root
 # module, then provider/. The committed bundle means it needs no Node. The
 # -tags e2e suite needs network and Chromium, and each test starts its own
-# daemon unless WAXSEAL_URL names one; the README covers it.
+# daemon unless WAXSEAL_URL names one; docs/development.md covers it.
 test: fmt-check
 	go test -race ./...
 	cd provider && go test -race ./...
 
-# live runs the real-Chromium CDP transport tests. They drive a local browser
-# over the pipe transport and need no network; set WAXSEAL_CHROME_BIN when the
-# browser is not on a well-known path.
+# live runs the tests that drive a local browser and need no network: the CDP
+# pipe-transport tests, then provider/'s, which run a daemon whose session
+# launches fail offline. Set WAXSEAL_CHROME_BIN when the browser is not on a
+# well-known path.
 live:
 	go test -race -tags live ./internal/cdp
+	cd provider && go test -race -tags live ./...
 
 # jsbundle-browser builds the bgutils-js and BotGuard entrypoint as an ES2020
 # IIFE. Chromium evaluates the committed bundle, which Go embeds from
@@ -199,10 +212,26 @@ docker-build:
 # page it serves itself on loopback (a data: page would skip the network
 # service). --network none keeps YouTube's view of a datacenter IP out of the
 # verdict, so a red run means the image is broken. --pull=never keeps the probe
-# on the local build even when this host is logged in to the registry.
+# on the local build even when this host is logged in to the registry. The
+# second run starts the daemon on the same network, where its warm-up cannot
+# reach YouTube: it must stay up and pass the image's own health probe. Its
+# container is named before it starts and removed by a trap that also catches
+# INT and TERM, since dash runs an EXIT trap on neither.
 docker-smoke: docker-build
 	docker run --rm --network none --shm-size=1gb --pull=never \
 	  --entrypoint waxseal $(IMAGE):$(VERSION)-$(ARCH) doctor --stop-after-load
+	@name=waxseal-smoke-$$$$; \
+	  trap 'docker rm -f "$$name" >/dev/null 2>&1' EXIT; trap 'exit 130' INT TERM; \
+	  docker run -d --name "$$name" --network none --shm-size=1gb --pull=never \
+	    $(IMAGE):$(VERSION)-$(ARCH) >/dev/null || exit 1; \
+	  n=0; until docker exec "$$name" waxseal ping --strict --timeout 5s >/dev/null 2>&1; do \
+	    n=$$((n+1)); \
+	    if [ "$$n" -ge 60 ] || [ "$$(docker inspect -f '{{.State.Running}}' "$$name")" != true ]; then \
+	      echo "ERROR: the daemon did not stay up and serve with no network"; \
+	      docker logs --tail 20 "$$name"; exit 1; fi; \
+	    sleep 1; \
+	  done; \
+	  echo "OK: the daemon serves after a warm-up that cannot reach YouTube"
 	@out=$$(docker run --rm --pull=never --entrypoint /bin/ls \
 	  $(IMAGE):$(VERSION)-$(ARCH) /usr/share/doc/waxseal) || exit 1; \
 	  for f in LICENSE THIRD-PARTY-NOTICES.md; do \

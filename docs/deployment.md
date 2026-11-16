@@ -8,16 +8,24 @@ and run
 docker compose up -d --wait
 ```
 
-`--wait` returns once the image's healthcheck passes and the daemon can serve
-tokens, typically within ten seconds of Chromium starting. The first token or
-context request may still wait up to 12 seconds behind the mint-separation gate
-(README, `/player-context`).
+`--wait` returns once the image's healthcheck passes, typically within ten
+seconds of Chromium starting. The first token or context request may still wait
+up to 12 seconds behind the mint-separation gate (see
+[`/player-context`](api.md#get-post-player-context)).
+
+A daemon that YouTube refuses, or that cannot reach it, turns healthy too: it
+answers with a `Retry-After` and retries its warm-up in the background, backing
+off to every 30 minutes, until a session attests.
+`docker compose exec waxseal waxseal ping` fails while it has none and says
+why. On a keyed daemon add `--key <key>`: without one the ping checks only the
+browser, and passes.
 
 `docker compose logs -f` follows startup, and `docker compose ps` shows health.
 A container that never turns healthy is either restarting (the daemon exited on
-a startup failure) or up and unhealthy (its probe keeps failing); the log says
-which. The daemon needs no volume: browser profiles are temporary and rebuilt
-at every start.
+bad configuration, a port in use, a Chromium that would not start or twice
+could not set a session up, or a session that could not mint) or up and
+unhealthy (its probe keeps failing); the log says which. The daemon needs no
+volume: browser profiles are temporary and rebuilt at every start.
 
 Everything below is optional. Unless a section says otherwise, paste its
 snippet into that file under the `waxseal:` service at the indentation shown;
@@ -29,12 +37,12 @@ The file pulls `:latest`. `WAXSEAL_VERSION` picks a tag instead, on the command
 line or in a `.env` file beside `compose.yaml`, which compose reads on its own:
 
 ```sh
-WAXSEAL_VERSION=1.5.1 docker compose up -d --wait
+WAXSEAL_VERSION=1.6.0 docker compose up -d --wait
 ```
 
 ```sh
 # .env
-WAXSEAL_VERSION=1.5.1
+WAXSEAL_VERSION=1.6.0
 ```
 
 Each release tag is a manifest covering linux/amd64 and linux/arm64, so Docker
@@ -131,6 +139,22 @@ so it sits at the service indentation. On a host with swap, leaving it out moves
 the kill point from the limit to twice the limit. The `docker run` equivalent is
 `--memory 2g --memory-swap 2g`.
 
+## Free memory while idle
+
+Chromium holds about 300 MB between requests, and `docker stats` counts its
+cached files on top. `WAXSEAL_IDLE_TIMEOUT` closes it once no request has needed
+the browser for that long, which leaves about 20 MB. Put it under
+`environment:`, in the block the file already has if you added one:
+
+```yaml
+    environment:
+      WAXSEAL_IDLE_TIMEOUT: 30m
+```
+
+The next request that needs the browser starts it again and is slower for it;
+[operations.md](operations.md#idle-timeout) has the cost. The healthcheck
+passes while the browser is closed.
+
 ## Read-only root filesystem
 
 Chromium needs a writable home for its profile and a writable `/tmp`, so a
@@ -178,12 +202,21 @@ block from `waxseal`.
 ## Tune the daemon
 
 Settings go under `environment:` like the keys above; the README's
-[Operations](../README.md#operations) section lists every variable and the flag
-it stands in for. `WAXSEAL_SHUTDOWN_TIMEOUT` (default 60s) is how long a
-stopping daemon drains in-flight requests, and the file's `stop_grace_period`
-of 70s covers it: raise both together, or Docker kills the container
-mid-request. `WAXSEAL_MINT_SEPARATION` must be a positive Go duration, or the
-daemon refuses to start.
+[Configuration](../README.md#configuration) section lists every variable and
+its default. `WAXSEAL_SHUTDOWN_TIMEOUT` (default 60s) is how long a stopping
+daemon drains in-flight requests, and the file's `stop_grace_period` of 70s
+covers it: raise both together, or Docker kills the container mid-request.
+`WAXSEAL_MINT_SEPARATION` must be a positive Go duration, or the daemon refuses
+to start.
+
+A setting that is a flag only, such as `--metrics-public`, goes in `command:`,
+which replaces the image's `server --host 0.0.0.0`. Repeat those words: without
+`--host 0.0.0.0` the daemon binds loopback inside the container, so the
+published port reaches nothing while the healthcheck still passes.
+
+```yaml
+    command: ["server", "--host", "0.0.0.0", "--metrics-public"]
+```
 
 ## Health checks
 
@@ -193,11 +226,12 @@ seconds, with a 110 second timeout and a two minute start period, so compose,
 file.
 
 An orchestrator probing over HTTP uses `GET /ping?strict=true`: 200 while the
-daemon is healthy or in the benign window after a session is retired, 503 once
-a probe confirms the session or the browser lost. Give it the same generous
-timeout, since a probe that finds a wedged browser relaunches it before
-answering. The README's [Operations](../README.md#operations) section has the
-details, including what a probe on a keyed daemon checks.
+daemon is healthy or has no session, because one was retired or YouTube will
+not grant one yet, and 503 once a probe confirms the session or the browser
+lost.
+Give it the same generous timeout, since a probe that finds a wedged browser
+relaunches it before answering. [operations.md](operations.md#health-checks)
+has the details, including what a probe on a keyed daemon checks.
 
 ## Upgrade, follow, stop
 

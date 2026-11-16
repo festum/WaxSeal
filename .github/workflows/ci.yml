@@ -41,6 +41,15 @@ jobs:
           WAXSEAL_CHROME_BIN: ${{ steps.setup-chrome.outputs.chrome-path }}
           WAXSEAL_REQUIRE_CHROME: "1"
         run: go test -race -tags live ./internal/cdp
+      # provider/'s live test reads a daemon whose launches fail through the
+      # consumer's own probe. Its Chromium resolves no host but loopback, so
+      # nothing leaves the runner.
+      - name: provider live test (real Chromium, no network)
+        working-directory: provider
+        env:
+          WAXSEAL_CHROME_BIN: ${{ steps.setup-chrome.outputs.chrome-path }}
+          WAXSEAL_REQUIRE_CHROME: "1"
+        run: go test -race -tags live ./...
 
   # Build and vet the nested WaxTap adapter module separately.
   provider:
